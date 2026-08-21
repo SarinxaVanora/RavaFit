@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "runtime": {
+    "version": "1.0.0",
+    "url": "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.zip",
+    "sha256": "997c47ac501aff2131b01f76520036f7eb0a2b262ee2b61e7aa80cd77e8e0bd2",
+    "size": 185332410,
+    "productionRevision": "1.0.0-runtime-1",
+    "minimumPluginVersion": "1.0.0"
+  },
+  "bodies": {
+    "version": "1.0.0",
+    "url": "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/Bodies.rbody",
+    "sha256": "5d8e2b301742e85038cd3ec74dabbe094c7005d37a07f05d48491826a4b8b0a0",
+    "size": 478922442,
+    "minimumPluginVersion": "1.0.0"
+  }
+}

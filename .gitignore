@@ -1,0 +1,26 @@
+# Build output
+**/bin/
+**/obj/
+artifacts/
+Build/
+
+# Local development assets
+DevAssets/Runtime/
+DevAssets/Bodies/
+DevAssets/Incoming/
+!DevAssets/README.md
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+
+# IDE/local files
+.vs/
+.idea/
+*.user
+*.suo
+
+# Temporary downloads/staging
+*.part
+*.tmp
+*.staging-*
