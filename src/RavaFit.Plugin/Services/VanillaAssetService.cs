@@ -354,7 +354,7 @@ internal sealed class VanillaAssetService
             var optionId = Guid.NewGuid();
             var meta = new JsonObject
             {
-                ["FileVersion"] = 4, ["Name"] = sourceName, ["Author"] = "RavaFit", ["Version"] = "1.0.0", ["Website"] = string.Empty,
+                ["FileVersion"] = 4, ["Name"] = sourceName, ["Author"] = "RavaFit", ["Version"] = "1.1.0", ["Website"] = string.Empty,
                 ["Description"] = $"Vanilla XIV outfit staged by RavaFit from equipment set e{asset.ModelSetId:D4} for {race.DisplayName}.", ["Tags"] = new JsonArray(), ["LastWrite"] = DateTimeOffset.UtcNow.ToString("O"),
                 ["DefaultData"] = EmptyOptionData(), ["PageNames"] = new JsonObject { ["0"] = "Source" },
                 ["Groups"] = new JsonArray
@@ -439,7 +439,7 @@ internal sealed class VanillaAssetService
             var optionId = Guid.NewGuid();
             var meta = new JsonObject
             {
-                ["FileVersion"] = 4, ["Name"] = sourceName, ["Author"] = "RavaFit", ["Version"] = "1.0.0", ["Website"] = string.Empty,
+                ["FileVersion"] = 4, ["Name"] = sourceName, ["Author"] = "RavaFit", ["Version"] = "1.1.0", ["Website"] = string.Empty,
                 ["Description"] = $"Vanilla XIV model staged by RavaFit from {gamePath}", ["Tags"] = new JsonArray(), ["LastWrite"] = DateTimeOffset.UtcNow.ToString("O"),
                 ["DefaultData"] = EmptyOptionData(), ["PageNames"] = new JsonObject { ["0"] = "Source" },
                 ["Groups"] = new JsonArray

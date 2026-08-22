@@ -65,7 +65,7 @@ public sealed class Plugin : IDalamudPlugin
         TryMigrateLegacyUserBodies(legacyUserBodies, userBodies);
 
         Solver = new SolverHostService(Configuration, Log);
-        Penumbra = new PenumbraService(PluginInterface, Log);
+        Penumbra = new PenumbraService(PluginInterface, Framework, Log);
         Bodies = new BodyLibraryService(Configuration.BodyLibraryDirectory, userBodies, Solver, Log);
         ModelBridge = new ModelBridgeService(Framework, DataManager, Penumbra, Log);
         Conversion = new ConversionService(Penumbra, DataManager, Solver, ModelBridge, Bodies, Log);

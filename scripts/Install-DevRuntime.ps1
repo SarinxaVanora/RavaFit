@@ -3,8 +3,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RuntimeVersion = "1.0.0"
-$ExpectedProductionRevision = "1.0.0-runtime-1"
+$RuntimeVersion = "1.1.0"
+$ExpectedProductionRevision = "1.1.0-runtime-3"
 $PythonVersion = "3.13.5"
 $PipZipappVersion = "26.2.1"
 $PythonEmbedUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
@@ -395,7 +395,7 @@ try {
         Trimesh = '4.11.1'
         Torch = '2.10.0+cpu'
         Layout = 'private-python-wheel-install+validated-runtime-diet+final-bytecode-prune'
-        SolverSource = 'RavaFit 1.0.0-runtime-1'
+        SolverSource = 'RavaFit 1.1.0-runtime-3'
         ProductionRevision = $ExpectedProductionRevision
         PrunedBytes = $prunedBytes
         Components = $components

@@ -9,8 +9,8 @@ $DevAssets = Join-Path $RepoRoot "DevAssets"
 $BodiesDir = Join-Path $DevAssets "Bodies"
 $RuntimeDir = Join-Path $DevAssets "Runtime"
 $IncomingDir = Join-Path $DevAssets "Incoming"
-$ExpectedRuntimeVersion = "1.0.0"
-$ExpectedProductionRevision = "1.0.0-runtime-1"
+$ExpectedRuntimeVersion = "1.1.0"
+$ExpectedProductionRevision = "1.1.0-runtime-3"
 
 New-Item -ItemType Directory -Force -Path $BodiesDir, $IncomingDir | Out-Null
 

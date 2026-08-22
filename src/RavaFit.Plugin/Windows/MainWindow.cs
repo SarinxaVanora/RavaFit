@@ -84,7 +84,13 @@ internal sealed class MainWindow : Window, IDisposable
 
     private sealed class AccessoryOutfitRowState
     {
-        public AccessoryOutfitRowState(string slot) => Slot = slot;
+        public AccessoryOutfitRowState(string slot)
+        {
+            Slot = slot;
+            Sources = BodySlots.All.ToDictionary(bodySlot => bodySlot, _ => (BodyVariantInfo?)null, StringComparer.OrdinalIgnoreCase);
+            Targets = BodySlots.All.ToDictionary(bodySlot => bodySlot, _ => (BodyVariantInfo?)null, StringComparer.OrdinalIgnoreCase);
+        }
+
         public string Slot { get; }
         public bool Enabled { get; set; }
         public OutfitModelChoice? Selection { get; set; }
@@ -93,6 +99,9 @@ internal sealed class MainWindow : Window, IDisposable
         public int Revision { get; set; }
         public CancellationTokenSource? Cancellation { get; set; }
         public string Status { get; set; } = string.Empty;
+        public Dictionary<string, BodyVariantInfo?> Sources { get; }
+        public Dictionary<string, BodyVariantInfo?> Targets { get; }
+        public HashSet<string> SourceUserOverrides { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private static readonly Vector4 SuccessColour = new(0.32f, 0.88f, 0.56f, 1f);
@@ -217,6 +226,7 @@ internal sealed class MainWindow : Window, IDisposable
         while (_uiActions.TryDequeue(out var uiAction))
             uiAction();
 
+        ReconcileSelectedPenumbraMod();
         _resetScrollThisFrame = _resetScrollNextFrame;
         _resetScrollNextFrame = false;
         if (_plugin.Conversion.Busy)
@@ -2074,7 +2084,6 @@ internal sealed class MainWindow : Window, IDisposable
     private void DrawSwapSelectionCell(OutfitRowState row)
     {
         var choices = _outfitChoices[row.Slot];
-        if (row.Selection is null && choices.Count == 1) SetSwapSelection(row, choices[0]);
         var preview = row.Selection?.Label ?? (choices.Count == 0 ? "No model options" : "Select option");
         ImGui.SetNextItemWidth(-1);
         using var combo = ImRaii.Combo($"##SwapSelection_{row.Slot}", preview);
@@ -2106,12 +2115,6 @@ internal sealed class MainWindow : Window, IDisposable
                 : IsValidSwapSourceVariant(item, row.Slot, sourceIdentity, target))
             .ToArray();
         var current = isTarget ? row.Target : row.Source;
-        if (current is null && available.Length == 1)
-        {
-            if (isTarget) { row.Target = available[0]; AutoFillSwapTargets(row); }
-            else { row.Source = available[0]; row.SourceUserOverride = true; row.SourceInferred = false; row.SourceAutoPriority = 100; AutoFillSwapSourceSiblings(); }
-            current = available[0];
-        }
         var preview = current is null ? (!isTarget && row.Analysing ? "Checking..." : "Select body") : $"{current.BodyName} / {current.VariantName}";
         ImGui.SetNextItemWidth(-1);
         using var combo = ImRaii.Combo($"##Swap{(isTarget ? "Target" : "Source")}_{row.Slot}", preview);
@@ -2142,7 +2145,6 @@ internal sealed class MainWindow : Window, IDisposable
                 if (isTarget)
                 {
                     row.Target = item;
-                    AutoFillSwapTargets(row);
                 }
                 else
                 {
@@ -2150,7 +2152,6 @@ internal sealed class MainWindow : Window, IDisposable
                     row.SourceUserOverride = true;
                     row.SourceInferred = false;
                     row.SourceAutoPriority = 100;
-                    AutoFillSwapSourceSiblings();
                 }
                 _bodyFilter = string.Empty;
             }
@@ -2250,6 +2251,7 @@ internal sealed class MainWindow : Window, IDisposable
             {
                 var required = string.Join(" + ", row.Analysis.Slots.Values.Where(e => e.Primary || e.Recommended).OrderByDescending(e => e.Primary).Select(e => e.Slot).Distinct(StringComparer.OrdinalIgnoreCase));
                 RavaFitUiChrome.DrawMutedText($"Fits as {row.Analysis.PrimarySlot}{(string.IsNullOrWhiteSpace(required) ? string.Empty : $" · support {required}")} · garment only");
+                DrawAccessorySupportBodies(row, swap);
             }
             else if (!string.IsNullOrWhiteSpace(row.Status)) RavaFitUiChrome.DrawMutedWrappedText(row.Status);
             ImGui.PopID();
@@ -2259,7 +2261,6 @@ internal sealed class MainWindow : Window, IDisposable
     private void DrawAccessorySelectionCell(AccessoryOutfitRowState row, bool swap)
     {
         var choices = _accessoryChoices[row.Slot];
-        if (row.Selection is null && choices.Count == 1) SetAccessorySelection(row, choices[0], swap);
         var preview = row.Selection?.Label ?? "Select option";
         ImGui.SetNextItemWidth(-1);
         using var combo = ImRaii.Combo("##AccessorySelection", preview);
@@ -2276,6 +2277,106 @@ internal sealed class MainWindow : Window, IDisposable
                 SetAccessorySelection(row, choice, swap); _selectionFilter = string.Empty;
             }
         });
+    }
+
+    private void DrawAccessorySupportBodies(AccessoryOutfitRowState row, bool swap)
+    {
+        if (row.Selection is null || row.Analysis is null) return;
+
+        var required = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { row.Analysis.PrimarySlot };
+        foreach (var evidence in row.Analysis.Slots.Values.Where(evidence => evidence.Primary || evidence.Recommended))
+            required.Add(evidence.Slot);
+
+        ImGuiHelpers.ScaledDummy(5f);
+        ImGui.PushID($"AccessorySupport_{(swap ? "Swap" : "Convert")}_{row.Slot}");
+        if (ImGui.BeginTable("##AccessorySupportBodies", 3, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.RowBg))
+        {
+            ImGui.TableSetupColumn("Support", ImGuiTableColumnFlags.WidthFixed, 90f * ImGuiHelpers.GlobalScale);
+            ImGui.TableSetupColumn("Source", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableHeadersRow();
+            foreach (var bodySlot in BodySlots.All.Where(required.Contains))
+            {
+                ImGui.PushID(bodySlot);
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.TextUnformatted(bodySlot);
+                ImGui.TableNextColumn(); DrawAccessoryBodyCell(row, bodySlot, isTarget: false, swap);
+                ImGui.TableNextColumn(); DrawAccessoryBodyCell(row, bodySlot, isTarget: true, swap);
+                ImGui.PopID();
+            }
+            ImGui.EndTable();
+        }
+        ImGui.PopID();
+    }
+
+    private void DrawAccessoryBodyCell(AccessoryOutfitRowState row, string bodySlot, bool isTarget, bool swap)
+    {
+        if (row.Selection is null) return;
+        if (!swap && !isTarget && _convertUseVanilla)
+        {
+            ImGui.SetNextItemWidth(-1);
+            using (ImRaii.Disabled(true))
+                ImGui.InputText($"##AccessoryVanillaSource_{row.Slot}_{bodySlot}", ref _vanillaSourceDisplay, 64, ImGuiInputTextFlags.ReadOnly);
+            return;
+        }
+
+        var sourceRaceCode = GetModelRaceCode(row.Selection.Model.GamePath);
+        var sourceIdentity = CharacterRaceCatalog.FromCode(sourceRaceCode);
+        var sourceGender = sourceIdentity?.Gender;
+        var swapTarget = GetSwapTargetIdentity();
+        var available = _plugin.Bodies.ForSlot(bodySlot)
+            .Where(item => swap
+                ? isTarget
+                    ? IsValidSwapTargetVariant(item, bodySlot, swapTarget, sourceGender)
+                    : IsValidSwapSourceVariant(item, bodySlot, sourceIdentity, swapTarget)
+                : item.SupportsGender(sourceGender))
+            .ToArray();
+
+        var current = isTarget ? row.Targets[bodySlot] : row.Sources[bodySlot];
+
+        var preview = current is null ? (isTarget ? "Select target" : "Select source") : $"{current.BodyName} / {current.VariantName}";
+        ImGui.SetNextItemWidth(-1);
+        using var combo = ImRaii.Combo($"##Accessory{(isTarget ? "Target" : "Source")}_{bodySlot}", preview);
+        if (!combo.Success) return;
+
+        var bodyFilterOwner = $"Accessory:{(swap ? "Swap" : "Convert")}:{row.Slot}:{bodySlot}:{(isTarget ? "Target" : "Source")}";
+        if (!string.Equals(_bodyFilterOwner, bodyFilterOwner, StringComparison.Ordinal))
+        {
+            _bodyFilterOwner = bodyFilterOwner;
+            _bodyFilter = string.Empty;
+        }
+
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint($"##AccessoryBodyFilter_{(isTarget ? "Target" : "Source")}_{bodySlot}", "Search bodies...", ref _bodyFilter, 128);
+        ImGui.Separator();
+        var visibleBodies = available.Where(v => string.IsNullOrWhiteSpace(_bodyFilter)
+            || v.BodyName.Contains(_bodyFilter, StringComparison.OrdinalIgnoreCase)
+            || v.VariantName.Contains(_bodyFilter, StringComparison.OrdinalIgnoreCase)
+            || v.Collection.Contains(_bodyFilter, StringComparison.OrdinalIgnoreCase)).ToArray();
+        DrawPinnedSearchResults($"##AccessoryBodyResults_{(isTarget ? "Target" : "Source")}_{bodySlot}", visibleBodies.Length, () =>
+        {
+            foreach (var item in visibleBodies)
+            {
+                var label = $"{item.BodyName} / {item.VariantName}";
+                if (!string.Equals(item.Collection, item.BodyName, StringComparison.OrdinalIgnoreCase))
+                    label += $"  [{item.Collection}]";
+                if (!ImGui.Selectable(label, current == item)) continue;
+
+                if (isTarget)
+                {
+                    row.Targets[bodySlot] = item;
+                }
+                else
+                {
+                    row.Sources[bodySlot] = item;
+                    row.SourceUserOverrides.Add(bodySlot);
+                }
+                _bodyFilter = string.Empty;
+            }
+        });
+
+        if (available.Length == 0)
+            RavaFitUiChrome.DrawMutedText("No compatible bodies found.");
     }
 
     private void DrawOutfitRows()
@@ -2358,7 +2459,6 @@ internal sealed class MainWindow : Window, IDisposable
     private void DrawOutfitSelectionCell(OutfitRowState row)
     {
         var choices = _outfitChoices[row.Slot];
-        if (row.Selection is null && choices.Count == 1) SetOutfitSelection(row, choices[0]);
         var preview = row.Selection?.Label ?? (choices.Count == 0 ? "No model options" : "Select option");
         ImGui.SetNextItemWidth(-1);
         using var combo = ImRaii.Combo($"##Selection_{row.Slot}", preview);
@@ -2403,12 +2503,6 @@ internal sealed class MainWindow : Window, IDisposable
         var gender = GetOutfitContextGender(row);
         var available = _plugin.Bodies.ForSlot(row.Slot).Where(item => item.SupportsGender(gender)).ToArray();
         var current = isTarget ? row.Target : row.Source;
-        if (current is null && available.Length == 1)
-        {
-            if (isTarget) { row.Target = available[0]; AutoFillOutfitTargets(row); }
-            else { row.Source = available[0]; row.SourceUserOverride = true; row.SourceInferred = false; row.SourceAutoPriority = 100; AutoFillOutfitSourceSiblings(); }
-            current = available[0];
-        }
         var preview = current is null
             ? (!isTarget && row.Analysing ? "Checking..." : "Select body")
             : $"{current.BodyName} / {current.VariantName}";
@@ -2444,7 +2538,6 @@ internal sealed class MainWindow : Window, IDisposable
                 if (isTarget)
                 {
                     row.Target = item;
-                    AutoFillOutfitTargets(row);
                 }
                 else
                 {
@@ -2452,7 +2545,6 @@ internal sealed class MainWindow : Window, IDisposable
                     row.SourceUserOverride = true;
                     row.SourceInferred = false;
                     row.SourceAutoPriority = 100;
-                    AutoFillOutfitSourceSiblings();
                 }
                 _bodyFilter = string.Empty;
             }
@@ -2508,6 +2600,8 @@ internal sealed class MainWindow : Window, IDisposable
         {
             accessory.Cancellation?.Cancel(); accessory.Cancellation?.Dispose(); accessory.Cancellation = null;
             accessory.Revision++; accessory.Enabled = false; accessory.Selection = null; accessory.Analysis = null; accessory.Analysing = false; accessory.Status = string.Empty;
+            foreach (var slot in BodySlots.All) { accessory.Sources[slot] = null; accessory.Targets[slot] = null; }
+            accessory.SourceUserOverrides.Clear();
         }
         foreach (var row in _outfitRows.Values)
         {
@@ -2535,6 +2629,8 @@ internal sealed class MainWindow : Window, IDisposable
         {
             accessory.Cancellation?.Cancel(); accessory.Cancellation?.Dispose(); accessory.Cancellation = null;
             accessory.Revision++; accessory.Enabled = false; accessory.Selection = null; accessory.Analysis = null; accessory.Analysing = false; accessory.Status = string.Empty;
+            foreach (var slot in BodySlots.All) { accessory.Sources[slot] = null; accessory.Targets[slot] = null; }
+            accessory.SourceUserOverrides.Clear();
         }
         foreach (var row in _swapRows.Values)
         {
@@ -2583,7 +2679,6 @@ internal sealed class MainWindow : Window, IDisposable
         if (!_plugin.ModelBridge.Status.Available || !_plugin.Solver.Ready)
         {
             row.Status = "Choose Source manually.";
-            AutoFillSwapSourceSiblings();
             return;
         }
 
@@ -2613,13 +2708,12 @@ internal sealed class MainWindow : Window, IDisposable
                 row.Analysing = false;
                 row.Analysis = result;
                 row.Status = string.Empty;
-                var sourceMatches = result.SourceMatches.Values.ToArray();
-                foreach (var match in sourceMatches.Where(match => match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)))
-                    ApplyAutomaticSwapSourceMatch(match, 4, false);
-                AutoFillSwapSourceSiblings();
-                foreach (var match in sourceMatches.Where(match => !match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)))
-                    ApplyAutomaticSwapSourceMatch(match, 2, true);
-                AutoFillSwapSourceSiblings();
+                if (result.SourceMatches.TryGetValue(rowSlot, out var match))
+                {
+                    var embedded = match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)
+                        || match.Reason.StartsWith("Penumbra selection name", StringComparison.OrdinalIgnoreCase);
+                    ApplyAutomaticSwapSourceMatch(match, embedded ? 4 : 2, inferred: !embedded);
+                }
             });
         }
         catch (OperationCanceledException) { }
@@ -2632,7 +2726,6 @@ internal sealed class MainWindow : Window, IDisposable
                     return;
                 row.Analysing = false;
                 row.Status = $"Source detection failed: {ex.Message}";
-                AutoFillSwapSourceSiblings();
             });
         }
     }
@@ -2646,47 +2739,6 @@ internal sealed class MainWindow : Window, IDisposable
         contextRow.Source = match.Variant;
         contextRow.SourceInferred = inferred;
         contextRow.SourceAutoPriority = priority;
-    }
-
-    private void AutoFillSwapSourceSiblings()
-    {
-        foreach (var row in _swapRows.Values.Where(row => !row.SourceUserOverride))
-        {
-            var rowGender = GetModelGender(row);
-            var best = _swapRows.Values
-                .Where(anchor => anchor.Source is not null && !ReferenceEquals(anchor, row))
-                .Select(anchor =>
-                {
-                    var sibling = _plugin.Bodies.FindSibling(anchor.Source!, row.Slot);
-                    if (sibling is not null && !sibling.SupportsGender(rowGender))
-                        sibling = null;
-                    var priority = anchor.SourceUserOverride || anchor.SourceAutoPriority >= 4 ? 3 : 1;
-                    return (Sibling: sibling, Priority: priority);
-                })
-                .Where(candidate => candidate.Sibling is not null)
-                .OrderByDescending(candidate => candidate.Priority)
-                .FirstOrDefault();
-            if (best.Sibling is null || (row.Source is not null && row.SourceAutoPriority >= best.Priority))
-                continue;
-            row.Source = best.Sibling;
-            row.SourceInferred = true;
-            row.SourceAutoPriority = best.Priority;
-        }
-    }
-
-    private void AutoFillSwapTargets(OutfitRowState anchorRow)
-    {
-        if (anchorRow.Target is null)
-            return;
-        var target = GetSwapTargetIdentity();
-        foreach (var row in _swapRows.Values)
-        {
-            if (ReferenceEquals(row, anchorRow) || row.Target is not null)
-                continue;
-            var sibling = _plugin.Bodies.FindSibling(anchorRow.Target, row.Slot);
-            if (sibling is not null && IsValidSwapTargetVariant(sibling, row.Slot, target, GetModelGender(row)))
-                row.Target = sibling;
-        }
     }
 
     private bool TryBuildSwapSlotSelections(OutfitRowState row, out IReadOnlyList<SlotConversionSelection> selections, out string reason)
@@ -2776,6 +2828,8 @@ internal sealed class MainWindow : Window, IDisposable
     {
         row.Cancellation?.Cancel(); row.Cancellation?.Dispose(); row.Cancellation = null;
         row.Selection = choice; row.Enabled = true; row.Analysis = null; row.Analysing = false; row.Status = string.Empty; row.Revision++;
+        foreach (var slot in BodySlots.All) { row.Sources[slot] = null; row.Targets[slot] = null; }
+        row.SourceUserOverrides.Clear();
         if (_selectedMod is null || !_plugin.ModelBridge.Status.Available || !_plugin.Solver.Ready)
         {
             row.Status = "Coverage analysis is not ready.";
@@ -2799,10 +2853,9 @@ internal sealed class MainWindow : Window, IDisposable
                 row.Analysing = false; row.Analysis = result; row.Status = string.Empty;
                 foreach (var match in result.SourceMatches.Values)
                 {
-                    if (swap) ApplyAutomaticSwapSourceMatch(match, match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase) ? 4 : 2, !match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase));
-                    else ApplyAutomaticSourceMatch(match, match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase) ? 4 : 2, !match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase));
+                    if (row.Sources.ContainsKey(match.Slot) && !row.SourceUserOverrides.Contains(match.Slot))
+                        row.Sources[match.Slot] = match.Variant;
                 }
-                if (swap) AutoFillSwapSourceSiblings(); else AutoFillOutfitSourceSiblings();
             });
         }
         catch (OperationCanceledException) { }
@@ -2831,12 +2884,11 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var slot in BodySlots.All.Where(required.Contains))
             {
-                var context = _outfitRows[slot];
-                BodyVariantInfo? source = context.Source;
+                BodyVariantInfo? source = row.Sources[slot];
                 if (source is null && row.Analysis.SourceMatches.TryGetValue(slot, out var inferred)) source = inferred.Variant;
-                var target = context.Target;
-                if (!_convertUseVanilla && (source is null || !source.SupportsGender(sourceIdentity.Gender))) { reason = $"Accessory {row.Slot} also needs a {slot} source body. Pick one in the body rows above."; return false; }
-                if (target is null || !target.SupportsGender(sourceIdentity.Gender)) { reason = $"Accessory {row.Slot} also needs a {slot} target body. Pick one in the body rows above."; return false; }
+                var target = row.Targets[slot];
+                if (!_convertUseVanilla && (source is null || !source.SupportsGender(sourceIdentity.Gender))) { reason = $"Accessory {row.Slot} needs a {slot} source body. Pick it under the accessory."; return false; }
+                if (target is null || !target.SupportsGender(sourceIdentity.Gender)) { reason = $"Accessory {row.Slot} needs a {slot} target body. Pick it under the accessory."; return false; }
                 built.Add(new SlotConversionSelection(slot, _convertUseVanilla ? null : source, target, raceCode));
             }
         }
@@ -2845,10 +2897,9 @@ internal sealed class MainWindow : Window, IDisposable
             var targetIdentity = GetSwapTargetIdentity();
             foreach (var slot in BodySlots.All.Where(required.Contains))
             {
-                var context = _swapRows[slot];
-                BodyVariantInfo? source = context.Source;
+                BodyVariantInfo? source = row.Sources[slot];
                 if (source is null && row.Analysis.SourceMatches.TryGetValue(slot, out var inferred)) source = inferred.Variant;
-                var target = context.Target;
+                var target = row.Targets[slot];
                 if (source is null || !IsValidSwapSourceVariant(source, slot, sourceIdentity, targetIdentity)) { reason = $"Accessory {row.Slot} also needs a valid {slot} source body."; return false; }
                 if (target is null || !IsValidSwapTargetVariant(target, slot, targetIdentity, sourceIdentity.Gender)) { reason = $"Accessory {row.Slot} also needs a valid {slot} target body."; return false; }
                 built.Add(new SlotConversionSelection(slot, source, target, raceCode));
@@ -2887,7 +2938,6 @@ internal sealed class MainWindow : Window, IDisposable
             row.Status = _convertUseVanilla
                 ? "Fit check is not ready yet."
                 : "Couldn't detect the source body. Pick one manually.";
-            if (!_convertUseVanilla) AutoFillOutfitSourceSiblings();
             return;
         }
 
@@ -2922,17 +2972,13 @@ internal sealed class MainWindow : Window, IDisposable
 
                 if (detectSourceBodies)
                 {
-                    // Evidence order is manual > embedded body > same-family continuity > garment-only inference.
-                    var sourceMatches = result.SourceMatches.Values.ToArray();
-                    foreach (var match in sourceMatches.Where(match => match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)))
-                        ApplyAutomaticSourceMatch(match, priority: 4, inferred: false);
-
-                    AutoFillOutfitSourceSiblings();
-
-                    foreach (var match in sourceMatches.Where(match => !match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)))
-                        ApplyAutomaticSourceMatch(match, priority: 2, inferred: true);
-
-                    AutoFillOutfitSourceSiblings();
+                    // Evidence order is manual > explicit/embedded evidence > garment-only inference, scoped to this row.
+                    if (result.SourceMatches.TryGetValue(rowSlot, out var match))
+                    {
+                        var embedded = match.Reason.StartsWith("Embedded body", StringComparison.OrdinalIgnoreCase)
+                            || match.Reason.StartsWith("Penumbra selection name", StringComparison.OrdinalIgnoreCase);
+                        ApplyAutomaticSourceMatch(match, embedded ? 4 : 2, inferred: !embedded);
+                    }
                 }
             });
         }
@@ -2946,7 +2992,7 @@ internal sealed class MainWindow : Window, IDisposable
                     return;
                 row.Analysing = false;
                 row.Status = detectSourceBodies ? $"Couldn't detect the source body: {ex.Message}" : $"Couldn't check the fit: {ex.Message}";
-                if (detectSourceBodies) AutoFillOutfitSourceSiblings();
+                // Keep source selection local to this row; a failed guess must not alter sibling rows.
             });
         }
     }
@@ -2961,46 +3007,6 @@ internal sealed class MainWindow : Window, IDisposable
         contextRow.Source = match.Variant;
         contextRow.SourceInferred = inferred;
         contextRow.SourceAutoPriority = priority;
-    }
-
-    private void AutoFillOutfitSourceSiblings()
-    {
-        foreach (var row in _outfitRows.Values.Where(row => !row.SourceUserOverride))
-        {
-            var rowGender = GetModelGender(row);
-            var best = _outfitRows.Values
-                .Where(anchor => anchor.Source is not null && !ReferenceEquals(anchor, row))
-                .Select(anchor =>
-                {
-                    var sibling = _plugin.Bodies.FindSibling(anchor.Source!, row.Slot);
-                    if (sibling is not null && !sibling.SupportsGender(rowGender))
-                        sibling = null;
-                    var priority = anchor.SourceUserOverride || anchor.SourceAutoPriority >= 4 ? 3 : 1;
-                    return (Sibling: sibling, Priority: priority);
-                })
-                .Where(candidate => candidate.Sibling is not null)
-                .OrderByDescending(candidate => candidate.Priority)
-                .FirstOrDefault();
-            if (best.Sibling is null || (row.Source is not null && row.SourceAutoPriority >= best.Priority))
-                continue;
-            row.Source = best.Sibling;
-            row.SourceInferred = true;
-            row.SourceAutoPriority = best.Priority;
-        }
-    }
-
-    private void AutoFillOutfitTargets(OutfitRowState anchorRow)
-    {
-        if (anchorRow.Target is null)
-            return;
-        foreach (var row in _outfitRows.Values)
-        {
-            if (ReferenceEquals(row, anchorRow) || row.Target is not null)
-                continue;
-            var sibling = _plugin.Bodies.FindSibling(anchorRow.Target, row.Slot);
-            if (sibling is not null && sibling.SupportsGender(GetOutfitContextGender(row)))
-                row.Target = sibling;
-        }
     }
 
     private bool TryBuildSlotSelections(OutfitRowState row, out IReadOnlyList<SlotConversionSelection> selections, out string reason)
@@ -3366,8 +3372,8 @@ internal sealed class MainWindow : Window, IDisposable
                 return false;
             }
             if (!TryBuildAccessorySlotSelections(accessory, swap: true, out _, out reason)) return false;
-            var target = _swapRows[accessory.Analysis.PrimarySlot].Target;
-            if (target is null) { reason = $"Pick a {accessory.Analysis.PrimarySlot} target body for {accessory.Slot}."; return false; }
+            var target = accessory.Targets[accessory.Analysis.PrimarySlot];
+            if (target is null) { reason = $"Pick a {accessory.Analysis.PrimarySlot} target body under {accessory.Slot}."; return false; }
             var outputName = GetRaceSwapOutputOptionName(target, identity);
             if (accessory.Selection.Group.Options.Any(option => string.Equals(option.Name, outputName, StringComparison.OrdinalIgnoreCase)))
             { reason = $"'{outputName}' already exists."; return false; }
@@ -3557,8 +3563,8 @@ internal sealed class MainWindow : Window, IDisposable
                 return false;
             }
             if (!TryBuildAccessorySlotSelections(accessory, swap: false, out _, out reason)) return false;
-            var target = _outfitRows[accessory.Analysis.PrimarySlot].Target;
-            if (target is null) { reason = $"Pick a {accessory.Analysis.PrimarySlot} target body for {accessory.Slot}."; return false; }
+            var target = accessory.Targets[accessory.Analysis.PrimarySlot];
+            if (target is null) { reason = $"Pick a {accessory.Analysis.PrimarySlot} target body under {accessory.Slot}."; return false; }
             var outputName = GetOutputOptionName(target);
             if (accessory.Selection.Group.Options.Any(option => string.Equals(option.Name, outputName, StringComparison.OrdinalIgnoreCase)))
             { reason = $"'{outputName}' already exists in '{accessory.Selection.Group.Name}'."; return false; }
@@ -3598,15 +3604,64 @@ internal sealed class MainWindow : Window, IDisposable
         return true;
     }
 
+    private void ReconcileSelectedPenumbraMod()
+    {
+        if (_selectedMod is null || !_plugin.Penumbra.Available) return;
+
+        var refreshed = _plugin.Penumbra.Mods.FirstOrDefault(mod => string.Equals(mod.Directory, _selectedMod.Directory, StringComparison.OrdinalIgnoreCase));
+        if (refreshed is not null)
+        {
+            _selectedMod = refreshed;
+            return;
+        }
+
+        _plugin.PreviewTextures.Clear();
+        _selectedMod = null;
+        _document = null;
+        ResetOutfitRows(keepTargets: false);
+        ResetSwapRows(keepTargets: false);
+        _swapTargetRaceOverride = null;
+        _animationSourceRaceOverride = null;
+        _animationTargetRaceOverride = null;
+        _animationSkeletonChoiceId = AnimationSkeletonService.StandardChoiceId;
+        _customiseSelection = null;
+        _customisePiercingBody = null;
+        _customiseParts = [];
+        _customisePreviewTriangles = [];
+        _customisePreviewEdges = [];
+        _customiseSelectedParts.Clear();
+        _cleanupCandidates = [];
+        _customiseCleanupSelected.Clear();
+        _animationCleanupSelected.Clear();
+        _selectionFilter = string.Empty;
+        _bodyFilter = string.Empty;
+        _bodyFilterOwner = string.Empty;
+        _uiMessage = string.Empty;
+        _uiMessageError = false;
+        _plugin.AnimationPort.ResetStatus();
+        RequestScrollTop();
+    }
+
     private void SelectMod(PenumbraModInfo mod)
     {
         RequestScrollTop();
         _plugin.PreviewTextures.Clear();
+        var modChanged = _selectedMod is null || !string.Equals(_selectedMod.Directory, mod.Directory, StringComparison.OrdinalIgnoreCase);
         _selectedMod = mod;
         _document = null;
-        ResetOutfitRows(keepTargets: true);
-        ResetSwapRows(keepTargets: true);
+        ResetOutfitRows(keepTargets: !modChanged);
+        ResetSwapRows(keepTargets: !modChanged);
         _animationSourceRaceOverride = null;
+        if (modChanged)
+        {
+            _swapTargetRaceOverride = null;
+            _animationTargetRaceOverride = null;
+            _animationSkeletonChoiceId = AnimationSkeletonService.StandardChoiceId;
+            _selectionFilter = string.Empty;
+            _bodyFilter = string.Empty;
+            _bodyFilterOwner = string.Empty;
+        }
+        _modFilter = string.Empty;
         _customiseSelection = null;
         _customisePiercingBody = null;
         _customisePiercingBodies = [];
@@ -3803,8 +3858,8 @@ internal sealed class MainWindow : Window, IDisposable
                 SetMessage(string.IsNullOrWhiteSpace(reason) ? $"{accessory.Slot} accessory is not ready to port." : reason, true);
                 return;
             }
-            var target = _swapRows[accessory.Analysis.PrimarySlot].Target;
-            if (target is null) { SetMessage($"Pick a {accessory.Analysis.PrimarySlot} target body for {accessory.Slot}.", true); return; }
+            var target = accessory.Targets[accessory.Analysis.PrimarySlot];
+            if (target is null) { SetMessage($"Pick a {accessory.Analysis.PrimarySlot} target body under {accessory.Slot}.", true); return; }
             requests.Add(new RaceSwapConversionRequest(selectedMod.Directory, selectedMod.Name, selectedMod.ModRoot,
                 accessory.Selection.Group.StableKey, accessory.Selection.Option.StableKey, [accessory.Selection.Model], slots,
                 GetRaceSwapOutputOptionName(target, identity), identity.Code, accessory.Analysis.PrimarySlot, accessory.Analysis.SourceContainsBody, false));
@@ -3900,8 +3955,8 @@ internal sealed class MainWindow : Window, IDisposable
                 SetMessage(string.IsNullOrWhiteSpace(reason) ? $"{accessory.Slot} accessory is not ready to convert." : reason, true);
                 return;
             }
-            var target = _outfitRows[accessory.Analysis.PrimarySlot].Target;
-            if (target is null) { SetMessage($"Pick a {accessory.Analysis.PrimarySlot} target body for {accessory.Slot}.", true); return; }
+            var target = accessory.Targets[accessory.Analysis.PrimarySlot];
+            if (target is null) { SetMessage($"Pick a {accessory.Analysis.PrimarySlot} target body under {accessory.Slot}.", true); return; }
             requests.Add(new ConversionRequest(selectedMod.Directory, selectedMod.Name, selectedMod.ModRoot,
                 accessory.Selection.Group.StableKey, accessory.Selection.Option.StableKey, [accessory.Selection.Model], slots, GetOutputOptionName(target),
                 accessory.Analysis.PrimarySlot, accessory.Analysis.SourceContainsBody, false));

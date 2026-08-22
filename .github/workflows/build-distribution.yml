@@ -1,0 +1,111 @@
+name: Build RavaFit Distribution
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "distribution/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ravafit-distribution-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-distribution:
+    name: Build and hydrate distribution
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout source and LFS assets
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Ensure Git LFS content is hydrated
+        shell: pwsh
+        run: |
+          git lfs install --local
+          git lfs pull
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      # The private runtime is large. Cache the validated runtime by its actual
+      # source/provisioning inputs so ordinary C#/UI changes do not reinstall
+      # Python, NumPy, SciPy, Torch, Numba, etc. Build-GitHubAssets still runs
+      # every time and re-validates it before publishing.
+      - name: Restore validated RavaFit runtime cache
+        uses: actions/cache@v6
+        with:
+          path: DevAssets/Runtime
+          key: ${{ runner.os }}-ravafit-runtime-${{ hashFiles('runtime/**', 'scripts/Install-DevRuntime.ps1', 'scripts/Prepare-DevEnvironment.ps1') }}
+
+      - name: Build hosted assets and plugin distribution
+        shell: pwsh
+        run: |
+          ./scripts/Build-Distribution.ps1 `
+            -GitHubRepository "${{ github.repository }}" `
+            -Branch "master" `
+            -RuntimeVersion "1.1.0" `
+            -BodiesVersion "1.0.0" `
+            -MinimumPluginVersion "1.1.0" `
+            -RunTests
+
+      - name: Show generated distribution
+        shell: pwsh
+        run: |
+          Write-Host "Generated distribution changes:"
+          git status --short -- distribution
+
+          if (-not (Test-Path -LiteralPath "distribution/latest.zip" -PathType Leaf)) {
+              throw "distribution/latest.zip was not produced."
+          }
+          if (-not (Test-Path -LiteralPath "distribution/assets/RavaFit.Runtime.win-x64.zip" -PathType Leaf)) {
+              throw "Hosted runtime ZIP was not produced."
+          }
+          if (-not (Test-Path -LiteralPath "distribution/assets/Bodies.rbody" -PathType Leaf)) {
+              throw "Bodies.rbody was not produced/hydrated."
+          }
+
+      - name: Commit hydrated distribution
+        shell: pwsh
+        run: |
+          # A newer source push may have landed while this large runtime job was
+          # finishing. Never attach stale generated output to a newer source tree;
+          # that newer push has its own workflow run because of the concurrency key.
+          git fetch origin master
+          $remoteHead = (git rev-parse origin/master).Trim()
+          if ($remoteHead -ne "${{ github.sha }}") {
+              Write-Host "master advanced from ${{ github.sha }} to $remoteHead; skipping this stale distribution publish."
+              exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add --all distribution
+          git diff --cached --quiet -- distribution
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Distribution is already current; nothing to commit."
+              exit 0
+          }
+          if ($LASTEXITCODE -ne 1) {
+              throw "git diff --cached failed with exit code $LASTEXITCODE."
+          }
+
+          git commit -m "Build RavaFit distribution [skip ci]"
+          git push origin HEAD:master

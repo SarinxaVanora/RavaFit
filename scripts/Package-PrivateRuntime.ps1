@@ -34,12 +34,36 @@ Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory(
-    $Runtime,
-    $Output,
-    [System.IO.Compression.CompressionLevel]::Optimal,
-    $false
-)
+
+# Produce byte-stable hosted runtime ZIPs. GitHub Actions may hydrate the same
+# runtime on different machines/dates; filesystem mtimes must not turn identical
+# runtime content into a brand-new ~500 MB Git LFS object on every source push.
+$fixedTimestamp = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+$runtimeRoot = $Runtime.TrimEnd([char[]]@('\','/'))
+$files = @(Get-ChildItem -LiteralPath $runtimeRoot -Recurse -Force -File |
+    Sort-Object { $_.FullName.Substring($runtimeRoot.Length).Replace('\','/') })
+
+$stream = [IO.File]::Open($Output, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try {
+    $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
+    try {
+        foreach ($file in $files) {
+            $relative = $file.FullName.Substring($runtimeRoot.Length).TrimStart([char[]]@('\','/')).Replace('\','/')
+            $entry = $archive.CreateEntry($relative, [IO.Compression.CompressionLevel]::Optimal)
+            $entry.LastWriteTime = $fixedTimestamp
+
+            $input = [IO.File]::OpenRead($file.FullName)
+            try {
+                $outputStream = $entry.Open()
+                try { $input.CopyTo($outputStream) }
+                finally { $outputStream.Dispose() }
+            }
+            finally { $input.Dispose() }
+        }
+    }
+    finally { $archive.Dispose() }
+}
+finally { $stream.Dispose() }
 
 if (-not (Test-Path -LiteralPath $Output -PathType Leaf)) { throw "Runtime package was not created: $Output" }
 $hash = (Get-FileHash -LiteralPath $Output -Algorithm SHA256).Hash.ToLowerInvariant()

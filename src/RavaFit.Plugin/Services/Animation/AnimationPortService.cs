@@ -368,7 +368,7 @@ internal sealed partial class AnimationPortService
                 ["FileVersion"] = 4,
                 ["Name"] = destinationName,
                 ["Author"] = "RavaFit",
-                ["Version"] = "1.0.0",
+                ["Version"] = "1.1.0",
                 ["Website"] = string.Empty,
                 ["Description"] = $"RavaFit vanilla animation port · {friendlyName} · {sourceCharacter.DisplayName} → {targetCharacter.DisplayName}.",
                 ["Tags"] = new JsonArray(),

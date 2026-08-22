@@ -22,6 +22,10 @@ try {
     & .\scripts\Build-PluginRelease.ps1 -Configuration $Configuration -Output $Output
     & .\scripts\Build-PluginMaster.ps1
 
+    if ([string]::Equals($Configuration, "Release", [StringComparison]::OrdinalIgnoreCase)) {
+        & .\scripts\Test-ReleasePathPrivacy.ps1 -Configuration $Configuration
+    }
+
     if ($RunTests) {
         & .\scripts\Test.ps1 -Configuration $Configuration
     }
