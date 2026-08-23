@@ -92,8 +92,7 @@ jobs:
             -Branch "master" `
             -RuntimeVersion "1.1.0" `
             -BodiesVersion "1.0.0" `
-            -MinimumPluginVersion "1.1.0" `
-            -RunTests
+            -MinimumPluginVersion "1.1.0"
 
       - name: Show generated distribution
         shell: pwsh
