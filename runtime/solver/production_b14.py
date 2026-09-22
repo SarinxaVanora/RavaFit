@@ -1919,7 +1919,10 @@ def _retarget_garment_skinning(raw_positions: np.ndarray, source_positions: np.n
     if left_columns and right_columns:
         source_left=source[:,left_columns].sum(axis=1);source_right=source[:,right_columns].sum(axis=1)
         bilateral=(source_left>=.04)&(source_right>=.04)
-        alpha[bilateral]=np.minimum(alpha[bilateral],.25)
+        # Source-authored bilateral bridge weighting is structural garment authority.  Crotch/cloth
+        # vertices deliberately shared across both legs must not be reweighted toward whichever target
+        # thigh happens to be nearest after the geometry refit.
+        alpha[bilateral]=0.0
     else:
         bilateral=np.zeros(len(source),dtype=bool)
 
@@ -1957,7 +1960,7 @@ def _retarget_garment_skinning(raw_positions: np.ndarray, source_positions: np.n
         "vertices":int(len(blended)),"retargeted_vertices":int(np.count_nonzero(alpha>1e-6)),"geometry_rigid_vertices":int(np.count_nonzero(rigid)),
         "skin_rigid_smoothed_vertices":smoothed_rigid_vertices,"skin_rigid_smoothed_components":smoothed_rigid_components,
         "preserved_non_body_joint_count":int(np.count_nonzero(preserved)),"preserved_non_body_weight_mean":float(np.mean(preserved_mass)),
-        "bilateral_authored_vertices":int(np.count_nonzero(bilateral)),"source_influence_capacity":influence_capacity,"new_target_joint_slots":new_target_slots,"geometric_move_p50_mm":float(np.median(geometric_move)*1000.0),"geometric_move_p95_mm":float(np.percentile(geometric_move,95)*1000.0),
+        "bilateral_authored_vertices":int(np.count_nonzero(bilateral)),"bilateral_exact_source_weight_preserve":True,"source_influence_capacity":influence_capacity,"new_target_joint_slots":new_target_slots,"geometric_move_p50_mm":float(np.median(geometric_move)*1000.0),"geometric_move_p95_mm":float(np.percentile(geometric_move,95)*1000.0),
         "alpha_mean":float(np.mean(alpha)),"alpha_p95":float(np.percentile(alpha,95)),"target_distance_p50_mm":float(np.median(distance)*1000.0),
         "target_distance_p95_mm":float(np.percentile(distance,95)*1000.0),"weight_delta_l1_mean":float(np.mean(delta)),"weight_delta_l1_p95":float(np.percentile(delta,95)),
     }
@@ -5612,7 +5615,7 @@ def _source_proven_cross_mesh_seam_pairs(source: Any, positions: dict[str,np.nda
     return result,{"candidate_pair_count":int(len(cross)),"accepted_pair_count":int(len(result)),"accepted_mesh_pair_count":int(len(eligible)),"mesh_pair_witnesses":witness_report,"source_tolerance_mm":float(tolerance_m*1000.0),"minimum_pair_witnesses":int(minimum_pair_witnesses)}
 
 
-def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndarray], target_body_triangles: np.ndarray | None=None, source_body_triangles: np.ndarray | None=None, tolerance_m: float=.000075, minimum_pair_witnesses: int=6, body_margin_m: float=.00065) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
     """Keep repeated source-proven seams between separate garment meshes physically joined.
 
     Independent layer fitting is intentionally allowed, but two source meshes that share many
@@ -5628,24 +5631,12 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
         return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no repeated source-proven cross-mesh seam","discovery":discovery}
     out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
     target_sum={name:np.zeros_like(out[name]) for name in out};target_weight={name:np.zeros(len(out[name]),dtype=np.float64) for name in out}
-    before_gaps=[];body_pushes=0;body_push_max=0.0
-    body_tri=np.asarray(target_body_triangles,dtype=np.float64) if target_body_triangles is not None else np.zeros((0,3,3),dtype=np.float64)
-    source_body_tri=np.asarray(source_body_triangles,dtype=np.float64) if source_body_triangles is not None else np.zeros((0,3,3),dtype=np.float64)
+    before_gaps=[]
     for an,ai,bn,bi,source_delta in pairs:
         pa=np.asarray(out[an][ai],dtype=np.float64);pb=np.asarray(out[bn][bi],dtype=np.float64);mid=(pa+pb)*.5
         before_gaps.append(float(np.linalg.norm((pa-pb)-source_delta)))
-        # Seam closure owns the relationship between garment meshes, not garment/body spacing.  It may
-        # make one tiny penetration repair only when the embedded source body proves that this seam was
-        # actually body-adjacent.  Positive clearance is never added here.
-        if len(body_tri) and len(source_body_tri):
-            sa=np.asarray(source.data(an).get("V",[]),dtype=np.float64)[ai];sb=np.asarray(source.data(bn).get("V",[]),dtype=np.float64)[bi];source_mid=((sa+sb)*.5)[None,:]
-            _,_,source_signed,source_distance,_=_b14_nearest_surface(source_mid,source_body_tri,k=32);source_signed_value=float(np.asarray(source_signed).reshape(-1)[0]);source_distance_value=float(np.asarray(source_distance).reshape(-1)[0])
-            if np.isfinite(source_signed_value) and np.isfinite(source_distance_value) and source_distance_value<=.012 and -.0015<=source_signed_value<=.012:
-                _,normal,signed,_,_=_b14_nearest_surface(mid[None,:],body_tri,k=32);signed_value=float(np.asarray(signed).reshape(-1)[0])
-                if np.isfinite(signed_value) and signed_value<-.00002:
-                    n=np.asarray(normal,dtype=np.float64).reshape(-1,3)[0];nn=float(np.linalg.norm(n))
-                    if nn>1e-12:
-                        push=min(.00075,max(0.0,.00005-signed_value));mid=mid+n/nn*push;body_pushes+=1;body_push_max=max(body_push_max,push)
+        # Garment seams are restored from the untouched garment only.  Body geometry, collision,
+        # clearance and anatomy are intentionally not inputs to seam placement.
         ta=mid+source_delta*.5;tb=mid-source_delta*.5
         target_sum[an][ai]+=ta;target_weight[an][ai]+=1.0;target_sum[bn][bi]+=tb;target_weight[bn][bi]+=1.0
     changed=[];rejected=[];per_mesh={}
@@ -5690,12 +5681,10 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
         after_gaps.append(float(np.linalg.norm((out[an][ai]-out[bn][bi])-source_delta)))
     return out,{
         "enabled":True,
-        "policy":"repeated cross-mesh source seam witnesses retain their authored relative position after independent fitting",
+        "policy":"garment-only source seam witnesses retain their authored relative position after independent fitting; body geometry is not an input",
         "discovery":discovery,
         "changed_meshes":changed,
         "rejected_meshes":rejected,
-        "body_penetration_repair_count":int(body_pushes),
-        "body_penetration_repair_max_mm":float(body_push_max*1000.0),
         "seam_error_p50_before_mm":float(np.median(before_gaps)*1000.0) if before_gaps else 0.0,
         "seam_error_p95_before_mm":float(np.percentile(before_gaps,95)*1000.0) if before_gaps else 0.0,
         "seam_error_p50_after_mm":float(np.median(after_gaps)*1000.0) if after_gaps else 0.0,
@@ -5854,7 +5843,7 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     # Independent mesh solves can pull apart a boundary that was physically shared in the source.
     # Rejoin those source-proven seams once.  Seam closure may make only a tiny true-penetration repair;
     # it cannot use body spacing as a shaping force.
-    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,target_collision_tri,source_body_triangles=source_literal_collision_tri,tolerance_m=.000075,minimum_pair_witnesses=6,body_margin_m=.00005)
+    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,tolerance_m=.000075,minimum_pair_witnesses=6)
     post_seam_body_clearance={"enabled":False,"reason":"single bounded penetration pass; seam closure does not own body clearance"}
     final_source_shared_seam_reassert={"enabled":False,"reason":"single authored seam closure is final"}
     skinning,mesh_skin_records=_retarget_frozen_layer_skinning(source,positions,cache,source_tri)

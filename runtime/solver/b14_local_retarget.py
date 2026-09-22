@@ -272,7 +272,7 @@ def _graph_distance_from_seeds(nbr: list[set[int]], seeds: np.ndarray, component
     return dist
 
 
-def _quadratic_bridge_target(base: np.ndarray, seed_group: np.ndarray, nbr: list[set[int]], component_mask: np.ndarray, boundary_hops: np.ndarray, target_normals: np.ndarray, *, pull: float=.50, max_move_m: float=.0025) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
+def _quadratic_bridge_target(base: np.ndarray, seed_group: np.ndarray, nbr: list[set[int]], component_mask: np.ndarray, boundary_hops: np.ndarray, target_normals: np.ndarray, *, pull: float=.62, max_move_m: float=.0032) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
     V=np.asarray(base,dtype=np.float64);dist=_graph_distance_from_seeds(nbr,seed_group,component_mask,boundary_hops,7)
     core=np.flatnonzero(dist<=3);fit_ids=np.flatnonzero((dist>=4)&(dist<=7))
     if len(core)<3 or len(fit_ids)<12:return V.copy(),np.zeros(len(V),dtype=bool),{"selected":False,"reason":"insufficient local shell neighbourhood"}
@@ -296,7 +296,11 @@ def _quadratic_bridge_target(base: np.ndarray, seed_group: np.ndarray, nbr: list
     ring4=np.flatnonzero(dist==4)
     for i in ring4:
         nearest=core[np.argsort(np.linalg.norm(V[core]-V[i],axis=1))[:8]]
-        if len(nearest):target[i]+=0.45*np.mean(raw[nearest],axis=0)
+        if len(nearest):target[i]+=0.58*np.mean(raw[nearest],axis=0)
+    ring5=np.flatnonzero(dist==5)
+    for i in ring5:
+        nearest=core[np.argsort(np.linalg.norm(V[core]-V[i],axis=1))[:8]]
+        if len(nearest):target[i]+=0.22*np.mean(raw[nearest],axis=0)
     changed|=np.linalg.norm(target-V,axis=1)>1e-12
     return target,changed,{"selected":True,"reason":"new interior convexity exceeds surrounding authored shell","core_vertices":int(len(core)),"fit_vertices":int(len(fit_ids)),"positive_excess_vertices":positive,"tolerance_mm":float(tolerance*1000.0),"residual_p95_mm":float(np.percentile(residual,95)*1000.0),"max_requested_mm":float(np.max(requested)*1000.0 if len(requested) else 0.0)}
 
@@ -342,13 +346,13 @@ def _bridge_new_local_curvature(source_vertices: np.ndarray, faces: np.ndarray, 
             row["reason"]="shell is not closely body-supported";reports.append(row);continue
         displacement=out-P;smoothed=_smooth_displacement(displacement,nbr,ids,iterations=4,alpha=.5);normal_residual=np.abs(np.einsum("ij,ij->i",displacement-smoothed,N))
         clearance_error=np.abs(target_clear-source_clear);seed_mask=np.zeros(len(P),dtype=bool)
-        seed_mask[ids]=(hops[ids]>=3)&(normal_residual[ids]>=.0017)&(clearance_error[ids]>=.0030)
+        seed_mask[ids]=(hops[ids]>=3)&(normal_residual[ids]>=.00125)&(clearance_error[ids]>=.0022)
         seeds=np.flatnonzero(seed_mask);row["strong_seed_vertices"]=int(len(seeds))
         if not len(seeds):
             row["reason"]="no new interior high-frequency deformation";reports.append(row);continue
         groups=_cluster_points(seeds,out,radius_m=.035);component_mask=labels==component_index;component_candidate=out.copy();component_changed=np.zeros(len(P),dtype=bool);group_reports=[]
         for group in groups:
-            candidate,changed,group_report=_quadratic_bridge_target(component_candidate,group,nbr,component_mask,hops,target_normals,pull=.50,max_move_m=.0025)
+            candidate,changed,group_report=_quadratic_bridge_target(component_candidate,group,nbr,component_mask,hops,target_normals,pull=.62,max_move_m=.0032)
             if bool(group_report.get("selected")):
                 component_candidate[changed]=candidate[changed];component_changed|=changed
             group_reports.append(group_report)

@@ -47,7 +47,7 @@ def test_repeated_cross_mesh_source_seam_is_rejoined_after_independent_fit():
     solved_right[right_seam, 0] += .002
 
     out, report = p._preserve_final_source_shared_seams(
-        source, {"left": solved_left, "right": solved_right}, None,
+        source, {"left": solved_left, "right": solved_right},
         tolerance_m=.000001, minimum_pair_witnesses=3)
 
     assert report["enabled"]
@@ -68,12 +68,32 @@ def test_isolated_cross_mesh_contact_does_not_become_seam_authority():
     solved["right"][0] += np.asarray([.004, 0.0, 0.0])
 
     out, report = p._preserve_final_source_shared_seams(
-        source, solved, None, tolerance_m=.000001, minimum_pair_witnesses=3)
+        source, solved, tolerance_m=.000001, minimum_pair_witnesses=3)
 
     assert not report["enabled"]
     assert np.array_equal(out["left"], solved["left"])
     assert np.array_equal(out["right"], solved["right"])
 
+
+
+def test_shared_seam_is_garment_only_and_preserves_authored_offset():
+    left, left_faces = _grid(-.10, 0.0, -.05, .05, .010)
+    right, right_faces = _grid(.00004, .10004, -.05, .05, .010)
+    source = _Source({"left": {"V": left, "F": left_faces}, "right": {"V": right, "F": right_faces}})
+    solved_left = left.copy(); solved_right = right.copy()
+    seam_left = np.isclose(left[:, 0], 0.0)
+    seam_right = np.isclose(right[:, 0], .00004)
+    solved_left[seam_left, 2] += .004
+    solved_right[seam_right, 2] -= .003
+
+    out, report = p._preserve_final_source_shared_seams(
+        source, {"left": solved_left, "right": solved_right}, tolerance_m=.00005, minimum_pair_witnesses=3)
+
+    assert report["enabled"]
+    assert "body" not in " ".join(report.keys()).casefold()
+    delta = out["left"][seam_left] - out["right"][seam_right]
+    expected = left[seam_left] - right[seam_right]
+    np.testing.assert_allclose(delta, expected, atol=1e-12)
 
 def test_final_source_authored_clearance_repairs_small_true_penetration_including_face_interiors():
     garment, faces = _grid(-.10, .10, -.10, .10, .001, nx=5, ny=5)
@@ -159,7 +179,7 @@ def test_final_clearance_and_shared_seam_compose_without_reopening_boundary():
     positions = {"left": solved_left, "right": solved_right}
 
     positions, _ = p._final_source_authored_body_clearance(source, positions, body, body, body, margin_m=.00005)
-    positions, report = p._preserve_final_source_shared_seams(source, positions, body, source_body_triangles=body, tolerance_m=.000001, minimum_pair_witnesses=3, body_margin_m=.00005)
+    positions, report = p._preserve_final_source_shared_seams(source, positions, tolerance_m=.000001, minimum_pair_witnesses=3)
 
     left_seam = np.isclose(left[:, 0], 0.0); right_seam = np.isclose(right[:, 0], 0.0)
     assert report["seam_error_p95_after_mm"] < 1e-6

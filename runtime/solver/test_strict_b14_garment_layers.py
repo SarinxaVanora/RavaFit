@@ -303,3 +303,19 @@ def test_final_source_attachment_closure_can_cross_mesh_boundaries():
     assert np.array_equal(out["shell"],positions["shell"])
     assert float(np.mean(out["connector"][:,1]-connector[:,1]))>.0055
     assert float(np.mean(out["ribbon"][[0,8,16],1]-ribbon[[0,8,16],1]))>.0050
+
+def test_bilateral_bridge_skinning_preserves_source_weights_exactly(monkeypatch):
+    names=["j_asi_a_l","j_asi_a_r","j_kosi","j_sebo_a"]
+    raw=np.asarray([[0.0,0.0,0.0],[0.01,0.0,0.0]],dtype=np.float64)
+    fitted=raw+np.asarray([[0.0,0.0,0.025],[0.0,0.0,0.025]],dtype=np.float64)
+    source_weights=np.asarray([[0.20,0.20,0.55,0.05],[0.18,0.22,0.55,0.05]],dtype=np.float64)
+    target_weights=np.asarray([[0.75,0.05,0.15,0.05],[0.05,0.75,0.15,0.05]],dtype=np.float64)
+    def fake_target(points,cache,source_weights=None,source_joint_names=None):
+        return target_weights.copy(),np.zeros(len(points),dtype=np.float64)
+    monkeypatch.setattr(p,"_target_skin_weights_at_points",fake_target)
+    cache={"names":names,"target_surface_W":np.ones((1,len(names)),dtype=np.float64)}
+    labels=np.asarray([0,0],dtype=np.int64);classes={0:"shell"};raw_to_weld=np.asarray([0,1],dtype=np.int64)
+    out,report=p._retarget_garment_skinning(fitted,raw,source_weights,names,cache,"body_following_flexible_layer","body_following_flexible_layer",labels,classes,raw_to_weld)
+    np.testing.assert_allclose(out,source_weights,atol=1e-12)
+    assert report["bilateral_authored_vertices"]==2
+    assert report["bilateral_exact_source_weight_preserve"] is True

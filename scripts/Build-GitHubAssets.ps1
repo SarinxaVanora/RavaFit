@@ -1,7 +1,7 @@
 param(
     [string]$GitHubRepository = "SarinxaVanora/RavaFit",
     [string]$Branch = "master",
-    [string]$RuntimeVersion = "1.1.6",
+    [string]$RuntimeVersion = "1.1.7",
     [string]$BodiesVersion = "1.0.0",
     [string]$MinimumPluginVersion = "1.1.1",
     [string]$Runtime = "",
