@@ -936,6 +936,52 @@ def _triangles_from_surface(vertices: np.ndarray, faces: np.ndarray) -> np.ndarr
     return np.asarray(vertices, np.float64)[np.asarray(faces, np.int64)]
 
 
+def _sanitise_strict_b14_surface_triangles(triangles: np.ndarray, surface_name: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove only unusable faces before crossing the untouched frozen-B14 boundary.
+
+    Frozen B14 deliberately uses its historical ``trimesh.triangles.closest_point`` path.
+    A zero-area/near-collinear support triangle can make that routine divide by zero and return
+    NaN even when every input vertex is finite.  Such a face has no usable surface area, so
+    dropping it does not change the represented collision surface; it only prevents invalid
+    closest-point candidates from entering the historical optimiser.
+    """
+    tri=np.asarray(triangles,dtype=np.float64)
+    if tri.ndim!=3 or tri.shape[1:]!=(3,3):
+        raise ValueError(f"{surface_name} strict B14 surface has invalid triangle shape {tri.shape}; expected (N, 3, 3).")
+    if len(tri)==0:
+        raise ValueError(f"{surface_name} strict B14 surface is empty.")
+
+    finite=np.all(np.isfinite(tri),axis=(1,2))
+    keep=finite.copy()
+    degenerate=np.zeros(len(tri),dtype=bool)
+    finite_ids=np.flatnonzero(finite)
+    if len(finite_ids):
+        candidate=tri[finite_ids]
+        ab=candidate[:,1]-candidate[:,0];ac=candidate[:,2]-candidate[:,0];bc=candidate[:,2]-candidate[:,1]
+        edge_sq=np.maximum.reduce((np.sum(ab*ab,axis=1),np.sum(ac*ac,axis=1),np.sum(bc*bc,axis=1)))
+        double_area=np.linalg.norm(np.cross(ab,ac),axis=1)
+        # Relative to each face's own edge scale.  This rejects collapsed/near-collinear faces
+        # without imposing a world-space minimum that could erase legitimately tiny detail.
+        local_degenerate=(edge_sq<=0.0)|(double_area<=edge_sq*1.0e-12)
+        degenerate[finite_ids]=local_degenerate
+        keep[finite_ids]&=~local_degenerate
+
+    cleaned=np.ascontiguousarray(tri[keep],dtype=np.float64)
+    if len(cleaned)==0:
+        raise ValueError(
+            f"{surface_name} strict B14 surface contains no usable triangles after sanitisation "
+            f"(input={len(tri)}, non_finite={int(np.sum(~finite))}, degenerate={int(np.sum(degenerate))})."
+        )
+    report={
+        "input_triangle_count":int(len(tri)),
+        "output_triangle_count":int(len(cleaned)),
+        "dropped_non_finite_triangle_count":int(np.sum(~finite)),
+        "dropped_degenerate_triangle_count":int(np.sum(degenerate)),
+        "changed":bool(np.any(~keep)),
+    }
+    return cleaned,report
+
+
 def _rigid_fit_points(source: np.ndarray, target: np.ndarray, weights: np.ndarray | None = None):
     source = np.asarray(source, dtype=np.float64); target = np.asarray(target, dtype=np.float64)
     if len(source) != len(target) or len(source) < 3:
@@ -5481,6 +5527,8 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     if source_tri is None:source_tri=_triangles_from_surface(cache.get("_ravafit_strict_source_surface_V",cache["source_support_V"]),cache.get("_ravafit_strict_source_surface_F",cache["source_support_F"]))
     target_tri=cache.get("_ravafit_strict_target_surface_triangles")
     if target_tri is None:target_tri=_triangles_from_surface(cache.get("_ravafit_strict_target_surface_V",cache["target_support_V"]),cache.get("_ravafit_strict_target_surface_F",cache["target_support_F"]))
+    source_tri,strict_source_surface_sanitisation=_sanitise_strict_b14_surface_triangles(source_tri,"source")
+    target_tri,strict_target_surface_sanitisation=_sanitise_strict_b14_surface_triangles(target_tri,"target")
     target_collision_tri=cache.get("_ravafit_target_collision_triangles")
     if target_collision_tri is None:
         suppression=cache.get("_ravafit_source_body_suppression") or {}
@@ -5604,6 +5652,7 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
         "strict_frozen_b14":True,"strict_layer_orchestration":True,
         "principle":"B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.",
         "strict_contract_report":cache.get("_ravafit_strict_b14_report"),
+        "strict_surface_sanitisation":{"source":strict_source_surface_sanitisation,"target":strict_target_surface_sanitisation},
         "garment_layer_count":len(layers),"layer_order_relation_count":len(relations),
         "layers":layer_diagnostics,
         "layer_order_graph":[{k:v for k,v in relation.items() if k!="source_gap"} for relation in relations],
@@ -5744,6 +5793,9 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
     target_tri=cache.get("_ravafit_target_support_triangles")
     if target_tri is None:
         target_tri=_triangles_from_surface(cache["target_support_V"],cache["target_support_F"]);cache["_ravafit_target_support_triangles"]=target_tri
+    if strict_b14_contract:
+        source_tri,_=_sanitise_strict_b14_surface_triangles(source_tri,"source")
+        target_tri,_=_sanitise_strict_b14_surface_triangles(target_tri,"target")
     target_collision_tri=cache.get("_ravafit_target_collision_triangles")
     if target_collision_tri is None:
         suppression=cache.get("_ravafit_source_body_suppression") or {}

@@ -79,3 +79,20 @@ def test_strict_uv_map_repairs_only_gross_rig_ambiguous_duplicate_uv():
     assert report["rig_ambiguity_repaired_vertices"]==1
     assert float(Y[0,0])<0.05
     np.testing.assert_allclose(NT,np.asarray([[0,0,1]],float),atol=1e-12)
+
+
+def test_strict_b14_surface_sanitisation_drops_only_unusable_faces():
+    tri=np.asarray([
+        [[0.,0.,0.],[1.,0.,0.],[0.,1.,0.]],
+        [[0.,0.,0.],[0.,0.,0.],[0.,0.,0.]],
+        [[0.,0.,0.],[1.,0.,0.],[2.,0.,0.]],
+        [[np.nan,0.,0.],[0.,1.,0.],[0.,0.,1.]],
+    ],dtype=np.float64)
+    cleaned,report=p._sanitise_strict_b14_surface_triangles(tri,"target-test")
+    assert cleaned.shape==(1,3,3)
+    np.testing.assert_array_equal(cleaned[0],tri[0])
+    assert report["input_triangle_count"]==4
+    assert report["output_triangle_count"]==1
+    assert report["dropped_non_finite_triangle_count"]==1
+    assert report["dropped_degenerate_triangle_count"]==2
+    assert report["changed"] is True
