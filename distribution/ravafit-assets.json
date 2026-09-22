@@ -1,18 +1,18 @@
-﻿{
-    "schema":  1,
-    "runtime":  {
-                    "version":  "1.1.5",
-                    "url":  "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.zip",
-                    "sha256":  "7451059755153cfb7e95b859804b92869fe79b2ec70eb59c8b0c2e80c0b6b63c",
-                    "size":  188052329,
-                    "productionRevision":  "1.1.1-multi-region-support-source-preserve",
-                    "minimumPluginVersion":  "1.1.1"
-                },
-    "bodies":  {
-                   "version":  "1.0.0",
-                   "url":  "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/Bodies.rbody",
-                   "sha256":  "5d8e2b301742e85038cd3ec74dabbe094c7005d37a07f05d48491826a4b8b0a0",
-                   "size":  478922442,
-                   "minimumPluginVersion":  "1.1.1"
-               }
+{
+  "schema": 1,
+  "runtime": {
+    "version": "1.1.5",
+    "url": "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.zip",
+    "sha256": "afd596c0ab90eabe9dcc2c81831a55de362c7a77e6e25f48233a0868b9636dab",
+    "size": 192228329,
+    "productionRevision": "1.1.1-multi-region-support-source-preserve",
+    "minimumPluginVersion": "1.1.1"
+  },
+  "bodies": {
+    "version": "1.0.0",
+    "url": "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/Bodies.rbody",
+    "sha256": "5d8e2b301742e85038cd3ec74dabbe094c7005d37a07f05d48491826a4b8b0a0",
+    "size": 478922442,
+    "minimumPluginVersion": "1.1.1"
+  }
 }
