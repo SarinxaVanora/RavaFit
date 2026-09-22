@@ -222,8 +222,9 @@ internal sealed class CustomiseModService
             var controlRequests = prepared.Groups.Select(group => new V4CustomisationGroupRequest(group.BodyName, group.Slot, request.Model.GamePath, group.SourceKey, group.Group)).ToArray();
             await _writer.ReplaceModelAndPiercingControlsAsync(Path.Combine(request.Mod.ModRoot, "meta.json"), request.GroupKey, request.OptionKey, request.Model.GamePath, generated.RelativePath, controlRequests, sourcePiercingResources, cancellationToken).ConfigureAwait(false);
             metaCommitted = true;
-            if (!_penumbra.Reload(request.Mod, out var reloadError))
-                throw new InvalidOperationException($"Piercings were written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(request.Mod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"Piercings were written safely, but Penumbra reload failed: {reloadResult.Error}");
             Status = $"Assigned {request.PiercingBody.BodyName} piercings";
         }
         catch
@@ -293,8 +294,9 @@ internal sealed class CustomiseModService
             Status = request.Toggles.Count == 1 ? "Adding visibility toggle" : $"Adding {request.Toggles.Count} visibility toggles";
             await _writer.AddAttributeVisibilityTogglesAsync(Path.Combine(request.Mod.ModRoot, "meta.json"), request.GroupKey, request.OptionKey, request.Model.GamePath, generated.RelativePath, controls, cancellationToken).ConfigureAwait(false);
             metaCommitted = true;
-            if (!_penumbra.Reload(request.Mod, out var reloadError))
-                throw new InvalidOperationException($"Visibility toggles were written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(request.Mod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"Visibility toggles were written safely, but Penumbra reload failed: {reloadResult.Error}");
             Status = request.Toggles.Count == 1 ? $"Added {controls[0].ToggleName}" : $"Added {request.Toggles.Count} visibility toggles";
         }
         catch
@@ -458,9 +460,10 @@ internal sealed class CustomiseModService
             var metaPath = Path.Combine(root, "meta.json");
             await File.WriteAllTextAsync(metaPath, meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), cancellationToken).ConfigureAwait(false);
             _ = PenumbraV4Document.Load(metaPath);
-            if (!_penumbra.AddMod(directoryName, out var addError))
-                throw new InvalidOperationException($"The new mod was created, but Penumbra could not add it: {addError}");
-            _penumbra.Refresh();
+            var addResult = await _penumbra.AddModAsync(directoryName, cancellationToken).ConfigureAwait(false);
+            if (!addResult.Success)
+                throw new InvalidOperationException($"The new mod was created, but Penumbra could not add it: {addResult.Error}");
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
             return _penumbra.Mods.FirstOrDefault(mod => string.Equals(Path.GetFullPath(mod.ModRoot), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase))
                 ?? new PenumbraModInfo(directoryName, displayName, root);
         }

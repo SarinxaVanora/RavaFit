@@ -1,10 +1,10 @@
 ﻿{
     "schema":  1,
     "runtime":  {
-                    "version":  "1.1.4",
+                    "version":  "1.1.5",
                     "url":  "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.zip",
-                    "sha256":  "a817a611982534107d3426cf852d757408ed306f5ca864e010703875c126e264",
-                    "size":  188046735,
+                    "sha256":  "7451059755153cfb7e95b859804b92869fe79b2ec70eb59c8b0c2e80c0b6b63c",
+                    "size":  188052329,
                     "productionRevision":  "1.1.1-multi-region-support-source-preserve",
                     "minimumPluginVersion":  "1.1.1"
                 },

@@ -220,7 +220,7 @@ internal sealed partial class AnimationPortService
                 ?? throw new InvalidDataException("Generated animation mod metadata could not be verified.");
             File.Move(tempMeta, destinationMeta, true);
 
-            _penumbra.Refresh();
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
             Progress = new(AnimationPortStage.Complete, 1f, "Done");
             return new AnimationPortResult(destinationName, destinationRoot, converted, unchanged, droppedTracks, bindings);
         }
@@ -386,9 +386,10 @@ internal sealed partial class AnimationPortService
             var generatedModDirectory = Path.GetFileName(destinationRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             if (string.IsNullOrWhiteSpace(generatedModDirectory))
                 throw new InvalidOperationException("RavaFit wrote the converted vanilla animation safely, but Penumbra could not register the generated mod: generated mod directory was invalid");
-            if (!_penumbra.AddMod(generatedModDirectory, out var addError))
-                throw new InvalidOperationException($"RavaFit wrote the converted vanilla animation safely, but Penumbra could not register the generated mod: {addError}");
-            _penumbra.Refresh();
+            var addResult = await _penumbra.AddModAsync(generatedModDirectory, cancellationToken).ConfigureAwait(false);
+            if (!addResult.Success)
+                throw new InvalidOperationException($"RavaFit wrote the converted vanilla animation safely, but Penumbra could not register the generated mod: {addResult.Error}");
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
             Progress = new(AnimationPortStage.Complete, 1f, "Done");
             return new AnimationPortResult(destinationName, destinationRoot, converted, unchanged, droppedTracks, bindings);
         }

@@ -90,7 +90,7 @@ jobs:
           ./scripts/Build-Distribution.ps1 `
             -GitHubRepository "${{ github.repository }}" `
             -Branch "master" `
-            -RuntimeVersion "1.1.4" `
+            -RuntimeVersion "1.1.5" `
             -BodiesVersion "1.0.0" `
             -MinimumPluginVersion "1.1.1"
 

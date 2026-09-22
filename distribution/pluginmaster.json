@@ -2,7 +2,7 @@
     "Author":  "RavaFit",
     "Name":  "RavaFit",
     "InternalName":  "RavaFit",
-    "AssemblyVersion":  "1.1.2.0",
+    "AssemblyVersion":  "1.1.4.0",
     "Description":  "Port outfits and animations between FFXIV races, genders and supported body shapes.",
     "ApplicableVersion":  "any",
     "DalamudApiLevel":  15,
@@ -16,5 +16,5 @@
     "RepoUrl":  "https://github.com/SarinxaVanora/RavaFit",
     "DownloadLinkInstall":  "https://raw.githubusercontent.com/SarinxaVanora/RavaFit/master/distribution/latest.zip",
     "DownloadLinkUpdate":  "https://raw.githubusercontent.com/SarinxaVanora/RavaFit/master/distribution/latest.zip",
-    "LastUpdate":  1790081234
+    "LastUpdate":  1790084655
 }

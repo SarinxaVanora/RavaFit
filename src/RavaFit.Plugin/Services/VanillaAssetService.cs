@@ -370,9 +370,10 @@ internal sealed class VanillaAssetService
                 },
             };
             await File.WriteAllTextAsync(Path.Combine(root, "meta.json"), meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), cancellationToken).ConfigureAwait(false);
-            if (!_penumbra.AddMod(folderName, out var addError))
-                throw new InvalidOperationException($"RavaFit staged the vanilla outfit safely, but Penumbra could not register the new mod: {addError}");
-            _penumbra.Refresh();
+            var addResult = await _penumbra.AddModAsync(folderName, cancellationToken).ConfigureAwait(false);
+            if (!addResult.Success)
+                throw new InvalidOperationException($"RavaFit staged the vanilla outfit safely, but Penumbra could not register the new mod: {addResult.Error}");
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
             return _penumbra.Mods.FirstOrDefault(mod => string.Equals(Path.GetFullPath(mod.ModRoot), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) ?? new PenumbraModInfo(folderName, sourceName, root);
         }
         catch
@@ -455,9 +456,10 @@ internal sealed class VanillaAssetService
                 },
             };
             await File.WriteAllTextAsync(Path.Combine(root, "meta.json"), meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), cancellationToken).ConfigureAwait(false);
-            if (!_penumbra.AddMod(folderName, out var addError))
-                throw new InvalidOperationException($"RavaFit staged the vanilla outfit safely, but Penumbra could not register the new mod: {addError}");
-            _penumbra.Refresh();
+            var addResult = await _penumbra.AddModAsync(folderName, cancellationToken).ConfigureAwait(false);
+            if (!addResult.Success)
+                throw new InvalidOperationException($"RavaFit staged the vanilla outfit safely, but Penumbra could not register the new mod: {addResult.Error}");
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
             return _penumbra.Mods.FirstOrDefault(mod => string.Equals(Path.GetFullPath(mod.ModRoot), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) ?? new PenumbraModInfo(folderName, sourceName, root);
         }
         catch

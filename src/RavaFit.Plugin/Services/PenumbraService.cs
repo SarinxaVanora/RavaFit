@@ -28,6 +28,7 @@ internal sealed class PenumbraService : IDisposable
     private readonly Func<string, string> _resolvePlayerPath;
     private readonly CancellationTokenSource _disposeCts = new();
     private readonly CancellationToken _disposeToken;
+    private readonly SemaphoreSlim _mutationGate = new(1, 1);
     private int _refreshRevision;
     private int _refreshWorkerRunning;
 
@@ -240,7 +241,7 @@ internal sealed class PenumbraService : IDisposable
         }
     }
 
-    public bool AddMod(string directory, out string error)
+    private bool AddModOnFrameworkThread(string directory, out string error)
     {
         try
         {
@@ -255,13 +256,40 @@ internal sealed class PenumbraService : IDisposable
         }
         catch (Exception ex)
         {
-            error = ex.Message;
+            error = DescribeIpcFailure(ex);
             _log.Error(ex, "Penumbra add-mod failed for {ModDirectory}", directory);
             return false;
         }
     }
 
-    public bool Reload(PenumbraModInfo mod, out string error)
+    public async Task<(bool Success, string Error)> AddModAsync(string directory, CancellationToken cancellationToken = default)
+    {
+        await _mutationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await _framework.RunOnTick(() =>
+            {
+                var success = AddModOnFrameworkThread(directory, out var error);
+                return (success, error);
+            }, delayTicks: 2, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var error = DescribeIpcFailure(ex);
+            _log.Error(ex, "Penumbra add-mod dispatch failed for {ModDirectory}", directory);
+            return (false, error);
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
+    }
+
+    private bool ReloadOnFrameworkThread(PenumbraModInfo mod, out string error)
     {
         try
         {
@@ -276,10 +304,68 @@ internal sealed class PenumbraService : IDisposable
         }
         catch (Exception ex)
         {
-            error = ex.Message;
+            error = DescribeIpcFailure(ex);
             _log.Error(ex, "Penumbra reload failed for {Mod}", mod.Name);
             return false;
         }
+    }
+
+    public async Task<(bool Success, string Error)> ReloadAsync(PenumbraModInfo mod, CancellationToken cancellationToken = default)
+    {
+        await _mutationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await _framework.RunOnTick(() =>
+            {
+                var success = ReloadOnFrameworkThread(mod, out var error);
+                return (success, error);
+            }, delayTicks: 2, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var error = DescribeIpcFailure(ex);
+            _log.Error(ex, "Penumbra reload dispatch failed for {Mod}", mod.Name);
+            return (false, error);
+        }
+        finally
+        {
+            _mutationGate.Release();
+        }
+    }
+
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var snapshot = await _framework.RunOnFrameworkThread(CaptureSnapshot).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            var state = await Task.Run(() => BuildRefreshState(snapshot), cancellationToken).ConfigureAwait(false);
+            await _framework.RunOnFrameworkThread(() =>
+            {
+                ApplyRefreshState(state);
+                return true;
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ApplyRefreshFailure(ex);
+            _log.Debug(ex, "Penumbra refresh failed.");
+        }
+    }
+
+    private static string DescribeIpcFailure(Exception ex)
+    {
+        var current = ex;
+        while (current.InnerException is not null) current = current.InnerException;
+        return string.IsNullOrWhiteSpace(current.Message) ? ex.Message : current.Message;
     }
 
     private static string ResolvePhysicalModRoot(string modDirectoryRoot, string modDirectoryName)

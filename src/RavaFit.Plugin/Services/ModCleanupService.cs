@@ -1,5 +1,5 @@
-using System.Text.Json.Nodes;
 using Dalamud.Plugin.Services;
+using System.Text.Json.Nodes;
 using RavaFit.Core.Models;
 using RavaFit.Core.Penumbra;
 
@@ -8,14 +8,12 @@ namespace RavaFit.Services;
 internal sealed class ModCleanupService
 {
     private readonly PenumbraService _penumbra;
-    private readonly IFramework _framework;
     private readonly IPluginLog _log;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
-    public ModCleanupService(PenumbraService penumbra, IFramework framework, IPluginLog log)
+    public ModCleanupService(PenumbraService penumbra, IPluginLog log)
     {
         _penumbra = penumbra;
-        _framework = framework;
         _log = log;
     }
 
@@ -121,12 +119,8 @@ internal sealed class ModCleanupService
             }
 
             Status = "Refreshing Penumbra";
-            var reloadResult = await _framework.RunOnTick(() =>
-            {
-                var success = _penumbra.Reload(mod, out var error);
-                _penumbra.Refresh();
-                return (Success: success, Error: error);
-            }, delayTicks: 2, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var reloadResult = await _penumbra.ReloadAsync(mod, cancellationToken).ConfigureAwait(false);
+            await _penumbra.RefreshAsync(cancellationToken).ConfigureAwait(false);
 
             var warnings = new List<string>();
             var removedFiles = 0;

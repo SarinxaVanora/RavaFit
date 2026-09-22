@@ -245,8 +245,9 @@ internal sealed class ConversionService
                 throw;
             }
 
-            if (!_penumbra.Reload(mod, out var reloadError))
-                throw new InvalidOperationException($"The new option was written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(mod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"The new option was written safely, but Penumbra reload failed: {reloadResult.Error}");
 
             SetProgress(ConversionStage.Complete, 1.0f, "Complete");
             return result;
@@ -391,8 +392,9 @@ internal sealed class ConversionService
                 foreach (var support in generatedSupportFiles) DeleteUnreferencedSupportFile(support);
                 throw;
             }
-            if (!_penumbra.Reload(penumbraMod, out var reloadError))
-                throw new InvalidOperationException($"Conversion was written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(penumbraMod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"Conversion was written safely, but Penumbra reload failed: {reloadResult.Error}");
 
             SetProgress(ConversionStage.Complete, 1.0f, "Complete");
             return result;
@@ -591,8 +593,9 @@ internal sealed class ConversionService
                 throw;
             }
 
-            if (!_penumbra.Reload(penumbraMod, out var reloadError))
-                throw new InvalidOperationException($"The converted outfit was written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(penumbraMod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"The converted outfit was written safely, but Penumbra reload failed: {reloadResult.Error}");
 
             SetProgress(ConversionStage.Complete, 1.0f, "Complete");
             return results;
@@ -830,8 +833,9 @@ internal sealed class ConversionService
                 throw;
             }
 
-            if (!_penumbra.Reload(penumbraMod, out var reloadError))
-                throw new InvalidOperationException($"The converted outfit was written safely, but Penumbra reload failed: {reloadError}");
+            var reloadResult = await _penumbra.ReloadAsync(penumbraMod, cancellationToken).ConfigureAwait(false);
+            if (!reloadResult.Success)
+                throw new InvalidOperationException($"The converted outfit was written safely, but Penumbra reload failed: {reloadResult.Error}");
 
             SetProgress(ConversionStage.Complete, 1.0f, "Complete");
             return results;

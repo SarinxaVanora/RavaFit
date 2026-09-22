@@ -604,6 +604,7 @@ public sealed class PenumbraV4Writer
         var pendingNames = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         var sourceSnapshots = new List<(V4OptionInfo Source, string Json)>();
         var appended = new List<(string GroupKey, Guid Id, string Name, JsonObject Node)>();
+        var appendedVisibilityGroups = new List<(Guid Id, Guid ParentOptionId, string Name)>();
 
         foreach (var request in requests)
         {
@@ -645,6 +646,9 @@ public sealed class PenumbraV4Writer
                 ?? throw new InvalidDataException($"Group '{group.Name}' has no Options array.");
             optionArray.Add(clone);
             appended.Add((group.StableKey, newId, request.NewOptionName, clone));
+
+            if (source.Id is Guid sourceOptionId)
+                appendedVisibilityGroups.AddRange(CloneAttributeVisibilityGroupsForGeneratedOption(document, sourceOptionId, newId, request.NewOptionName));
         }
 
         foreach (var (source, json) in sourceSnapshots)
@@ -813,6 +817,17 @@ public sealed class PenumbraV4Writer
                     throw new InvalidDataException("V4 target-body transaction validation failed: generated group name changed.");
             }
 
+            foreach (var visibilityGroup in appendedVisibilityGroups)
+            {
+                var verifiedVisibility = verify.Groups.SingleOrDefault(g => g.Id == visibilityGroup.Id)
+                    ?? throw new InvalidDataException($"V4 visibility transaction validation failed: group '{visibilityGroup.Name}' was not found.");
+                if (PenumbraV4Document.FindProperty(verifiedVisibility.Node, "Condition") is not JsonObject condition
+                    || !string.Equals(ReadString(condition, "Type"), "Setting", StringComparison.OrdinalIgnoreCase)
+                    || !Guid.TryParse(ReadString(condition, "Setting"), out var conditionSetting)
+                    || conditionSetting != visibilityGroup.ParentOptionId)
+                    throw new InvalidDataException($"V4 visibility transaction validation failed: group '{visibilityGroup.Name}' is not scoped to its generated outfit option.");
+            }
+
             var liveMetaBytes = await File.ReadAllBytesAsync(metaPath, cancellationToken).ConfigureAwait(false);
             if (!originalMetaBytes.AsSpan().SequenceEqual(liveMetaBytes))
                 throw new InvalidDataException("meta.json changed on disk while RavaFit was preparing the outfit transaction. Nothing was written; retry the conversion.");
@@ -833,6 +848,57 @@ public sealed class PenumbraV4Writer
             if (File.Exists(tempPath))
                 File.Delete(tempPath);
         }
+    }
+
+    private static IReadOnlyList<(Guid Id, Guid ParentOptionId, string Name)> CloneAttributeVisibilityGroupsForGeneratedOption(PenumbraV4Document document, Guid sourceOptionId, Guid generatedOptionId, string generatedOptionName)
+    {
+        var groups = PenumbraV4Document.FindProperty(document.Root, "Groups") as JsonArray;
+        if (groups is null)
+            return [];
+
+        var marker = $"RavaFit attribute visibility: {sourceOptionId:D}";
+        var sourceGroups = groups.OfType<JsonObject>()
+            .Where(group => string.Equals(ReadString(group, "Type"), "Multi", StringComparison.OrdinalIgnoreCase))
+            .Where(group => string.Equals(ReadString(group, "Description"), marker, StringComparison.OrdinalIgnoreCase))
+            .Where(group =>
+            {
+                if (PenumbraV4Document.FindProperty(group, "Condition") is not JsonObject condition)
+                    return false;
+                return string.Equals(ReadString(condition, "Type"), "Setting", StringComparison.OrdinalIgnoreCase)
+                    && Guid.TryParse(ReadString(condition, "Setting"), out var settingId)
+                    && settingId == sourceOptionId;
+            })
+            .ToArray();
+
+        if (sourceGroups.Length == 0)
+            return [];
+
+        var result = new List<(Guid Id, Guid ParentOptionId, string Name)>(sourceGroups.Length);
+        foreach (var sourceGroup in sourceGroups)
+        {
+            var clone = sourceGroup.DeepClone().AsObject();
+            var newGroupId = Guid.NewGuid();
+            var name = $"Visibility · {generatedOptionName}";
+            SetProperty(clone, "Id", JsonValue.Create(newGroupId.ToString("D")));
+            SetProperty(clone, "Name", JsonValue.Create(name));
+            SetProperty(clone, "Description", JsonValue.Create($"RavaFit attribute visibility: {generatedOptionId:D}"));
+            SetProperty(clone, "Condition", new JsonObject
+            {
+                ["Type"] = "Setting",
+                ["Setting"] = generatedOptionId.ToString("D"),
+            });
+
+            if (PenumbraV4Document.FindProperty(clone, "Options") is JsonArray options)
+            {
+                foreach (var option in options.OfType<JsonObject>())
+                    SetProperty(option, "Id", JsonValue.Create(Guid.NewGuid().ToString("D")));
+            }
+
+            groups.Add(clone);
+            result.Add((newGroupId, generatedOptionId, name));
+        }
+
+        return result;
     }
 
     private static bool IsPiercingLikeGroup(JsonObject group)

@@ -482,6 +482,51 @@ public sealed class PenumbraV4Tests
     }
 
     [Fact]
+    public async Task ClonedOutfitOptionGetsItsOwnAttributeVisibilityControls()
+    {
+        using var fixture = Fixture.Create();
+        var writer = new PenumbraV4Writer();
+        const string gamePath = "chara/equipment/e0001/model/c0101e0001_top.mdl";
+
+        await writer.AddAttributeVisibilityToggleAsync(
+            fixture.MetaPath, "Body Size", "YAB Medium Buff", "Corset", gamePath,
+            "RavaFit/Customise/tagged-corset.mdl", "atrx_ravafit_corset");
+
+        var before = PenumbraV4Document.Load(fixture.MetaPath);
+        var sourceGroup = before.GetGroup("Body Size");
+        var sourceOption = before.GetOption(sourceGroup, "YAB Medium Buff");
+        Assert.NotNull(sourceOption.Id);
+        var originalVisibility = Assert.Single(before.Groups.Where(group => group.Name == "Visibility · YAB Medium Buff"));
+        var originalVisibilityJson = originalVisibility.Node.ToJsonString();
+
+        var result = await writer.AppendClonedOptionAsync(new V4AppendRequest(
+            fixture.MetaPath, sourceGroup.StableKey, sourceOption.StableKey, "Neolithe M",
+            new Dictionary<string, string> { [gamePath] = "RavaFit/Neolithe/top.mdl" }));
+
+        var after = PenumbraV4Document.Load(fixture.MetaPath);
+        var generated = after.GetOption(after.GetGroup("Body Size"), result.NewOptionId.ToString("D"));
+        var sourceVisibility = Assert.Single(after.Groups.Where(group => group.Id == originalVisibility.Id));
+        Assert.Equal(originalVisibilityJson, sourceVisibility.Node.ToJsonString());
+
+        var generatedVisibility = Assert.Single(after.Groups.Where(group =>
+            string.Equals(group.Node["Description"]?.GetValue<string>(), $"RavaFit attribute visibility: {generated.Id!.Value:D}", StringComparison.OrdinalIgnoreCase)));
+        Assert.Equal("Visibility · Neolithe M", generatedVisibility.Name);
+        Assert.NotEqual(sourceVisibility.Id, generatedVisibility.Id);
+        var condition = Assert.IsType<JsonObject>(generatedVisibility.Node["Condition"]);
+        Assert.Equal("Setting", condition["Type"]!.GetValue<string>());
+        Assert.Equal(generated.Id.Value.ToString("D"), condition["Setting"]!.GetValue<string>());
+        var toggle = Assert.Single(generatedVisibility.Options);
+        Assert.Equal("Corset", toggle.Name);
+        Assert.NotEqual(originalVisibility.Options[0].Id, toggle.Id);
+        Assert.Equal("atrx_ravafit_corset", toggle.Node["Manipulations"]![0]!["Manipulation"]!["Attribute"]!.GetValue<string>());
+
+        var baseline = generated.Node["Manipulations"]!.AsArray().OfType<JsonObject>()
+            .Single(manipulation => manipulation["Type"]?.GetValue<string>() == "Atr"
+                && manipulation["Manipulation"]?["Attribute"]?.GetValue<string>() == "atrx_ravafit_corset");
+        Assert.False(baseline["Manipulation"]!["Entry"]!.GetValue<bool>());
+    }
+
+    [Fact]
     public void ReadsDirectBodyEstWithNumericStrings()
     {
         using var fixture = Fixture.Create();

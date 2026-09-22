@@ -70,7 +70,7 @@ public sealed class Plugin : IDalamudPlugin
         ModelBridge = new ModelBridgeService(Framework, DataManager, Penumbra, Log);
         Conversion = new ConversionService(Penumbra, DataManager, Solver, ModelBridge, Bodies, Log);
         Customise = new CustomiseModService(Penumbra, DataManager, Solver, ModelBridge, Bodies, Conversion, Log);
-        Cleanup = new ModCleanupService(Penumbra, Framework, Log);
+        Cleanup = new ModCleanupService(Penumbra, Log);
         VanillaAssets = new VanillaAssetService(DataManager, Penumbra);
         PreviewTextures = new ModelPreviewTextureService(DataManager, TextureProvider, Penumbra, Log);
         CharacterRace = new CharacterRaceService(ObjectTable);
