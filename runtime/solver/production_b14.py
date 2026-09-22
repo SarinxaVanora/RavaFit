@@ -922,13 +922,14 @@ def _collapse_dense_vanilla_garment_solution(proxy:_DenseVanillaGarmentSource,po
 
 def _complete_vanilla_target_body_plan(cache:dict[str,Any],present_slots:list[str]):
     """Vanilla garments may never delete geometry from the selected target body."""
-    triangles=[];reports=[]
+    triangles=[];source_triangles=[];reports=[]
     for pair in cache.get("slot_pairs",[]):
-        slot=str(pair.get("slot") or "Body");V=np.asarray(pair.get("target_literal_V",[]),dtype=np.float64);F=np.asarray(pair.get("target_literal_F",[]),dtype=np.int64)
+        slot=str(pair.get("slot") or "Body");V=np.asarray(pair.get("target_literal_V",[]),dtype=np.float64);F=np.asarray(pair.get("target_literal_F",[]),dtype=np.int64);SV=np.asarray(pair.get("source_literal_V",[]),dtype=np.float64);SF=np.asarray(pair.get("source_literal_F",[]),dtype=np.int64)
         if len(V) and len(F):triangles.append(V[F])
+        if len(SV) and len(SF):source_triangles.append(SV[SF])
         reports.append({"slot":slot,"source_body_present":slot in present_slots,"status":"vanilla full-target authority; suppression disabled","accepted_components":[],"suppressed_target_triangles":0,"native_meshes":[]})
-    collision=np.vstack(triangles) if triangles else np.zeros((0,3,3),dtype=np.float64)
-    return {"enabled":False,"policy":"vanilla conversions transplant the selected target body complete; garment fitting must accommodate the body","slots":reports,"native_suppression":[],"_collision_triangles":collision}
+    collision=np.vstack(triangles) if triangles else np.zeros((0,3,3),dtype=np.float64);source_collision=np.vstack(source_triangles) if source_triangles else np.zeros((0,3,3),dtype=np.float64)
+    return {"enabled":False,"policy":"vanilla conversions transplant the selected target body complete; garment fitting must accommodate the body","slots":reports,"native_suppression":[],"_collision_triangles":collision,"_source_collision_triangles":source_collision}
 
 def _triangles_from_surface(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     if len(vertices) == 0 or len(faces) == 0:
@@ -5490,63 +5491,92 @@ def _preserve_final_source_attachment_continuity(source: Any, positions: dict[st
 
 
 def _strict_source_literal_body_triangles(cache: dict[str,Any], fallback: np.ndarray) -> np.ndarray:
-    """Use the complete source body as relationship authority for the final garment clearance pass."""
+    """Use the body geometry that actually existed in the source outfit as final contact authority.
+
+    A modded outfit may deliberately delete anatomy under a garment.  The catalogue source body is still
+    useful for correspondence, but it must never resurrect that deleted anatomy at the end of the solve.
+    The suppression plan therefore publishes the embedded source-body triangles it actually observed.
+    """
+    suppression=cache.get("_ravafit_source_body_suppression") or {}
+    if "_source_collision_triangles" in suppression:
+        actual=np.asarray(suppression.get("_source_collision_triangles"),dtype=np.float64)
+        if actual.ndim==3 and actual.shape[1:]==(3,3):
+            if len(actual)==0:return actual
+            actual,_=_sanitise_strict_b14_surface_triangles(actual,"embedded source final-clearance")
+            return actual
     triangles=[]
     for pair in cache.get("slot_pairs",[]):
         vertices=np.asarray(pair.get("source_literal_V",[]),dtype=np.float64)
         faces=np.asarray(pair.get("source_literal_F",[]),dtype=np.int64)
         if vertices.ndim!=2 or vertices.shape[1:]!=(3,) or faces.ndim!=2 or faces.shape[1:]!=(3,) or len(vertices)<3 or len(faces)==0:
             continue
-        if int(np.min(faces,initial=0))<0 or int(np.max(faces,initial=-1))>=len(vertices):
-            continue
+        if int(np.min(faces,initial=0))<0 or int(np.max(faces,initial=-1))>=len(vertices):continue
         triangles.append(vertices[faces])
-    if not triangles:
-        return np.asarray(fallback,dtype=np.float64)
-    combined=np.vstack(triangles)
-    combined,_=_sanitise_strict_b14_surface_triangles(combined,"source literal final-clearance")
+    if not triangles:return np.asarray(fallback,dtype=np.float64)
+    combined=np.vstack(triangles);combined,_=_sanitise_strict_b14_surface_triangles(combined,"source literal final-clearance")
     return combined
 
 
-def _final_source_authored_body_clearance(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00065) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
-    """Re-clear only source-proven body-contact garment faces after every structural authority.
+def _final_source_authored_body_clearance(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00005, maximum_vertex_move_m: float=.00150) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Repair small genuine body penetrations without letting target anatomy reshape the garment.
 
-    Strict B14 correctly owns the fit, but later assembly/detail authorities can leave small literal-body
-    intersections behind.  The existing source-covered face solver is deliberately conservative: it
-    touches only face samples that were close to the untouched source body, samples triangle interiors
-    as well as vertices, and topology-guards every push.  Running it once at the true end of the solve
-    therefore removes new target clipping without turning the target body into garment-shape authority.
+    Only regions that were close to the body geometry physically present in the untouched source outfit
+    are eligible.  Already-positive target clearance is left exactly alone.  Corrections use the smooth
+    support surface for direction, sample triangle interiors, stay local, and are capped so a target-only
+    nipple, mound or other literal relief can never inflate an otherwise-correct B14 result.
     """
-    if not positions:
-        return {},{"enabled":False,"reason":"no garment meshes"}
-    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
-    reports={};changed=[];total_faces=0;maximum_move=0.0;minimum_after=None
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    source_tri=np.asarray(source_body_triangles,dtype=np.float64);target_tri=np.asarray(target_body_triangles,dtype=np.float64);support_tri=np.asarray(target_support_triangles,dtype=np.float64)
+    if source_tri.ndim!=3 or source_tri.shape[1:]!=(3,3) or len(source_tri)==0:
+        return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no embedded source-body contact surface"}
+    if target_tri.ndim!=3 or target_tri.shape[1:]!=(3,3) or len(target_tri)==0:
+        return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no target collision surface"}
+    bary=np.asarray([(i/4.0,j/4.0,(4-i-j)/4.0) for i in range(5) for j in range(5-i)],dtype=np.float64)
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};reports={};changed=[];total_faces=0;maximum_move=0.0;minimum_after=None;unresolved_total=0
     for name in sorted(out):
-        data=source.data(name);S=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64);P=out[name]
+        data=source.data(name);S=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64);P=np.asarray(out[name],dtype=np.float64)
         if S.shape!=P.shape or S.ndim!=2 or S.shape[1:]!=(3,) or F.ndim!=2 or F.shape[1:]!=(3,) or len(F)==0:
             reports[name]={"enabled":False,"reason":"no compatible indexed garment surface"};continue
-        candidate,report=_source_covered_face_clearance(S,P,F,source_body_triangles,target_body_triangles,margin=float(margin_m),target_support_triangles=target_support_triangles,_bounded_retry_budget=1)
-        candidate=np.asarray(candidate,dtype=np.float64)
-        if candidate.shape!=P.shape or not np.all(np.isfinite(candidate)):
-            raise ValueError(f"{name}: final body clearance produced invalid geometry {candidate.shape}.")
-        moved=np.linalg.norm(candidate-P,axis=1);move_max=float(np.max(moved,initial=0.0));affected=int(report.get("affected_faces",0) or 0)
-        if move_max>1e-12:
-            out[name]=candidate;changed.append(name)
-        total_faces+=affected;maximum_move=max(maximum_move,move_max)
-        after=report.get("sample_min_after_mm")
-        if after is not None and np.isfinite(float(after)):
-            minimum_after=float(after) if minimum_after is None else min(minimum_after,float(after))
-        row=dict(report);row["changed_vertex_count"]=int(np.count_nonzero(moved>1e-12));row["maximum_move_mm"]=move_max*1000.0;reports[name]=row
-    return out,{
-        "enabled":True,
-        "policy":"final literal-body clearance is limited to source-proven garment/body contact and includes face interiors",
-        "margin_mm":float(margin_m*1000.0),
-        "changed_meshes":changed,
-        "changed_mesh_count":len(changed),
-        "affected_face_count":int(total_faces),
-        "maximum_move_mm":float(maximum_move*1000.0),
-        "minimum_contact_sample_after_mm":minimum_after,
-        "meshes":reports,
-    }
+        source_samples=np.einsum("bk,fkj->fbj",bary,S[F]).reshape(-1,3)
+        _,_,source_signed,source_distance,_=_b14_nearest_surface(source_samples,source_tri,k=32)
+        source_signed=np.asarray(source_signed,dtype=np.float64).reshape(len(F),len(bary));source_distance=np.asarray(source_distance,dtype=np.float64).reshape(len(F),len(bary))
+        authored=(source_distance<=.012)&(source_signed>=-.0015)&(source_signed<=.012)
+        contact_faces=np.flatnonzero(np.any(authored,axis=1))
+        if len(contact_faces)==0:
+            reports[name]={"enabled":True,"affected_faces":0,"changed_vertex_count":0,"reason":"no contact with embedded source body"};continue
+        original=P.copy();V=P.copy();affected=set();opposite_rejections=0
+        for _ in range(3):
+            grid=np.einsum("bk,fkj->fbj",bary,V[F[contact_faces]]);samples=grid.reshape(-1,3)
+            _,literal_normals,signed,_,_,rejections=_nearest_literal_surface_consistent_with_support(samples,target_tri,support_tri if len(support_tri) else None)
+            opposite_rejections+=int(rejections);signed=np.asarray(signed,dtype=np.float64).reshape(len(contact_faces),len(bary));literal_normals=np.asarray(literal_normals,dtype=np.float64).reshape(len(contact_faces),len(bary),3)
+            local_authored=authored[contact_faces];penetrating=local_authored&(signed<-.00002)
+            if not np.any(penetrating):break
+            deficit=np.where(penetrating,float(margin_m)-signed,0.0);bad_rows=np.flatnonzero(np.max(deficit,axis=1)>1e-7)
+            if len(bad_rows)==0:break
+            chosen=np.argmax(deficit[bad_rows],axis=1);face_ids=contact_faces[bad_rows];need=np.minimum(deficit[bad_rows,chosen],.0010)
+            if len(support_tri):
+                _,push_normals,_,_,_=_nearest_surface_reference_chunked(grid[bad_rows,chosen],support_tri,k=32)
+                push_normals=np.asarray(push_normals,dtype=np.float64)
+                literal=np.asarray(literal_normals[bad_rows,chosen],dtype=np.float64);flip=np.einsum("ij,ij->i",push_normals,literal)<0.0;push_normals[flip]*=-1.0
+            else:push_normals=np.asarray(literal_normals[bad_rows,chosen],dtype=np.float64)
+            push_normals/=np.maximum(np.linalg.norm(push_normals,axis=1)[:,None],1e-12)
+            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[face_ids];weights=.30+.70*bary[chosen]
+            contrib=push_normals[:,None,:]*need[:,None,None]*weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),weights.reshape(-1))
+            direct=weight>0;field=np.zeros_like(V);field[direct]=acc[direct]/weight[direct,None]
+            # One small feather ring avoids a hard dent without turning a local collision into a macro reshape.
+            edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);ea=edges[:,0];eb=edges[:,1];degree=np.bincount(np.concatenate((ea,eb)),minlength=len(V)).astype(np.float64);sums=np.zeros_like(V);np.add.at(sums,ea,field[eb]);np.add.at(sums,eb,field[ea]);avg=sums/np.maximum(degree[:,None],1.0);grow=np.zeros(len(V),dtype=bool);edge_active=direct[ea]|direct[eb];grow[ea[edge_active]]=True;grow[eb[edge_active]]=True;grow&=~direct;field[grow]=.18*avg[grow]
+            trial=V+field;delta=trial-original;mag=np.linalg.norm(delta,axis=1);delta*=np.minimum(1.0,float(maximum_vertex_move_m)/np.maximum(mag,1e-12))[:,None];trial=original+delta
+            base_area=np.cross(V[F[:,1]]-V[F[:,0]],V[F[:,2]]-V[F[:,0]]);trial_area=np.cross(trial[F[:,1]]-trial[F[:,0]],trial[F[:,2]]-trial[F[:,0]]);bn=np.linalg.norm(base_area,axis=1);tn=np.linalg.norm(trial_area,axis=1);valid=bn>1e-12;dot=np.ones(len(F));ratio=np.ones(len(F));dot[valid]=np.einsum("ij,ij->i",base_area[valid],trial_area[valid])/np.maximum(bn[valid]*tn[valid],1e-24);ratio[valid]=tn[valid]/np.maximum(bn[valid],1e-12);unsafe=valid&((dot<=.08)|(ratio<=.18))
+            if np.any(unsafe):trial[np.unique(F[unsafe].reshape(-1))]=V[np.unique(F[unsafe].reshape(-1))]
+            if float(np.max(np.linalg.norm(trial-V,axis=1),initial=0.0))<1e-9:break
+            V=trial;affected.update(int(x) for x in face_ids.tolist())
+        final_grid=np.einsum("bk,fkj->fbj",bary,V[F[contact_faces]]).reshape(-1,3);_,_,final_signed,_,_,final_rejections=_nearest_literal_surface_consistent_with_support(final_grid,target_tri,support_tri if len(support_tri) else None,exact_base=True);opposite_rejections+=int(final_rejections);final_signed=np.asarray(final_signed,dtype=np.float64).reshape(len(contact_faces),len(bary));remaining=authored[contact_faces]&(final_signed<-.00002);unresolved=int(np.count_nonzero(np.any(remaining,axis=1)));unresolved_total+=unresolved
+        relevant=final_signed[authored[contact_faces]];after=float(np.min(relevant)) if len(relevant) else None;moved=np.linalg.norm(V-original,axis=1);move_max=float(np.max(moved,initial=0.0))
+        if move_max>1e-12:out[name]=V;changed.append(name)
+        total_faces+=len(affected);maximum_move=max(maximum_move,move_max)
+        if after is not None and np.isfinite(after):minimum_after=after*1000.0 if minimum_after is None else min(minimum_after,after*1000.0)
+        reports[name]={"enabled":True,"affected_faces":int(len(affected)),"changed_vertex_count":int(np.count_nonzero(moved>1e-12)),"maximum_move_mm":move_max*1000.0,"unresolved_penetrating_faces":unresolved,"opposite_facing_literal_rejections":opposite_rejections,"sample_min_after_mm":after*1000.0 if after is not None else None}
+    return out,{"enabled":True,"policy":"repair true penetration only where the embedded source body proves garment/body contact; positive clearance and target-only relief are not shape authority","penetration_clearance_mm":float(margin_m*1000.0),"maximum_vertex_move_mm":float(maximum_vertex_move_m*1000.0),"changed_meshes":changed,"changed_mesh_count":len(changed),"affected_face_count":int(total_faces),"unresolved_penetrating_face_count":int(unresolved_total),"maximum_move_mm":float(maximum_move*1000.0),"minimum_contact_sample_after_mm":minimum_after,"meshes":reports}
 
 
 def _source_proven_cross_mesh_seam_pairs(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[list[tuple[str,int,str,int,np.ndarray]],dict[str,Any]]:
@@ -5604,24 +5634,18 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
     for an,ai,bn,bi,source_delta in pairs:
         pa=np.asarray(out[an][ai],dtype=np.float64);pb=np.asarray(out[bn][bi],dtype=np.float64);mid=(pa+pb)*.5
         before_gaps.append(float(np.linalg.norm((pa-pb)-source_delta)))
-        if len(body_tri):
-            _,normal,signed,_,_=_b14_nearest_surface(mid[None,:],body_tri,k=32);signed_value=float(np.asarray(signed).reshape(-1)[0])
-            desired=float(body_margin_m);violation_floor=-.00002
-            if len(source_body_tri):
-                sa=np.asarray(source.data(an).get("V",[]),dtype=np.float64)[ai];sb=np.asarray(source.data(bn).get("V",[]),dtype=np.float64)[bi];source_mid=((sa+sb)*.5)[None,:]
-                _,_,source_signed,_,_=_b14_nearest_surface(source_mid,source_body_tri,k=32);source_signed_value=float(np.asarray(source_signed).reshape(-1)[0])
-                if np.isfinite(source_signed_value) and source_signed_value<-.00002:
-                    desired=source_signed_value;violation_floor=source_signed_value-.00002
-                elif np.isfinite(source_signed_value):
-                    desired=max(float(body_margin_m),min(max(source_signed_value,0.0),.00150));violation_floor=-.00002
-            if np.isfinite(signed_value) and signed_value<violation_floor:
-                n=np.asarray(normal,dtype=np.float64).reshape(-1,3)[0];nn=float(np.linalg.norm(n))
-                if nn>1e-12:
-                    push=min(.006,max(0.0,desired-signed_value));mid=mid+n/nn*push;body_pushes+=1;body_push_max=max(body_push_max,push)
-            elif np.isfinite(signed_value) and desired>0.0 and signed_value<desired:
-                n=np.asarray(normal,dtype=np.float64).reshape(-1,3)[0];nn=float(np.linalg.norm(n))
-                if nn>1e-12:
-                    push=min(.006,max(0.0,desired-signed_value));mid=mid+n/nn*push;body_pushes+=1;body_push_max=max(body_push_max,push)
+        # Seam closure owns the relationship between garment meshes, not garment/body spacing.  It may
+        # make one tiny penetration repair only when the embedded source body proves that this seam was
+        # actually body-adjacent.  Positive clearance is never added here.
+        if len(body_tri) and len(source_body_tri):
+            sa=np.asarray(source.data(an).get("V",[]),dtype=np.float64)[ai];sb=np.asarray(source.data(bn).get("V",[]),dtype=np.float64)[bi];source_mid=((sa+sb)*.5)[None,:]
+            _,_,source_signed,source_distance,_=_b14_nearest_surface(source_mid,source_body_tri,k=32);source_signed_value=float(np.asarray(source_signed).reshape(-1)[0]);source_distance_value=float(np.asarray(source_distance).reshape(-1)[0])
+            if np.isfinite(source_signed_value) and np.isfinite(source_distance_value) and source_distance_value<=.012 and -.0015<=source_signed_value<=.012:
+                _,normal,signed,_,_=_b14_nearest_surface(mid[None,:],body_tri,k=32);signed_value=float(np.asarray(signed).reshape(-1)[0])
+                if np.isfinite(signed_value) and signed_value<-.00002:
+                    n=np.asarray(normal,dtype=np.float64).reshape(-1,3)[0];nn=float(np.linalg.norm(n))
+                    if nn>1e-12:
+                        push=min(.00075,max(0.0,.00005-signed_value));mid=mid+n/nn*push;body_pushes+=1;body_push_max=max(body_push_max,push)
         ta=mid+source_delta*.5;tb=mid-source_delta*.5
         target_sum[an][ai]+=ta;target_weight[an][ai]+=1.0;target_sum[bn][bi]+=tb;target_weight[bn][bi]+=1.0
     changed=[];rejected=[];per_mesh={}
@@ -5670,8 +5694,8 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
         "discovery":discovery,
         "changed_meshes":changed,
         "rejected_meshes":rejected,
-        "body_safe_midpoint_push_count":int(body_pushes),
-        "body_safe_midpoint_push_max_mm":float(body_push_max*1000.0),
+        "body_penetration_repair_count":int(body_pushes),
+        "body_penetration_repair_max_mm":float(body_push_max*1000.0),
         "seam_error_p50_before_mm":float(np.median(before_gaps)*1000.0) if before_gaps else 0.0,
         "seam_error_p95_before_mm":float(np.percentile(before_gaps,95)*1000.0) if before_gaps else 0.0,
         "seam_error_p50_after_mm":float(np.median(after_gaps)*1000.0) if after_gaps else 0.0,
@@ -5824,18 +5848,15 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     # Backtrack only the post-fit structural delta where literal body evidence proves it made the
     # already-resolved source-relative body relationship worse.
     positions,final_structural_body_veto=_veto_worsened_source_relative_body_penetration(source,pre_structural_authority_positions,positions,source_tri,target_collision_tri)
-    # The final rendered garment must keep the source's literal body relationship, including face
-    # interiors.  This is deliberately after every shape/detail authority so none of them can leave a
-    # visually obvious body intersection behind.
-    positions,final_source_body_clearance=_final_source_authored_body_clearance(source,positions,source_literal_collision_tri,target_collision_tri,target_tri,margin_m=.00065)
+    # Repair only genuine residual penetration where the body actually existed in the source outfit.
+    # Positive clearance is never added here: B14/source structure remains the garment-shape authority.
+    positions,final_source_body_clearance=_final_source_authored_body_clearance(source,positions,source_literal_collision_tri,target_collision_tri,target_tri,margin_m=.00005,maximum_vertex_move_m=.00150)
     # Independent mesh solves can pull apart a boundary that was physically shared in the source.
-    # Rejoin only repeated source-proven cross-mesh seams; unrelated nearby meshes remain independent.
-    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,target_collision_tri,source_body_triangles=source_literal_collision_tri,tolerance_m=.000075,minimum_pair_witnesses=6,body_margin_m=.00065)
-    # Seam closure is body-safe at its witnesses, but adjacent face interiors still get one final exact
-    # source-contact clearance pass.  Then reassert the seam once so a per-mesh collision push cannot
-    # manufacture a visible crack at the shared boundary.
-    positions,post_seam_body_clearance=_final_source_authored_body_clearance(source,positions,source_literal_collision_tri,target_collision_tri,target_tri,margin_m=.00065)
-    positions,final_source_shared_seam_reassert=_preserve_final_source_shared_seams(source,positions,target_collision_tri,source_body_triangles=source_literal_collision_tri,tolerance_m=.000075,minimum_pair_witnesses=6,body_margin_m=.00065)
+    # Rejoin those source-proven seams once.  Seam closure may make only a tiny true-penetration repair;
+    # it cannot use body spacing as a shaping force.
+    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,target_collision_tri,source_body_triangles=source_literal_collision_tri,tolerance_m=.000075,minimum_pair_witnesses=6,body_margin_m=.00005)
+    post_seam_body_clearance={"enabled":False,"reason":"single bounded penetration pass; seam closure does not own body clearance"}
+    final_source_shared_seam_reassert={"enabled":False,"reason":"single authored seam closure is final"}
     skinning,mesh_skin_records=_retarget_frozen_layer_skinning(source,positions,cache,source_tri)
     records={}
     for layer_diag in layer_diagnostics:
@@ -5879,7 +5900,7 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
         "final_source_shared_seam_reassert":final_source_shared_seam_reassert,
         "local_affine_quality_rms_mm":float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0),
         "garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning),
-        "post_b14_geometry_mutation":"bounded_layer_reconciler_then_evidence_gated_local_retarget_then_iterative_local_shell_bridge_then_support_stable_component_preserve_then_unilateral_proximal_guard_then_source_attachment_closure_then_unilateral_proximal_reassert_then_surface_relative_detail_layout_then_source_relative_structural_carriers_then_final_unilateral_floor_then_source_relative_body_veto_then_source_authored_face_clearance_then_source_proven_cross_mesh_seam_closure",
+        "post_b14_geometry_mutation":"bounded_layer_reconciler_then_evidence_gated_local_retarget_then_iterative_local_shell_bridge_then_support_stable_component_preserve_then_unilateral_proximal_guard_then_source_attachment_closure_then_unilateral_proximal_reassert_then_surface_relative_detail_layout_then_source_relative_structural_carriers_then_final_unilateral_floor_then_source_relative_body_veto_then_embedded_source_penetration_repair_then_source_proven_cross_mesh_seam_closure",
         "post_b14_body_or_macro_solver_called":False,
         "skinning_after_geometry_freeze":True,
     }
@@ -6878,7 +6899,7 @@ def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_
         if len(V) and len(F):garment_triangles.append(V[F])
     garment_tri=np.vstack(garment_triangles) if garment_triangles else np.zeros((0,3,3),dtype=np.float64)
     pair_by_slot={str(pair.get("slot")):pair for pair in cache.get("slot_pairs",[])}
-    literal_collision=[];slot_reports=[];native_suppression=[]
+    literal_collision=[];slot_reports=[];native_suppression=[];source_collision=[];source_collision_meshes=set()
     for slot in ("Chest","Legs","Hands","Feet"):
         pair=pair_by_slot.get(slot)
         if pair is None:continue
@@ -6887,10 +6908,14 @@ def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_
         if slot in present_slots and source_by_slot.get(slot) and len(garment_tri):
             actual=[]
             for entry in source_by_slot[slot]:
-                try:body_data=source.data(entry["mesh_name"])
+                mesh_name=str(entry.get("mesh_name") or "")
+                try:body_data=source.data(mesh_name)
                 except Exception:continue
                 V=np.asarray(body_data.get("V",[]),dtype=np.float64);F=np.asarray(body_data.get("F",[]),dtype=np.int64)
-                if len(V) and len(F):actual.append(V[F])
+                if len(V) and len(F):
+                    triangles=V[F];actual.append(triangles)
+                    if mesh_name and mesh_name not in source_collision_meshes:
+                        source_collision.append(triangles);source_collision_meshes.add(mesh_name)
             source_V=np.asarray(pair["source_literal_V"],dtype=np.float64);source_F=np.asarray(pair["source_literal_F"],dtype=np.int64)
             if actual and len(source_V):
                 actual_tri=np.vstack(actual);_,_,_,body_distance,_=_b14_nearest_surface(source_V,actual_tri,k=32)
@@ -6926,7 +6951,9 @@ def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_
             report["status"]="fit-context only; no embedded source body, so nothing may be removed"
         literal_collision.append(target_V[target_F[keep]]);slot_reports.append(report)
     collision_tri=np.vstack(literal_collision) if literal_collision else np.zeros((0,3,3),dtype=np.float64)
-    return {"enabled":True,"policy":"selected target stays complete unless the embedded source body explicitly removes a coherent garment-covered region","slots":slot_reports,"native_suppression":native_suppression,"_collision_triangles":collision_tri}
+    source_collision_tri=np.vstack(source_collision) if source_collision else np.zeros((0,3,3),dtype=np.float64)
+    if len(source_collision_tri):source_collision_tri,_=_sanitise_strict_b14_surface_triangles(source_collision_tri,"embedded source collision")
+    return {"enabled":True,"policy":"selected target stays complete unless the embedded source body explicitly removes a coherent garment-covered region","slots":slot_reports,"native_suppression":native_suppression,"_collision_triangles":collision_tri,"_source_collision_triangles":source_collision_tri}
 
 
 def _public_source_body_suppression(plan: dict[str, Any] | None) -> dict[str, Any]:

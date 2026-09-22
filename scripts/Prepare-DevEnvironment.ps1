@@ -9,7 +9,7 @@ $DevAssets = Join-Path $RepoRoot "DevAssets"
 $BodiesDir = Join-Path $DevAssets "Bodies"
 $RuntimeDir = Join-Path $DevAssets "Runtime"
 $IncomingDir = Join-Path $DevAssets "Incoming"
-$ExpectedRuntimeVersion = "1.1.5"
+$ExpectedRuntimeVersion = "1.1.6"
 $ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
 
 New-Item -ItemType Directory -Force -Path $BodiesDir, $IncomingDir | Out-Null
