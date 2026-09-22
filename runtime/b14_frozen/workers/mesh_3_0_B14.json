@@ -1,0 +1,72 @@
+{
+  "mesh": "mesh 3.0",
+  "fresh_from_original": true,
+  "generation_uses_validation": false,
+  "behavior": "body_following_flexible_layer",
+  "features": {
+    "root_component": 0,
+    "root_vertices": 3193,
+    "root_fraction": 1.0,
+    "boundary_fraction": 0.0413404321954275,
+    "source_clearance_median_mm": 1.989622665911283,
+    "component_count": 1,
+    "boundary_loops": 4
+  },
+  "metrics": null,
+  "quality": {
+    "edge_p": [
+      0.9329310967199962,
+      0.9529381815748779,
+      0.9891936129454466,
+      1.0285826641080051,
+      1.0785363972629
+    ],
+    "area_p": [
+      0.9013681770920287,
+      0.9352629060412512,
+      0.9722457388860941,
+      1.029158187860069,
+      1.1059235450048863
+    ],
+    "tiny_area_frac": 0.0
+  },
+  "orientation": {
+    "opposed": 0,
+    "orient_min": 0.8976007316306087,
+    "orient_p1": 0.9850722160444828,
+    "area_min": 0.521023892012146,
+    "area_p1": 0.9013681770920287
+  },
+  "stage": {
+    "mode": "body_following_flexible_layer",
+    "axial_strength": 0.9,
+    "structural_last": {
+      "iter": 350,
+      "loss": 0.13226576157396241,
+      "lap": 0.009629609819740478,
+      "bend": 9.414263909830736e-05,
+      "curv": 7.028855975357554e-05,
+      "shape": 0.002719840972435935,
+      "normal": 0.01721627275476131,
+      "reg": 0.00441632864183032,
+      "smooth": 0.018666694522116306,
+      "plane": 0.026006078011562486,
+      "triangle_guard": 0.0,
+      "guard_area_min": 0.0,
+      "guard_orient_min": 0.0,
+      "disp_rms_mm": 2.302084787794834
+    },
+    "collision": {
+      "before_pen_frac": 0.01096147823363608,
+      "before_min_mm": -3.8816305103192397,
+      "push_rms_mm": 0.15301251109465125,
+      "push_max_mm": 2.5,
+      "affected": 749
+    }
+  },
+  "elapsed_sec": 6.043592929840088,
+  "source_hash": "3a506c513c7976480299c41237cc4f256a3a329331d702ae7b1dbfefccce9fdc",
+  "target_hash_before": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_hash_after": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_unchanged": true
+}

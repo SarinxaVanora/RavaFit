@@ -45,6 +45,17 @@ def test_normal_equipment_keeps_requested_body_authority():
     assert container_slot is None
 
 
+
+def test_missing_source_body_forces_target_body_omission():
+    spec = {
+        "game_path": "chara/equipment/e0001/model/c0201e0001_sho.mdl",
+        "transplant_target_body": True,
+    }
+    fit_only, transplant, container_slot = prod._resolve_output_policy(spec, source_contains_body=False)
+    assert fit_only is False
+    assert transplant is False
+    assert container_slot is None
+
 def test_explicit_fit_only_also_protects_non_accessory_solver_sources():
     spec = {
         "game_path": "chara/equipment/e0001/model/c0201e0001_top.mdl",
@@ -61,6 +72,7 @@ def main():
     test_accessory_paths_are_always_fit_only()
     test_accessory_body_detection_is_independent_from_output_authority()
     test_normal_equipment_keeps_requested_body_authority()
+    test_missing_source_body_forces_target_body_omission()
     test_explicit_fit_only_also_protects_non_accessory_solver_sources()
     print("accessory garment policy tests: PASS")
 

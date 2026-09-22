@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import hashlib
 import gc
 import json
 import math
@@ -12,14 +13,17 @@ import subprocess
 import tempfile
 import time
 import sys
+import threading
 from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.spatial import cKDTree
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix, eye
 from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.linalg import spsolve
 import trimesh
 
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -32,7 +36,7 @@ for p in (RBODY_TOOLS, B14_SCRIPTS):
         sys.path.insert(0, str(p))
 
 from rbody_v3_loader import get_cached_rbody, close_cached_rbodies
-from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy
+from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy, apply_embedded_source_authority
 
 # Frozen B14 is read-only.
 from ffxiv_lobofit import (
@@ -61,8 +65,14 @@ from b14_compat import (
 from construction_fields import infer_shell_behavior
 from collision_eval import smooth_collision_polish as _b14_residual_collision_polish, nearest_surface as _b14_nearest_surface
 from glb_patch_legacy import GLBEditor, compute_tangents
+from b14_local_retarget import retarget_b14_local_components, retarget_attached_ribbons_to_assembly, preserve_source_proven_attachment_continuity, _bridge_new_local_curvature
+from universal_garment_refit import coherent_universal_refit, fit_body_macro_transform
+from unilateral_pair_separation import UnilateralPairSeparationConfig, preserve_source_unilateral_pair_separation
+from surface_relative_detail_layout import SurfaceRelativeDetailConfig, preserve_surface_relative_detail_layout
+from source_relative_structural_carriers import StructuralCarrierConfig, preserve_source_relative_structural_carriers
 
-PRODUCTION_REVISION = "1.1.0-runtime-3"
+# B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.
+PRODUCTION_REVISION = "1.1.1-multi-region-support-source-preserve"
 
 
 def _best_effort_trim_process_memory() -> dict[str, object]:
@@ -160,13 +170,13 @@ def _embedded_body_reference(glb: GLB, slot: str, rig_joint_names: list[str]):
             continue
         UV=data.get("UV");N=data.get("N")
         if UV is None or len(UV)!=len(V):
-            raise ValueError(f"Vanilla body support mesh {name!r} has no usable UV data.")
+            raise ValueError(f"Embedded body support mesh {name!r} has no usable UV data.")
         if N is None or len(N)!=len(V):
-            raise ValueError(f"Vanilla body support mesh {name!r} has no usable normal data.")
+            raise ValueError(f"Embedded body support mesh {name!r} has no usable normal data.")
         source_names=list(data.get("joint_names") or [])
         source_weights=np.asarray(data.get("W"),dtype=np.float64)
         if source_weights.ndim!=2 or source_weights.shape[0]!=len(V):
-            raise ValueError(f"Vanilla body support mesh {name!r} has no usable skin weights.")
+            raise ValueError(f"Embedded body support mesh {name!r} has no usable skin weights.")
         W=np.zeros((len(V),len(rig_joint_names)),dtype=np.float64)
         for source_index,bone_name in enumerate(source_names):
             target=target_index.get(bone_name)
@@ -175,7 +185,7 @@ def _embedded_body_reference(glb: GLB, slot: str, rig_joint_names: list[str]):
         total=W.sum(axis=1,keepdims=True)
         good=total[:,0]>1e-12
         if not np.all(good):
-            raise ValueError(f"Vanilla body support mesh {name!r} has {int(np.count_nonzero(~good))} vertices with no weights in the resolved rig.")
+            raise ValueError(f"Embedded body support mesh {name!r} has {int(np.count_nonzero(~good))} vertices with no weights in the resolved rig.")
         W/=total
         rows.append((V,F+base,np.asarray(UV,dtype=np.float64),np.asarray(N,dtype=np.float64),W))
         records.append({"mesh_name":name,"material":material,"vertex_offset":base,"vertex_count":int(len(V)),"index_count":int(len(F)*3)})
@@ -189,7 +199,7 @@ def _embedded_body_reference(glb: GLB, slot: str, rig_joint_names: list[str]):
                 available.add(_normalise_material(glb.data(name).get("material")))
             except Exception:
                 continue
-        raise ValueError(f"The selected vanilla {slot} source-support model contains no usable body surface (mt_c####b####). Model materials were {sorted(available)}.")
+        raise ValueError(f"The selected {slot} source-support model contains no usable embedded body surface (mt_c####b####). Model materials were {sorted(available)}.")
     return {
         "V":np.vstack([row[0] for row in rows]),
         "F":np.vstack([row[1] for row in rows]),
@@ -238,10 +248,16 @@ def _accessory_container_slot(game_path: str) -> str | None:
 
 
 def _resolve_output_policy(spec: dict[str, Any], source_contains_body: bool) -> tuple[bool, bool, str | None]:
-    """Resolve body output authority independently from source-body detection."""
+    """Resolve body output authority from the authored source, not garment coverage.
+
+    A target-body region may only be transplanted when the source asset actually contains that
+    body region.  This makes complete source omission authoritative (for example, fully enclosed
+    boots with no authored foot geometry) while leaving partial hidden-region suppression to the
+    topology-based source-body suppression pass.
+    """
     accessory_slot = _accessory_container_slot(str(spec.get("game_path") or ""))
     fit_only = bool(spec.get("fit_only", False)) or accessory_slot is not None
-    requested_transplant = bool(spec.get("transplant_target_body", source_contains_body))
+    requested_transplant = bool(spec.get("transplant_target_body", source_contains_body)) and bool(source_contains_body)
     return fit_only, False if fit_only else requested_transplant, accessory_slot
 
 
@@ -452,11 +468,129 @@ def _pair_cache_key(spec: dict[str, Any], names: list[str]) -> tuple[Any, ...]:
             str(spec.get("source_race_code") or ""),
             str(spec.get("target_race_code") or ""),
         )
-    vanilla_outfit_stamp=None
-    if any(str(row.get("source_mode") or top_source_mode).casefold()=="vanilla" for row in spec["slots"]):
+    source_outfit_stamp=None
+    if any(str(row.get("source_mode") or top_source_mode).casefold() in ("vanilla","rbody") for row in spec["slots"]):
         source_glb=spec.get("source_glb")
-        vanilla_outfit_stamp=_rbody_stamp(str(Path(source_glb).resolve())) if source_glb else None
-    return tuple(names),tuple(rows),retarget_stamp,vanilla_outfit_stamp
+        source_outfit_stamp=_rbody_stamp(str(Path(source_glb).resolve())) if source_glb else None
+    return tuple(names),tuple(rows),retarget_stamp,source_outfit_stamp
+
+
+def _strict_macro_body_surface(ref: dict[str,Any]) -> tuple[dict[str,Any],dict[str,Any]]:
+    """Return the broad anatomical surface that should shape clothing in the strict B14 lane.
+
+    RBODY body payloads can contain small local detail meshes (pubic detail, nails, claws, etc.) that
+    intentionally reuse parts of the body UV atlas.  They are useful collision/detail geometry, but
+    feeding them into the historical UV correspondence makes those duplicate UVs compete with the
+    actual macro body and can throw garment anchors across limbs.  Select the material group with the
+    broadest spatial coverage and keep every record using that material.  This is geometry/material
+    driven and has no body-, slot-, or outfit-specific names.
+    """
+    records=list(ref.get('mesh_records') or [])
+    V=np.asarray(ref.get('V'),dtype=np.float64)
+    if not records or V.ndim!=2 or V.shape[1]!=3:
+        return ref,{"enabled":False,"reason":"no mesh records","selected_records":len(records)}
+    groups:dict[str,list[dict[str,Any]]]={}
+    for rec in records:
+        material=_normalise_material(rec.get('material'))
+        groups.setdefault(material,[]).append(rec)
+    scored=[]
+    for material,recs in groups.items():
+        ids=[]
+        for rec in recs:
+            a=int(rec.get('vertex_offset',0));b=a+int(rec.get('vertex_count',0))
+            if 0<=a<b<=len(V):ids.append(np.arange(a,b,dtype=np.int64))
+        if not ids:continue
+        ids=np.concatenate(ids);pts=V[ids];extent=np.ptp(pts,axis=0);bbox=float(np.prod(np.maximum(extent,1e-6)))
+        # Broad coverage is primary; vertex count only breaks near-ties without favouring tiny dense detail.
+        scored.append((bbox,int(len(ids)),material,recs,ids,extent))
+    if not scored:
+        return ref,{"enabled":False,"reason":"no valid material geometry","selected_records":len(records)}
+    bbox,_,material,recs,ids,extent=max(scored,key=lambda row:(row[0],row[1]))
+    # Rebuild the selected material group into one compact indexed surface.
+    out={key:value for key,value in ref.items() if key not in {'V','F','UV','N','W','mesh_records'}}
+    chunks=[];faces=[];new_records=[];base=0
+    F0=np.asarray(ref.get('F'),dtype=np.int64)
+    for rec in recs:
+        a=int(rec.get('vertex_offset',0));vc=int(rec.get('vertex_count',0));b=a+vc
+        if vc<=0 or not (0<=a<b<=len(V)):continue
+        fo=int(rec.get('face_offset',0));fc=int(rec.get('face_count',int(rec.get('index_count',0))//3))
+        localF=F0[fo:fo+fc]-a
+        if len(localF) and (int(localF.min())<0 or int(localF.max())>=vc):
+            continue
+        chunks.append((a,b));faces.append(localF+base)
+        nr=dict(rec);nr['vertex_offset']=base;nr['face_offset']=sum(int(x.get('face_count',0)) for x in new_records);nr['face_count']=int(len(localF));nr['index_count']=int(len(localF)*3);new_records.append(nr);base+=vc
+    if not chunks:
+        return ref,{"enabled":False,"reason":"selected material had no usable indexed records","selected_material":material}
+    for key in ('V','UV','N','W'):
+        arr=np.asarray(ref.get(key))
+        out[key]=np.vstack([arr[a:b] for a,b in chunks]) if arr.ndim==2 else np.concatenate([arr[a:b] for a,b in chunks])
+    out['F']=np.vstack(faces) if faces else np.empty((0,3),dtype=np.int64);out['mesh_records']=new_records
+    # MDL storage can contain thousands of unreferenced/dead vertices. Historical B14 consumed the
+    # rendered/indexed topology, so compact the macro body to triangle-referenced vertices here too.
+    if len(out['F']):
+        ids=np.unique(out['F'].reshape(-1));remap=np.full(len(out['V']),-1,dtype=np.int64);remap[ids]=np.arange(len(ids),dtype=np.int64)
+        for key in ('V','UV','N','W'):out[key]=np.asarray(out[key])[ids].copy()
+        out['F']=remap[out['F']]
+        out['mesh_records']=[{'mesh_index':int(new_records[0].get('mesh_index',0)),'material':material,'vertex_offset':0,'vertex_count':int(len(ids)),'index_count':int(len(out['F'])*3),'face_offset':0,'face_count':int(len(out['F']))}]
+    return out,{"enabled":True,"mode":"broadest-material-spatial-coverage+indexed","selected_material":material,"selected_records":len(new_records),"input_records":len(records),"selected_vertices":int(len(out['V'])),"bbox_volume":bbox,"extent":extent.tolist()}
+
+
+def _strict_uv_map(SV: np.ndarray, SUV: np.ndarray, SN: np.ndarray, SW: np.ndarray, TV: np.ndarray, TUV: np.ndarray, TN: np.ndarray, TW: np.ndarray) -> tuple[np.ndarray,np.ndarray,dict[str,Any]]:
+    """Historical k=12 UV map with a narrow rig-space ambiguity repair for duplicated UV islands."""
+    tree=cKDTree(TUV);dist,idx=tree.query(SUV,k=min(12,len(TV)));dist=dist if dist.ndim>1 else dist[:,None];idx=idx if idx.ndim>1 else idx[:,None]
+    ww=1.0/(dist*dist+1e-7);ww/=np.maximum(ww.sum(axis=1,keepdims=True),1e-12)
+    Y=np.sum(TV[idx]*ww[:,:,None],axis=1);NT=np.sum(TN[idx]*ww[:,:,None],axis=1);NT/=np.maximum(np.linalg.norm(NT,axis=1,keepdims=True),1e-12)
+    repaired=np.zeros(len(SV),dtype=bool)
+    if SW.ndim==2 and TW.ndim==2 and SW.shape[1]==TW.shape[1] and SW.shape[1]>0:
+        align=np.einsum('nk,nqk->nq',SW,TW[idx]);spread=np.max(align,axis=1)-np.min(align,axis=1)
+        wr=ww*np.square(.05+np.maximum(align,0.0));wr/=np.maximum(wr.sum(axis=1,keepdims=True),1e-12)
+        Yr=np.sum(TV[idx]*wr[:,:,None],axis=1);NTr=np.sum(TN[idx]*wr[:,:,None],axis=1);NTr/=np.maximum(np.linalg.norm(NTr,axis=1,keepdims=True),1e-12)
+        delta=np.linalg.norm(Yr-Y,axis=1);base_disp=np.linalg.norm(Y-SV,axis=1);rig_disp=np.linalg.norm(Yr-SV,axis=1)
+        # Only repair candidates where UV-near vertices have radically different rig identity and the
+        # rig-consistent interpolation removes a large implausible jump. Ordinary historical mapping
+        # (including the successful Rue chest case) remains byte-for-byte on the pure UV formula.
+        repaired=(spread>.75)&(delta>.020)&(base_disp>.060)&(rig_disp<base_disp*.50)
+        if np.any(repaired):Y[repaired]=Yr[repaired];NT[repaired]=NTr[repaired]
+    return Y,NT,{"rig_ambiguity_repaired_vertices":int(np.count_nonzero(repaired)),"rig_ambiguity_max_correction_mm":float(np.max(np.linalg.norm(Yr-Y,axis=1))*1000.0) if 'Yr' in locals() and len(Yr) else 0.0}
+
+
+def _apply_strict_historical_uv_contract(pairs: list[tuple[dict[str,Any],dict[str,Any]]], base_cache: dict[str,Any]) -> dict[str,Any]:
+    """Restore the successful frozen-B14 body contract without letting local RBODY detail pollute fit authority."""
+    if not pairs:return dict(base_cache)
+    rows=[];common_names=None;uv_p95=[];macro_reports=[];strict_source_surfaces=[];strict_target_surfaces=[];ambiguity_reports=[]
+    for src0,tgt0 in pairs:
+        if bool(src0.get('_cross_sex_smallclothes_bridge')) or bool(tgt0.get('_cross_sex_smallclothes_bridge')):
+            out=dict(base_cache);out['_ravafit_strict_b14_contract']=False;out['_ravafit_strict_b14_report']={'enabled':False,'reason':'cross-sex smallclothes bridge requires modern adapter'};return out
+        src,src_macro=_strict_macro_body_surface(src0);tgt,tgt_macro=_strict_macro_body_surface(tgt0);macro_reports.append({'slot':str(src.get('slot') or tgt.get('slot') or 'body'),'source':src_macro,'target':tgt_macro})
+        SV=np.asarray(src.get('V'),dtype=np.float64);SUV=np.asarray(src.get('UV'),dtype=np.float64);SN=np.asarray(src.get('N'),dtype=np.float64);SW=np.asarray(src.get('W'),dtype=np.float64)
+        TV=np.asarray(tgt.get('V'),dtype=np.float64);TUV=np.asarray(tgt.get('UV'),dtype=np.float64);TN=np.asarray(tgt.get('N'),dtype=np.float64);TW=np.asarray(tgt.get('W'),dtype=np.float64)
+        sn=list(src.get('joint_names') or []);tn=list(tgt.get('joint_names') or [])
+        valid=(SV.ndim==2 and SV.shape[1]==3 and len(SV)>=3 and SUV.shape==(len(SV),2) and SN.shape==(len(SV),3) and SW.ndim==2 and SW.shape[0]==len(SV) and TV.ndim==2 and TV.shape[1]==3 and len(TV)>=3 and TUV.shape==(len(TV),2) and TN.shape==(len(TV),3) and TW.ndim==2 and TW.shape[0]==len(TV) and sn==tn and len(sn)==SW.shape[1] and TW.shape[1]==len(sn))
+        if not valid:
+            out=dict(base_cache);out['_ravafit_strict_b14_contract']=False;out['_ravafit_strict_b14_report']={'enabled':False,'reason':'body references do not expose compatible UV/normal/rig surfaces'};return out
+        if common_names is None:common_names=sn
+        elif sn!=common_names:
+            out=dict(base_cache);out['_ravafit_strict_b14_contract']=False;out['_ravafit_strict_b14_report']={'enabled':False,'reason':'slot body references do not share one rig list'};return out
+        nearest=cKDTree(TUV).query(SUV,k=1)[0];p95=float(np.percentile(nearest,95));uv_p95.append(p95)
+        if not np.isfinite(p95) or p95>.025:
+            out=dict(base_cache);out['_ravafit_strict_b14_contract']=False;out['_ravafit_strict_b14_report']={'enabled':False,'reason':f'body UV layouts are incompatible (p95={p95:.6f})'};return out
+        Y,NT,ambiguity=_strict_uv_map(SV,SUV,SN,SW,TV,TUV,TN,TW);ambiguity_reports.append(ambiguity)
+        NS=SN.copy();NS/=np.maximum(np.linalg.norm(NS,axis=1,keepdims=True),1e-12);BW=SW.copy();BW/=np.maximum(BW.sum(axis=1,keepdims=True),1e-12)
+        slot=str(src.get('slot') or tgt.get('slot') or 'body');rows.append((SV.copy(),Y,BW,NS,NT,np.asarray([slot]*len(SV),dtype=object)))
+        sF_raw=src.get('F');tF_raw=tgt.get('F')
+        if sF_raw is not None and tF_raw is not None:
+            sF=np.asarray(sF_raw,dtype=np.int64);tF=np.asarray(tF_raw,dtype=np.int64)
+            if sF.ndim==2 and sF.shape[1]==3 and tF.ndim==2 and tF.shape[1]==3 and len(sF) and len(tF):
+                strict_source_surfaces.append((SV.copy(),sF.copy()));strict_target_surfaces.append((TV.copy(),tF.copy()))
+    out=dict(base_cache);out['X']=np.vstack([r[0] for r in rows]);out['Y']=np.vstack([r[1] for r in rows]);out['BW']=np.vstack([r[2] for r in rows]);out['NS']=np.vstack([r[3] for r in rows]);out['NT']=np.vstack([r[4] for r in rows]);out['names']=list(common_names or []);out['parts']=np.concatenate([r[5] for r in rows]);out['identity_body_mapping']=bool(np.max(np.linalg.norm(out['Y']-out['X'],axis=1))<1e-9);out['_ravafit_strict_b14_contract']=True
+    # Keep macro support separate from complete body-package collision/detail geometry.
+    if strict_source_surfaces and len(strict_source_surfaces)==len(strict_target_surfaces):
+        sV=[];sF=[];tV=[];tF=[];sb=0;tb=0
+        for (sv,sf),(tv,tf) in zip(strict_source_surfaces,strict_target_surfaces):
+            sV.append(sv);sF.append(sf+sb);sb+=len(sv);tV.append(tv);tF.append(tf+tb);tb+=len(tv)
+        out['_ravafit_strict_source_surface_V']=np.vstack(sV);out['_ravafit_strict_source_surface_F']=np.vstack(sF);out['_ravafit_strict_target_surface_V']=np.vstack(tV);out['_ravafit_strict_target_surface_F']=np.vstack(tF)
+    out['_ravafit_strict_b14_report']={'enabled':True,'mode':'historical-k12-inverse-square-uv+macro-support','vertices':int(len(out['X'])),'slot_count':int(len(rows)),'uv_nearest_p95':uv_p95,'macro_support':macro_reports,'ambiguity_repairs':ambiguity_reports,'policy':'broad anatomical support shapes garment; local RBODY detail remains collision-only; no fitted garment/control geometry participates'}
+    return out
 
 
 def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None = None):
@@ -477,7 +611,7 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
     top_source_mode=str(spec.get("source_body_mode") or "rbody").casefold()
     source_body_glbs=spec.get("source_body_glbs") or {}
     vanilla_mode=top_source_mode=="vanilla" or any(str(row.get("source_mode") or top_source_mode).casefold()=="vanilla" for row in spec["slots"])
-    actual_outfit_body_materials=_embedded_body_materials(source_glb) if vanilla_mode and source_glb is not None else set()
+    actual_outfit_body_materials=_embedded_body_materials(source_glb) if source_glb is not None else set()
     for row in spec["slots"]:
         target_path=str(Path(row["target"]["rbody"]).resolve())
         tgt_lib=get_cached_rbody(target_path)
@@ -531,10 +665,21 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             src_ref=src_lib.reference(source["body"],row["slot"],source["variant"],race_code=source_race,rig_joint_names=names,surface_mode=source_support_surface)
             if retarget_context is not None:
                 src_ref=_retarget_reference(src_ref,retarget_context)
-            src_meta=src_lib.payload_meta(src_ref["payload_id"]);src_assignments=src_lib.mesh_material_assignments(src_ref["payload_id"])
+            source_payload=src_ref["payload_id"]
+            src_meta=src_lib.payload_meta(source_payload);src_assignments=src_lib.mesh_material_assignments(source_payload)
             for assignment in src_assignments.values():assignment["normalised_material"]=_normalise_material(assignment["material"])
             src_mats={assignment["normalised_material"] for assignment in src_assignments.values()}
-            source_payload=src_ref["payload_id"]
+            embedded_source_report={"enabled":False,"reason":"source export contains no usable embedded body surface"}
+            embedded_source_mats:set[str]=set()
+            if source_glb is not None and actual_outfit_body_materials:
+                cache_slot=str(row["slot"])
+                try:
+                    if cache_slot not in embedded_cache:
+                        embedded_cache[cache_slot]=_embedded_body_reference(source_glb,cache_slot,names)
+                    embedded_ref,embedded_source_mats=embedded_cache[cache_slot]
+                    src_ref,embedded_source_report=apply_embedded_source_authority(src_ref,embedded_ref)
+                except Exception as embedded_error:
+                    embedded_source_report={"enabled":False,"reason":f"embedded source authority unavailable: {embedded_error}"}
 
         if bool(row.get("cross_sex_smallclothes_bridge")) and str(row.get("slot") or "").casefold()=="legs":
             src_ref["_cross_sex_smallclothes_bridge"]=True
@@ -551,16 +696,26 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             # e0000 is fitting support; outfit materials determine which body fragments are replaced.
             source_materials.update(actual_outfit_body_materials)
             source_materials_by_slot.setdefault(row["slot"],set()).update(actual_outfit_body_materials)
+        elif source_mode=="rbody" and embedded_source_report.get("enabled") and embedded_source_mats:
+            # Literal outfit body materials are the reliable detach/transplant identity.  RBODY still
+            # supplies body semantics and missing-region completion for the fit pair itself.
+            source_materials.update(embedded_source_mats);source_materials_by_slot.setdefault(row["slot"],set()).update(embedded_source_mats)
         else:
             source_materials.update(src_mats);source_materials_by_slot.setdefault(row["slot"],set()).update(src_mats)
         target_materials_by_slot.setdefault(row["slot"],set()).update(tgt_mats)
         target_mesh_materials_by_slot[row["slot"]]=tgt_assignments
         payload_details.append({
             "slot":row["slot"],"source_mode":source_mode,"source_payload":source_payload,"target_payload":tgt_ref["payload_id"],"source_race_code":source_race,"target_race_code":target_race,"source_support_surface":str(row.get("source_support_surface") or "body"),"target_support_surface":target_support_surface,"cross_sex_smallclothes_bridge":bool(row.get("cross_sex_smallclothes_bridge")),
-            "source_materials":sorted(actual_outfit_body_materials if source_mode=="vanilla" else src_mats),"source_support_materials":sorted(src_mats),"target_materials":sorted(tgt_mats),"source_surface_materials":sorted(source_surface_mats),"target_surface_materials":sorted(target_surface_mats),
+            "source_materials":sorted(actual_outfit_body_materials if source_mode=="vanilla" else (embedded_source_mats if source_mode=="rbody" and embedded_source_report.get("enabled") and embedded_source_mats else src_mats)),"source_support_materials":sorted(src_mats),"target_materials":sorted(tgt_mats),"source_surface_materials":sorted(source_surface_mats),"target_surface_materials":sorted(target_surface_mats),
+            "embedded_source_authority":embedded_source_report if source_mode=="rbody" else {"enabled":source_mode=="embedded","mode":source_mode},
             "target_mesh_material_assignments":[tgt_assignments[index] for index in sorted(tgt_assignments)],
         })
     body_cache=collect_body_pairs(pairs)
+    if not vanilla_mode and retarget_context is None:
+        body_cache=_apply_strict_historical_uv_contract(pairs,body_cache)
+    else:
+        body_cache['_ravafit_strict_b14_contract']=False
+        body_cache['_ravafit_strict_b14_report']={'enabled':False,'reason':'vanilla dense proxy or race-skeleton retarget uses modern body adapter'}
     if retarget_context is not None:
         body_cache["race_skeleton_retarget"]={key:value for key,value in retarget_context.items() if key!="transforms"}
     result=(names,body_cache,source_materials,source_materials_by_slot,target_materials_by_slot,target_mesh_materials_by_slot,payload_details)
@@ -568,6 +723,55 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
     while len(_PAIR_CACHE)>_PAIR_CACHE_LIMIT:_PAIR_CACHE.popitem(last=False)
     return result
 
+
+
+def _attach_target_auxiliary_obstacles(cache: dict[str,Any], target_glbs_by_slot: dict[str,Path], payload_details: list[dict[str,Any]]):
+    """Attach body-package geometry that is not the smooth body support as collision-only auxiliaries.
+
+    This is deliberately material/geometry driven.  The RBODY payload tells us which material is the
+    body support; any other exported geometry from the same selected target body package becomes an
+    auxiliary obstacle (piercings, body ornaments, etc.).  Auxiliaries may veto garment occupancy but
+    never become a direct garment-shaping surface.
+    """
+    rows=[];all_tri=[]
+    detail_by_slot={str(row.get("slot")):row for row in payload_details}
+    for slot,path in target_glbs_by_slot.items():
+        detail=detail_by_slot.get(str(slot),{})
+        surface={_normalise_material(x) for x in detail.get("target_surface_materials",[]) if x}
+        package={_normalise_material(x.get("material","")) for x in detail.get("target_mesh_material_assignments",[]) if x.get("material")}
+        try:glb=GLB(path)
+        except Exception:continue
+        for name in glb.mesh_names():
+            if not name:continue
+            try:data=glb.data(name)
+            except Exception:continue
+            mat=_normalise_material(data.get("material", ""));V=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64)
+            if len(V)<3 or len(F)==0 or mat in surface or (package and mat not in package):continue
+            # Split exported auxiliary meshes into actual connected pieces so a bilateral material does
+            # not create one enormous artificial collision envelope spanning the body.
+            labels=np.arange(len(V),dtype=np.int64)
+            parent=np.arange(len(V),dtype=np.int64)
+            def find(x):
+                while parent[x]!=x:
+                    parent[x]=parent[parent[x]];x=int(parent[x])
+                return x
+            def union(a,b):
+                ra,rb=find(int(a)),find(int(b))
+                if ra!=rb:parent[rb]=ra
+            for a,b,c in F:union(a,b);union(b,c);union(c,a)
+            groups={}
+            for i in range(len(V)):groups.setdefault(find(i),[]).append(i)
+            for ci,values in enumerate(groups.values()):
+                ids=np.asarray(values,dtype=np.int64)
+                if len(ids)<3:continue
+                lut=np.full(len(V),-1,dtype=np.int64);lut[ids]=np.arange(len(ids),dtype=np.int64);mask=np.all(lut[F]>=0,axis=1);LF=lut[F[mask]]
+                if len(LF)==0:continue
+                P=V[ids].copy();rows.append({"slot":str(slot),"mesh":str(name),"component":int(ci),"material":mat,"V":P,"F":LF.copy()});all_tri.append(P[LF])
+    cache["_ravafit_target_auxiliary_components"]=rows
+    cache["_ravafit_target_auxiliary_triangles"]=np.concatenate(all_tri,axis=0) if all_tri else np.empty((0,3,3),dtype=np.float64)
+    cache["_ravafit_target_auxiliary_report"]={"component_count":len(rows),"triangle_count":int(sum(len(x) for x in all_tri)),"policy":"target body-package non-support geometry is collision-only auxiliary authority"}
+    cache.pop("_ravafit_auxiliary_envelope_support",None)
+    return cache["_ravafit_target_auxiliary_report"]
 
 def _mesh_node_index(glb: GLB, mesh_index: int) -> int | None:
     for ni, node in enumerate(glb.js.get("nodes", [])):
@@ -637,6 +841,56 @@ def _vanilla_garment_edge_p95(data: dict[str, Any]) -> float:
     if len(V)<3 or len(F)<1:return 0.0
     edges=np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]]));edges=np.sort(edges,axis=1);edges=np.unique(edges,axis=0)
     return float(np.percentile(np.linalg.norm(V[edges[:,0]]-V[edges[:,1]],axis=1),95)) if len(edges) else 0.0
+
+
+def _indexed_render_view(data: dict[str,Any]) -> tuple[dict[str,Any],dict[str,Any]]:
+    """Return the triangle-referenced view of one mesh and the exact raw expansion map."""
+    V=np.asarray(data.get('V',[]));F=np.asarray(data.get('F',[]),dtype=np.int64)
+    if V.ndim!=2 or V.shape[1]!=3 or F.ndim!=2 or (len(F) and F.shape[1]!=3):
+        raise ValueError(f"Indexed garment view requires V Nx3 and F Mx3, got {V.shape} / {F.shape}")
+    if len(F)==0:
+        return dict(data),{'raw_vertices':int(len(V)),'indexed_vertices':int(len(V)),'unindexed_vertices':0,'fraction':0.0}
+    if int(np.min(F))<0 or int(np.max(F))>=len(V):raise ValueError('Garment indices reference vertices outside the raw storage range.')
+    ids=np.unique(F.reshape(-1));remap=np.full(len(V),-1,dtype=np.int64);remap[ids]=np.arange(len(ids),dtype=np.int64)
+    out=dict(data);out['V']=np.asarray(data['V'])[ids].copy();out['F']=remap[F]
+    for key in ('N','UV','W'):
+        value=data.get(key)
+        if value is not None and len(value)==len(V):out[key]=np.asarray(value)[ids].copy()
+    out['_ravafit_indexed_raw_ids']=ids;out['_ravafit_raw_vertex_count']=int(len(V));out['_ravafit_indexed_contract']=True
+    missing=int(len(V)-len(ids));report={'raw_vertices':int(len(V)),'indexed_vertices':int(len(ids)),'unindexed_vertices':missing,'fraction':float(missing/max(len(V),1))}
+    return out,report
+
+
+class _IndexedRenderGarmentSource:
+    """Read-only solve view that excludes non-rendered raw storage vertices from garment topology."""
+    def __init__(self,source: Any,body_mesh_names:set[str]):
+        self.source=source;self.js=source.js;self.body_mesh_names=set(body_mesh_names);self._data={};self.report={}
+        for name in source.mesh_names():
+            if not name:continue
+            data=source.data(name)
+            if name in self.body_mesh_names:
+                self._data[name]=data;continue
+            indexed,report=_indexed_render_view(data);self._data[name]=indexed;self.report[name]=report
+    def mesh_names(self):return self.source.mesh_names()
+    def data(self,name):return self._data[name]
+
+
+def _collapse_indexed_render_garment_solution(view: _IndexedRenderGarmentSource, positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]]):
+    """Expand solved rendered vertices back into the exact authored raw MDL/GLB storage layout."""
+    out_pos={};out_skin={}
+    for name,solved in positions.items():
+        indexed=view.data(name);raw=view.source.data(name);ids=np.asarray(indexed.get('_ravafit_indexed_raw_ids'),dtype=np.int64)
+        if ids.ndim!=1:
+            out_pos[name]=np.asarray(solved,dtype=np.float64).copy();out_skin[name]=skinning[name];continue
+        raw_v=np.asarray(raw['V'],dtype=np.float64).copy();candidate=np.asarray(solved,dtype=np.float64)
+        if candidate.shape!=(len(ids),3):raise ValueError(f'Indexed solve for {name} returned {candidate.shape}, expected {(len(ids),3)}')
+        raw_v[ids]=candidate;out_pos[name]=raw_v
+        payload=skinning.get(name)
+        if payload is not None:
+            raw_w=np.asarray(raw['W'],dtype=np.float64).copy();solved_w=np.asarray(payload['weights'],dtype=np.float64)
+            if solved_w.shape[0]!=len(ids):raise ValueError(f'Indexed skinning for {name} returned {solved_w.shape[0]} rows, expected {len(ids)}')
+            raw_w[ids]=solved_w;out_skin[name]={'weights':raw_w,'joint_names':list(raw['joint_names']),'stage':payload.get('stage',{})}
+    return out_pos,out_skin
 
 
 class _DenseVanillaGarmentSource:
@@ -893,6 +1147,20 @@ def _solve_peer_shell_group_fresh(source: Any, w: dict[str, Any], Wg: np.ndarray
     for _,vertices,positions,stage in solved:result[vertices]=positions
     stage={"mode":"independent_peer_shells","initial_root":root_stage,"assembly_last":assembly_history[-1] if assembly_history else {"skipped":True,"reason":"no assembly history"},"peers":reports,"worker_group":group_report,"fresh_process_workers":group_report.get("mode")=="fresh_process_group"}
     return result,root_vertices,stage
+
+def _use_fragmented_decorated_shell_frame(behavior: str, features: dict[str, Any], details: list[dict[str, Any]]) -> bool:
+    """Avoid a global shell optimiser when one cloth root carries thousands of rigid ornaments.
+
+    This is intentionally a very high threshold.  Ordinary multi-component B14 garments, including
+    Dragon, keep their existing shell solve.  The conservative component frame only seeds Runtime 11's
+    source-differential structural finaliser; it does not become a replacement fitting algorithm.
+    """
+    if behavior not in {"stand_off_structured_shell","constructed_close_shell"} or not details:return False
+    component_count=int(features.get("component_count",0));root_vertices=int(features.get("root_vertices",0));root_fraction=float(features.get("root_fraction",1.0))
+    if component_count<512 or root_vertices<256 or root_fraction>.35:return False
+    rigid_count=sum(1 for row in details if str(row.get("kind","")).casefold()=="rigid")
+    return rigid_count>=512 and (rigid_count/max(component_count,1))>=.90
+
 
 def _use_rigid_component_preservation(behavior: str, features: dict[str, Any], details: list[dict[str, Any]]) -> bool:
     if not details:
@@ -1799,7 +2067,7 @@ def _layer_orientation_alpha(vertices: np.ndarray, faces: np.ndarray, displaceme
     return 0.0
 
 
-def _enforce_layer_relation(outer_vertices: np.ndarray, outer_faces: np.ndarray, inner_vertices: np.ndarray, inner_faces: np.ndarray, target_body_triangles: np.ndarray, minimum_gap: np.ndarray, influence: float, neighbours: list[list[int]]):
+def _enforce_layer_relation(outer_vertices: np.ndarray, outer_faces: np.ndarray, inner_vertices: np.ndarray, inner_faces: np.ndarray, target_body_triangles: np.ndarray, minimum_gap: np.ndarray, influence: float, neighbours: list[list[int]], source_outer_vertices: np.ndarray | None = None):
     """Move only the inferred outer layer outwards."""
     V=np.asarray(outer_vertices,dtype=np.float64).copy();inner_tri=np.asarray(inner_vertices,dtype=np.float64)[np.asarray(inner_faces,dtype=np.int64)];total=np.zeros(len(V),dtype=np.float64);rounds=[];minimum_gap=np.asarray(minimum_gap,dtype=np.float64)
     if minimum_gap.shape!=(len(V),):
@@ -1817,7 +2085,14 @@ def _enforce_layer_relation(outer_vertices: np.ndarray, outer_faces: np.ndarray,
             average=np.asarray([np.mean(field[n]) if n else field[i] for i,n in enumerate(neighbours)],dtype=np.float64);field=np.maximum(required,.78*required+.22*average)
         push=np.minimum(field,.003);push[distance>influence*1.25]=0.0;displacement=body_normals*push[:,None];alpha=_layer_orientation_alpha(V,outer_faces,displacement,push)
         if alpha<=0.0:break
-        V+=alpha*displacement;total+=alpha*push;rounds.append({"round":round_index+1,"vertices":int(np.count_nonzero(required>1e-6)),"alpha":alpha,"max_requested_mm":float(np.max(required)*1000.0)})
+        proposed=V+alpha*displacement
+        if source_outer_vertices is not None:
+            safe,safe_alpha,_,edge_metric=_coupled_topology_safe_alpha(np.asarray(source_outer_vertices,dtype=np.float64),V,proposed,outer_faces)
+            alpha*=safe_alpha;proposed=safe
+        else:
+            edge_metric=None
+        if alpha<=0.0:break
+        moved=np.linalg.norm(proposed-V,axis=1);V=proposed;total+=moved;rounds.append({"round":round_index+1,"vertices":int(np.count_nonzero(required>1e-6)),"alpha":float(alpha),"max_requested_mm":float(np.max(required)*1000.0),"edge":edge_metric})
     closest,_,_,distance,_=_b14_nearest_surface(V,inner_tri,k=32);_,body_normals,_,_,_=_b14_nearest_surface(V,target_body_triangles,k=32);radial=np.sum((V-closest)*body_normals,axis=1);eligible=(distance<=influence)&(minimum_gap>0.0)
     after_min=float(np.min(radial[eligible])*1000.0) if np.any(eligible) else None;after_violations=int(np.count_nonzero(eligible&(radial<minimum_gap-.00002))) if np.any(eligible) else 0
     authored=minimum_gap[minimum_gap>0.0]
@@ -1848,7 +2123,7 @@ def _preserve_authored_garment_layers(source_meshes: dict[str, dict[str, Any]], 
     for pass_index in range(2):
         for relation in relations:
             inner=relation["inner"];outer=relation["outer"]
-            corrected,report=_enforce_layer_relation(out[outer],np.asarray(candidates[outer]["F"],dtype=np.int64),out[inner],np.asarray(candidates[inner]["F"],dtype=np.int64),target_body_triangles,np.asarray(relation["_source_minimum_gap"],dtype=np.float64),float(relation["influence"]),neighbour_cache[outer])
+            corrected,report=_enforce_layer_relation(out[outer],np.asarray(candidates[outer]["F"],dtype=np.int64),out[inner],np.asarray(candidates[inner]["F"],dtype=np.int64),target_body_triangles,np.asarray(relation["_source_minimum_gap"],dtype=np.float64),float(relation["influence"]),neighbour_cache[outer],np.asarray(candidates[outer]["V"],dtype=np.float64))
             if report["moved_vertices"]>0:
                 out[outer]=corrected;changed.add(outer)
             key=(inner,outer);public_relation={k:v for k,v in relation.items() if not k.startswith("_")};entry=per_relation.setdefault(key,{**public_relation,"passes":[]});entry["passes"].append({"pass":pass_index+1,**report})
@@ -1856,6 +2131,90 @@ def _preserve_authored_garment_layers(source_meshes: dict[str, dict[str, Any]], 
     return out,changed,{"relation_count":len(relations),"adjusted_mesh_count":len(changed),"relations":reports}
 
 
+
+def _local_layer_directional_evidence(vertices: np.ndarray, other_triangles: np.ndarray, source_body_triangles: np.ndarray, close_distance: float=.009):
+    sample=np.asarray(vertices,dtype=np.float64)
+    if len(sample)>2048:sample=sample[np.unique(np.linspace(0,len(sample)-1,2048,dtype=np.int64))]
+    if len(sample)<16 or len(other_triangles)==0:return None
+    closest,_,_,distance,_=_b14_nearest_surface(sample,other_triangles,k=28);_,body_normals,_,_,_=_b14_nearest_surface(sample,source_body_triangles,k=28);radial=np.sum((sample-closest)*body_normals,axis=1);mask=(distance<=close_distance)&np.isfinite(radial)
+    minimum=max(14,int(math.ceil(len(sample)*.04)))
+    if int(np.count_nonzero(mask))<minimum or float(np.mean(mask))<.06:return None
+    values=radial[mask]
+    return {"count":int(len(values)),"fraction":float(np.mean(mask)),"positive_fraction":float(np.mean(values>.00012)),"negative_fraction":float(np.mean(values<-.00012)),"median":float(np.median(values)),"close_p95":float(np.percentile(distance[mask],95))}
+
+
+def _local_layer_nodes(meshes: dict[str,dict[str,Any]]):
+    nodes=[];component_counts={}
+    for name in sorted(meshes):
+        V=np.asarray(meshes[name].get("V",[]),dtype=np.float64);F=np.asarray(meshes[name].get("F",[]),dtype=np.int64)
+        if len(V)<32 or len(F)<16:component_counts[name]=0;continue
+        components=_masked_vertex_components(F,np.ones(len(V),dtype=bool));component_counts[name]=len(components)
+        for ci,ids in enumerate(components):
+            ids=np.asarray(ids,dtype=np.int64)
+            if len(ids)<32:continue
+            LF=_component_local_faces(F,ids,len(V))
+            if len(LF)<16:continue
+            P=V[ids];feature=_structural_component_features(P,LF)
+            # Very small rigid/detail pieces are handled by the structural attachment lane, not cloth layering.
+            if len(ids)<48 and feature["max_extent"]<.040:continue
+            nodes.append({"mesh":name,"component":int(ci),"ids":ids,"V":P,"F":LF,"features":feature})
+    return nodes,component_counts
+
+
+def _infer_local_authored_layer_relations(meshes: dict[str,dict[str,Any]], source_body_triangles: np.ndarray):
+    nodes,component_counts=_local_layer_nodes(meshes);relations=[]
+    for ai,a in enumerate(nodes):
+        for b in nodes[ai+1:]:
+            # Whole single-component mesh pairs are already handled by the established mesh-level relation pass.
+            if a["mesh"]!=b["mesh"] and component_counts.get(a["mesh"],0)<=1 and component_counts.get(b["mesh"],0)<=1:continue
+            av=np.asarray(a["V"],dtype=np.float64);bv=np.asarray(b["V"],dtype=np.float64)
+            if not _expanded_aabb_overlap(av,bv,.010):continue
+            at=av[np.asarray(a["F"],dtype=np.int64)];bt=bv[np.asarray(b["F"],dtype=np.int64)]
+            ab=_local_layer_directional_evidence(av,bt,source_body_triangles);ba=_local_layer_directional_evidence(bv,at,source_body_triangles)
+            if ab is None or ba is None:continue
+            outer=inner=None;oe=ie=None
+            if ab["positive_fraction"]>=.84 and ab["median"]>=.00032 and ba["negative_fraction"]>=.84 and ba["median"]<=-.00032:outer,inner,oe,ie=a,b,ab,ba
+            elif ba["positive_fraction"]>=.84 and ba["median"]>=.00032 and ab["negative_fraction"]>=.84 and ab["median"]<=-.00032:outer,inner,oe,ie=b,a,ba,ab
+            if outer is None:continue
+            OV=np.asarray(outer["V"],dtype=np.float64);IT=np.asarray(inner["V"],dtype=np.float64)[np.asarray(inner["F"],dtype=np.int64)]
+            closest,_,_,distance,_=_b14_nearest_surface(OV,IT,k=28);_,body_normals,_,_,_=_b14_nearest_surface(OV,source_body_triangles,k=28);radial=np.sum((OV-closest)*body_normals,axis=1);mask=(distance<=.0095)&np.isfinite(radial)&(radial>.00005)
+            if int(np.count_nonzero(mask))<max(12,int(len(OV)*.025)):continue
+            minimum=np.zeros(len(OV),dtype=np.float64);minimum[mask]=np.clip(radial[mask]*.90,.00012,.00125)
+            influence=float(np.clip(max(float(oe["close_p95"]),float(ie["close_p95"]))*1.35,.0055,.0115))
+            relations.append({"inner_mesh":inner["mesh"],"inner_component":int(inner["component"]),"inner_ids":inner["ids"],"outer_mesh":outer["mesh"],"outer_component":int(outer["component"]),"outer_ids":outer["ids"],"minimum_gap":minimum,"influence":influence,"source_outer_median_mm":float(oe["median"]*1000.0),"source_near_fraction":float(oe["fraction"])})
+    return relations
+
+
+def _preserve_local_authored_garment_layers(source_meshes: dict[str,dict[str,Any]], positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, relations: list[dict[str,Any]] | None=None, pass_count: int=2, quick_verify: bool=False):
+    """Restore source-proven local layer order, including disconnected components inside one mesh.
+
+    Runtime 11 may reuse source-authored relations after clearance.  The source relation graph is immutable,
+    so recomputing it after every correction was wasted work and could become pathological on highly
+    fragmented XIV garments.  A lightweight verification pass skips relations that remain safely ordered.
+    """
+    if relations is None:relations=_infer_local_authored_layer_relations(source_meshes,source_body_triangles)
+    if not relations:return positions,set(),{"relation_count":0,"adjusted_mesh_count":0,"relations":[],"policy":"component-local source-authored layering"}
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};changed=set();reports=[None]*len(relations);skipped_safe=0
+    for pass_index in range(max(1,int(pass_count))):
+        for ri,relation in enumerate(relations):
+            om=str(relation["outer_mesh"]);im=str(relation["inner_mesh"]);oids=np.asarray(relation["outer_ids"],dtype=np.int64);iids=np.asarray(relation["inner_ids"],dtype=np.int64)
+            if om not in out or im not in out:continue
+            OF=_component_local_faces(np.asarray(source_meshes[om]["F"],dtype=np.int64),oids,len(source_meshes[om]["V"]));IF=_component_local_faces(np.asarray(source_meshes[im]["F"],dtype=np.int64),iids,len(source_meshes[im]["V"]))
+            if len(OF)==0 or len(IF)==0:continue
+            minimum=np.asarray(relation["minimum_gap"],dtype=np.float64)
+            if quick_verify and pass_index==0:
+                sample=np.unique(np.linspace(0,len(oids)-1,min(len(oids),192),dtype=np.int64));OV=out[om][oids][sample];IT=out[im][iids][IF]
+                closest,_,_,distance,_=_b14_nearest_surface(OV,IT,k=20);_,body_normals,_,_,_=_b14_nearest_surface(OV,target_body_triangles,k=20);radial=np.sum((OV-closest)*body_normals,axis=1);eligible=(distance<=float(relation["influence"]))&(minimum[sample]>0.0)
+                if not np.any(eligible) or int(np.count_nonzero(eligible&(radial<minimum[sample]-.00008)))==0:
+                    skipped_safe+=1
+                    if reports[ri] is None:reports[ri]={"inner_mesh":im,"inner_component":int(relation["inner_component"]),"outer_mesh":om,"outer_component":int(relation["outer_component"]),"source_outer_median_mm":float(relation["source_outer_median_mm"]),"source_near_fraction":float(relation["source_near_fraction"]),"influence_mm":float(relation["influence"]*1000.0),"passes":[],"quick_verified_safe":True}
+                    continue
+            neighbours=_mesh_vertex_neighbours(len(oids),OF);before=out[om][oids].copy();corrected,report=_enforce_layer_relation(before,OF,out[im][iids],IF,target_body_triangles,minimum,float(relation["influence"]),neighbours,np.asarray(source_meshes[om]["V"],dtype=np.float64)[oids])
+            if report.get("moved_vertices",0)>0:out[om][oids]=corrected;changed.add(om)
+            if reports[ri] is None:reports[ri]={"inner_mesh":im,"inner_component":int(relation["inner_component"]),"outer_mesh":om,"outer_component":int(relation["outer_component"]),"source_outer_median_mm":float(relation["source_outer_median_mm"]),"source_near_fraction":float(relation["source_near_fraction"]),"influence_mm":float(relation["influence"]*1000.0),"passes":[report]}
+            else:reports[ri].setdefault("passes",[]).append(report)
+    reports=[r for r in reports if r is not None];public_pairs=sorted({(str(r["inner_mesh"]),str(r["outer_mesh"])) for r in relations if r["inner_mesh"]!=r["outer_mesh"]})
+    return out,changed,{"relation_count":len(relations),"adjusted_mesh_count":len(changed),"relations":reports,"cross_mesh_pairs":public_pairs,"quick_verified_safe":int(skipped_safe),"policy":"component-local source-authored layering including same-mesh disconnected components; immutable relations reused across convergence passes"}
 
 def _boundary_vertex_ids(faces: np.ndarray) -> np.ndarray:
     F=np.asarray(faces,dtype=np.int64)
@@ -1948,32 +2307,50 @@ def _preserve_authored_cross_mesh_assembly(source_meshes: dict[str, dict[str, An
     return out,changed,{"relation_count":len(relations),"adjusted_mesh_count":len(changed),"relations":relation_public,"passes":passes,"policy":"iterative mutual source-boundary registration; source-mode agnostic; 4 mm cumulative local cap"}
 
 
-def _preserve_authored_weld_splits(positions: dict[str, np.ndarray], retarget_contexts: dict[str, dict[str, Any]]):
-    """Rejoin only genuine authored render seams after B14 expands its welded solve."""
-    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};changed=set();mesh_reports={};all_splits=[];all_adjustments=[]
-    for name in sorted(out):
-        context=retarget_contexts.get(name);w=None if context is None else context.get("w");data=None if context is None else context.get("data")
-        raw_to_weld=None if w is None else np.asarray(w.get("raw_to_weld",[]),dtype=np.int64);V=out[name]
-        raw_F=np.asarray((data or {}).get("F",[]),dtype=np.int64);raw_W=np.asarray((data or {}).get("W",[]),dtype=np.float64)
-        if raw_to_weld.shape!=(len(V),) or raw_W.ndim!=2 or raw_W.shape[0]!=len(V) or raw_F.ndim!=2 or (len(raw_F) and raw_F.shape[1]!=3):
-            mesh_reports[name]={"weld_group_count":0,"eligible_seam_group_count":0,"corrected_group_count":0,"corrected_vertices":0,"split_max_mm":0.0,"adjustment_max_mm":0.0,"skipped":"missing authored weld/topology/skinning correspondence"};continue
+def _compile_authored_weld_split_topology(context: dict[str,Any] | None, vertex_count: int):
+    """Compile source-authored seam connectivity once; geometry remains dynamic on every pass."""
+    if context is None:return None
+    w=context.get("w");data=context.get("data")
+    raw_to_weld=None if w is None else np.asarray(w.get("raw_to_weld",[]),dtype=np.int64)
+    raw_F=np.asarray((data or {}).get("F",[]),dtype=np.int64);raw_W=np.asarray((data or {}).get("W",[]),dtype=np.float64);source_V=np.asarray((data or {}).get("V",[]),dtype=np.float64)
+    if raw_to_weld.shape!=(int(vertex_count),) or raw_W.ndim!=2 or raw_W.shape[0]!=int(vertex_count) or raw_F.ndim!=2 or (len(raw_F) and raw_F.shape[1]!=3):return None
+    if source_V.shape!=(int(vertex_count),3):source_V=np.zeros((int(vertex_count),3),dtype=np.float64)
+    key=(int(vertex_count),int(len(raw_F)),int(np.asarray(raw_F,dtype=np.int64).sum(dtype=np.int64)),int(np.asarray(raw_to_weld,dtype=np.int64).sum(dtype=np.int64)),int(raw_W.shape[1]))
+    cached=context.get("_ravafit_authored_weld_split_topology")
+    if isinstance(cached,dict) and cached.get("key")==key:return cached
 
-        raw_neighbours=[set() for _ in range(len(V))]
-        for a,b,c in raw_F:
-            a=int(a);b=int(b);c=int(c)
-            if min(a,b,c)<0 or max(a,b,c)>=len(V):continue
-            raw_neighbours[a].update((int(raw_to_weld[b]),int(raw_to_weld[c])))
-            raw_neighbours[b].update((int(raw_to_weld[a]),int(raw_to_weld[c])))
-            raw_neighbours[c].update((int(raw_to_weld[a]),int(raw_to_weld[b])))
+    raw_neighbours=[set() for _ in range(int(vertex_count))];incident=[[] for _ in range(int(vertex_count))];adjacency=[set() for _ in range(int(vertex_count))]
+    for fi,(a,b,c) in enumerate(raw_F):
+        a=int(a);b=int(b);c=int(c)
+        if min(a,b,c)<0 or max(a,b,c)>=int(vertex_count):continue
+        incident[a].append(fi);incident[b].append(fi);incident[c].append(fi)
+        adjacency[a].update((b,c));adjacency[b].update((a,c));adjacency[c].update((a,b))
+        raw_neighbours[a].update((int(raw_to_weld[b]),int(raw_to_weld[c])))
+        raw_neighbours[b].update((int(raw_to_weld[a]),int(raw_to_weld[c])))
+        raw_neighbours[c].update((int(raw_to_weld[a]),int(raw_to_weld[b])))
+    comp=np.full(int(vertex_count),-1,dtype=np.int64);cc=0
+    for seed in range(int(vertex_count)):
+        if comp[seed]>=0:continue
+        stack=[seed];comp[seed]=cc
+        while stack:
+            cur=stack.pop()
+            for nxt in adjacency[cur]:
+                if comp[nxt]<0:comp[nxt]=cc;stack.append(nxt)
+        cc+=1
 
-        order=np.argsort(raw_to_weld,kind="stable");sorted_weld=raw_to_weld[order];boundaries=np.r_[0,np.flatnonzero(np.diff(sorted_weld))+1,len(sorted_weld)]
-        duplicate_group_count=0;eligible_groups=0;disconnected_groups=0;weight_rejected_pairs=0;corrected_groups=0;corrected_vertices=0;split_values=[];adjustment_values=[]
-        for start,end in zip(boundaries[:-1],boundaries[1:]):
-            if end-start<2:continue
-            duplicate_group_count+=1;ids=order[start:end]
-            parent={int(i):int(i) for i in ids}
+    order=np.argsort(raw_to_weld,kind="stable");sorted_weld=raw_to_weld[order];boundaries=np.r_[0,np.flatnonzero(np.diff(sorted_weld))+1,len(sorted_weld)]
+    duplicate_group_count=0;eligible_groups=0;cross_component_rejections=0;weight_rejected_pairs=0;entries=[]
+    for group_index,(first,last) in enumerate(zip(boundaries[:-1],boundaries[1:])):
+        if last-first<2:continue
+        duplicate_group_count+=1;group_ids=order[first:last];by_component={}
+        for i in group_ids:by_component.setdefault(int(comp[int(i)]),[]).append(int(i))
+        if len(by_component)>1:cross_component_rejections+=sum(len(v) for v in by_component.values())
+        any_seam=False
+        for component_ids in by_component.values():
+            if len(component_ids)<2:continue
+            ids=np.asarray(component_ids,dtype=np.int64);parent={int(i):int(i) for i in ids}
             def find(x):
-                while parent[x]!=x: parent[x]=parent[parent[x]];x=parent[x]
+                while parent[x]!=x:parent[x]=parent[parent[x]];x=parent[x]
                 return x
             def union(a,b):
                 ra,rb=find(a),find(b)
@@ -1981,28 +2358,54 @@ def _preserve_authored_weld_splits(positions: dict[str, np.ndarray], retarget_co
             for ai in range(len(ids)):
                 a=int(ids[ai])
                 for bi in range(ai+1,len(ids)):
-                    b=int(ids[bi])
-                    if not (raw_neighbours[a]&raw_neighbours[b]):continue
-                    # Renderer splits should retain effectively the same authored deformation.
-                    if float(np.sum(np.abs(raw_W[a]-raw_W[b])))>.08:
-                        weight_rejected_pairs+=1;continue
+                    b=int(ids[bi]);shared=raw_neighbours[a]&raw_neighbours[b]
+                    if not shared:continue
+                    if float(np.sum(np.abs(raw_W[a]-raw_W[b])))>.08:weight_rejected_pairs+=1;continue
                     union(a,b)
             components={}
             for i in ids:components.setdefault(find(int(i)),[]).append(int(i))
             seam_components=[np.asarray(c,dtype=np.int64) for c in components.values() if len(c)>=2]
-            if not seam_components:
-                disconnected_groups+=1;continue
-            eligible_groups+=1
+            if not seam_components:continue
+            any_seam=True
             for seam_ids in seam_components:
-                pts=V[seam_ids];delta=pts[:,None,:]-pts[None,:,:];split=float(np.max(np.linalg.norm(delta,axis=2),initial=0.0));split_values.append(split)
-                if split<=1e-7:continue
-                centre=np.mean(pts,axis=0);adjustment=np.linalg.norm(pts-centre,axis=1);V[seam_ids]=centre
-                corrected_groups+=1;corrected_vertices+=len(seam_ids);adjustment_values.extend(adjustment.tolist())
+                face_ids=sorted({fi for vi in seam_ids for fi in incident[int(vi)]})
+                if not face_ids:
+                    entries.append({"group":group_index,"seam_ids":seam_ids,"face_ids":np.empty(0,dtype=np.int64),"patch_ids":np.empty(0,dtype=np.int64),"LF":np.empty((0,3),dtype=np.int64),"seam_local":np.empty(0,dtype=np.int64)})
+                    continue
+                face_ids=np.asarray(face_ids,dtype=np.int64);patch_ids=np.unique(raw_F[face_ids].reshape(-1));lookup={int(v):i for i,v in enumerate(patch_ids.tolist())};LF=np.asarray([[lookup[int(x)] for x in tri] for tri in raw_F[face_ids]],dtype=np.int64);seam_local=np.asarray([lookup[int(i)] for i in seam_ids],dtype=np.int64)
+                entries.append({"group":group_index,"seam_ids":seam_ids,"face_ids":face_ids,"patch_ids":patch_ids,"LF":LF,"seam_local":seam_local})
+        if any_seam:eligible_groups+=1
+    cached={"key":key,"raw_F":raw_F,"source_V":source_V,"duplicate_group_count":int(duplicate_group_count),"eligible_group_count":int(eligible_groups),"disconnected_group_count":int(duplicate_group_count-eligible_groups),"cross_component_rejections":int(cross_component_rejections),"weight_rejected_pairs":int(weight_rejected_pairs),"entries":entries}
+    context["_ravafit_authored_weld_split_topology"]=cached
+    return cached
+
+
+def _preserve_authored_weld_splits(positions: dict[str, np.ndarray], retarget_contexts: dict[str, dict[str, Any]]):
+    """Reconcile genuine render/UV seams while reusing immutable authored seam topology."""
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};changed=set();mesh_reports={};all_splits=[];all_adjustments=[]
+    for name in sorted(out):
+        context=retarget_contexts.get(name);V=out[name];compiled=_compile_authored_weld_split_topology(context,len(V))
+        if compiled is None:
+            mesh_reports[name]={"weld_group_count":0,"eligible_seam_group_count":0,"corrected_group_count":0,"corrected_vertices":0,"split_max_mm":0.0,"adjustment_max_mm":0.0,"skipped":"missing authored weld/topology/skinning correspondence"};continue
+        source_V=np.asarray(compiled["source_V"],dtype=np.float64)
+        if source_V.shape!=V.shape:source_V=V.copy()
+        topology_rejected=0;large_split_rejected=0;corrected_groups=0;corrected_vertices=0;split_values=[];adjustment_values=[]
+        for entry in compiled["entries"]:
+            seam_ids=np.asarray(entry["seam_ids"],dtype=np.int64);pts=V[seam_ids];delta=pts[:,None,:]-pts[None,:,:];split=float(np.max(np.linalg.norm(delta,axis=2),initial=0.0));split_values.append(split)
+            if split<=1e-7:continue
+            if split>.0080:large_split_rejected+=1;continue
+            patch_ids=np.asarray(entry["patch_ids"],dtype=np.int64);LF=np.asarray(entry["LF"],dtype=np.int64);seam_local=np.asarray(entry["seam_local"],dtype=np.int64)
+            if len(patch_ids)==0 or len(LF)==0:continue
+            centre=np.mean(pts,axis=0);disp=centre-pts;dmag=np.linalg.norm(disp,axis=1);cap=.0020;scale=np.minimum(1.0,cap/np.maximum(dmag,1e-12));target=pts+disp*scale[:,None]
+            before=V[patch_ids].copy();proposed=before.copy();proposed[seam_local]=target
+            safe,alpha,_,_=_coupled_topology_safe_alpha(source_V[patch_ids],before,proposed,LF)
+            if alpha<=0.0:topology_rejected+=1;continue
+            move=np.linalg.norm(safe-before,axis=1);V[patch_ids]=safe;actual=move[seam_local]
+            corrected_groups+=1;corrected_vertices+=len(seam_ids);adjustment_values.extend(actual.tolist())
         if corrected_groups:changed.add(name)
         all_splits.extend(split_values);all_adjustments.extend(adjustment_values)
-        mesh_reports[name]={"weld_group_count":int(duplicate_group_count),"eligible_seam_group_count":int(eligible_groups),"disconnected_coincident_group_count":int(disconnected_groups),"weight_rejected_pair_count":int(weight_rejected_pairs),"corrected_group_count":int(corrected_groups),"corrected_vertices":int(corrected_vertices),"split_p95_mm":float(np.percentile(split_values,95)*1000.0) if split_values else 0.0,"split_max_mm":float(max(split_values,default=0.0)*1000.0),"adjustment_p95_mm":float(np.percentile(adjustment_values,95)*1000.0) if adjustment_values else 0.0,"adjustment_max_mm":float(max(adjustment_values,default=0.0)*1000.0)}
-    return out,changed,{"enabled":True,"authority":"authored topology + skinning; source-mode agnostic","adjusted_mesh_count":int(len(changed)),"corrected_group_count":int(sum(r.get("corrected_group_count",0) for r in mesh_reports.values())),"corrected_vertices":int(sum(r.get("corrected_vertices",0) for r in mesh_reports.values())),"split_p95_mm":float(np.percentile(all_splits,95)*1000.0) if all_splits else 0.0,"split_max_mm":float(max(all_splits,default=0.0)*1000.0),"adjustment_p95_mm":float(np.percentile(all_adjustments,95)*1000.0) if all_adjustments else 0.0,"adjustment_max_mm":float(max(all_adjustments,default=0.0)*1000.0),"meshes":mesh_reports}
-
+        mesh_reports[name]={"weld_group_count":compiled["duplicate_group_count"],"eligible_seam_group_count":compiled["eligible_group_count"],"disconnected_coincident_group_count":compiled["disconnected_group_count"],"cross_component_rejections":compiled["cross_component_rejections"],"weight_rejected_pair_count":compiled["weight_rejected_pairs"],"topology_rejected_group_count":int(topology_rejected),"large_split_rejected_group_count":int(large_split_rejected),"corrected_group_count":int(corrected_groups),"corrected_vertices":int(corrected_vertices),"split_p95_mm":float(np.percentile(split_values,95)*1000.0) if split_values else 0.0,"split_max_mm":float(max(split_values,default=0.0)*1000.0),"adjustment_p95_mm":float(np.percentile(adjustment_values,95)*1000.0) if adjustment_values else 0.0,"adjustment_max_mm":float(max(adjustment_values,default=0.0)*1000.0)}
+    return out,changed,{"enabled":True,"authority":"authored raw connectivity + welded neighbourhood + skinning + local topology veto","adjusted_mesh_count":int(len(changed)),"corrected_group_count":int(sum(r.get("corrected_group_count",0) for r in mesh_reports.values())),"corrected_vertices":int(sum(r.get("corrected_vertices",0) for r in mesh_reports.values())),"split_p95_mm":float(np.percentile(all_splits,95)*1000.0) if all_splits else 0.0,"split_max_mm":float(max(all_splits,default=0.0)*1000.0),"adjustment_p95_mm":float(np.percentile(all_adjustments,95)*1000.0) if all_adjustments else 0.0,"adjustment_max_mm":float(max(all_adjustments,default=0.0)*1000.0),"meshes":mesh_reports}
 
 def _weighted_rigid_projection(source: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
     P=np.asarray(source,dtype=np.float64);Q=np.asarray(target,dtype=np.float64);w=np.maximum(np.asarray(weights,dtype=np.float64),0.0)
@@ -2020,10 +2423,20 @@ def _extreme_macro_body_field(points: np.ndarray, garment_weights: np.ndarray, c
     if p95<.055 or len(X)<8:return None,{"enabled":False,"body_move_p95_mm":p95*1000.0}
     span=np.ptp(X,axis=0);sigma=float(np.clip(np.max(span)*.014,.012,.024));k=min(128,len(X));tree=cKDTree(X);distance,index=tree.query(P,k=k)
     if distance.ndim==1:distance=distance[:,None];index=index[:,None]
-    alignment=np.einsum("nk,nqk->nq",Wg,BW[index]);weight=np.exp(-((distance/max(sigma,1e-6))**2))*np.clip(alignment,.05,1.0)
-    cross=(np.abs(P[:,0,None])>.020)&(np.sign(P[:,0,None])!=np.sign(X[index][:,:,0]));weight*=np.where(cross,np.exp(-5.0),1.0);weight/=np.maximum(weight.sum(axis=1,keepdims=True),1e-12)
-    mapped=P+np.sum((Y-X)[index]*weight[:,:,None],axis=1);best=np.argmax(weight,axis=1);contact=index[np.arange(len(P)),best]
-    return (mapped,contact,np.sum(distance*weight,axis=1),np.sum(alignment*weight,axis=1),weight,index),{"enabled":True,"body_move_p95_mm":p95*1000.0,"sigma_mm":sigma*1000.0,"samples":int(k)}
+    # Keep the exact per-vertex macro-transfer mathematics, but never materialise BW[index]
+    # for an entire large garment.  On heavily decorated meshes that temporary can be hundreds
+    # of megabytes even though each vertex is independent.  Bounded row chunks preserve the
+    # same neighbour set, reductions and returned blend/index fields with a fixed peak footprint.
+    weight=np.empty_like(distance,dtype=np.float64);mapped=np.empty_like(P,dtype=np.float64);weighted_distance=np.empty(len(P),dtype=np.float64);weighted_alignment=np.empty(len(P),dtype=np.float64)
+    chunk_rows=1024
+    movement=Y-X
+    for start in range(0,len(P),chunk_rows):
+        stop=min(len(P),start+chunk_rows);local_index=index[start:stop];local_distance=distance[start:stop];local_points=P[start:stop];local_garment_weights=Wg[start:stop]
+        alignment=np.einsum("nk,nqk->nq",local_garment_weights,BW[local_index]);local_weight=np.exp(-((local_distance/max(sigma,1e-6))**2))*np.clip(alignment,.05,1.0)
+        cross=(np.abs(local_points[:,0,None])>.020)&(np.sign(local_points[:,0,None])!=np.sign(X[local_index][:,:,0]));local_weight*=np.where(cross,np.exp(-5.0),1.0);local_weight/=np.maximum(local_weight.sum(axis=1,keepdims=True),1e-12)
+        weight[start:stop]=local_weight;mapped[start:stop]=local_points+np.sum(movement[local_index]*local_weight[:,:,None],axis=1);weighted_distance[start:stop]=np.sum(local_distance*local_weight,axis=1);weighted_alignment[start:stop]=np.sum(alignment*local_weight,axis=1)
+    best=np.argmax(weight,axis=1);contact=index[np.arange(len(P)),best]
+    return (mapped,contact,weighted_distance,weighted_alignment,weight,index),{"enabled":True,"body_move_p95_mm":p95*1000.0,"sigma_mm":sigma*1000.0,"samples":int(k),"chunk_rows":int(chunk_rows)}
 
 
 def _apply_target_relief_correction(source_vertices: np.ndarray, faces: np.ndarray, mapped: np.ndarray, blend: np.ndarray, blend_ids: np.ndarray, cache: dict[str, Any], behavior: str, features: dict[str, Any]):
@@ -2685,10 +3098,19 @@ def _preserve_source_authored_body_coverage(source_vertices: np.ndarray, vertice
 
 
 
-def _nearest_surface_reference_chunked(points: np.ndarray, triangles: np.ndarray, k: int=32, chunk_size: int=6000):
-    """Exact non-Numba nearest-surface query used for rare late-stage validation."""
-    P=np.asarray(points,dtype=np.float64);T=np.asarray(triangles,dtype=np.float64);kk=min(int(k),len(T))
+_REFERENCE_SURFACE_INDEX_CACHE: dict[int, tuple[np.ndarray, np.ndarray, cKDTree, np.ndarray]] = {}
+
+def _reference_surface_index(triangles: np.ndarray):
+    """Reuse immutable late-stage triangle centre indices inside one solver process."""
+    T=np.asarray(triangles,dtype=np.float64);key=id(T);cached=_REFERENCE_SURFACE_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is T:return cached[1],cached[2],cached[3]
     centres=T.mean(axis=1);tree=cKDTree(centres);fn=np.cross(T[:,1]-T[:,0],T[:,2]-T[:,0]);fn/=np.maximum(np.linalg.norm(fn,axis=1,keepdims=True),1e-12)
+    if len(_REFERENCE_SURFACE_INDEX_CACHE)>=16:_REFERENCE_SURFACE_INDEX_CACHE.pop(next(iter(_REFERENCE_SURFACE_INDEX_CACHE)))
+    _REFERENCE_SURFACE_INDEX_CACHE[key]=(T,centres,tree,fn);return centres,tree,fn
+
+def _nearest_surface_reference_chunked(points: np.ndarray, triangles: np.ndarray, k: int=32, chunk_size: int=6000):
+    """Exact non-Numba nearest-surface query used for late-stage validation, with reusable surface index."""
+    P=np.asarray(points,dtype=np.float64);T=np.asarray(triangles,dtype=np.float64);kk=min(int(k),len(T));_,tree,fn=_reference_surface_index(T)
     cp=np.empty((len(P),3),dtype=np.float64);fi=np.empty(len(P),dtype=np.int64);dist2=np.empty(len(P),dtype=np.float64)
     for start in range(0,len(P),int(chunk_size)):
         stop=min(len(P),start+int(chunk_size));Pc=P[start:stop];_,idx=tree.query(Pc,k=kk,workers=1);idx=idx if idx.ndim>1 else idx[:,None]
@@ -2696,19 +3118,33 @@ def _nearest_surface_reference_chunked(points: np.ndarray, triangles: np.ndarray
         cp[start:stop]=C[rows,winner];fi[start:stop]=idx[rows,winner];dist2[start:stop]=dd[rows,winner]
     normals=fn[fi];signed=np.sum((P-cp)*normals,axis=1);distance=np.sqrt(dist2);return cp,normals,signed,distance,fi
 
+def _nearest_literal_occupancy(points: np.ndarray, triangles: np.ndarray, k: int=48, exact_band: float=.0025):
+    """Fast compiled literal-body query with exact verification only near/inside the collision band.
+
+    The compiled B14 candidate kernel is used for the broad query.  Samples close enough to affect
+    clearance are then rechecked by the exact late-stage reference query, preserving literal occupancy
+    authority without allocating huge all-sample trimesh candidate arrays.
+    """
+    P=np.asarray(points,dtype=np.float64);T=np.asarray(triangles,dtype=np.float64)
+    cp,normals,signed,distance,face_index=_b14_nearest_surface(P,T,k=max(32,int(k)))
+    verify=np.flatnonzero(np.asarray(signed,dtype=np.float64)<float(exact_band))
+    if len(verify):
+        ecp,en,es,ed,efi=_nearest_surface_reference_chunked(P[verify],T,k=max(32,min(int(k),64)),chunk_size=2000)
+        cp[verify]=ecp;normals[verify]=en;signed[verify]=es;distance[verify]=ed;face_index[verify]=efi
+    return cp,normals,signed,distance,face_index
+
 def _nearest_surface_oriented_reference_chunked(points: np.ndarray, triangles: np.ndarray, reference_normals: np.ndarray, k: int=64, min_alignment: float=.10, chunk_size: int=3000):
-    """Nearest literal surface constrained to the reference-normal hemisphere."""
+    """Nearest literal surface constrained to the reference-normal hemisphere, reusing the surface index."""
     P=np.asarray(points,dtype=np.float64);T=np.asarray(triangles,dtype=np.float64);R=np.asarray(reference_normals,dtype=np.float64)
     if P.shape!=R.shape or P.ndim!=2 or P.shape[1]!=3:raise ValueError("Oriented surface query requires matching Nx3 points/reference normals.")
     if len(P)==0:return np.zeros((0,3)),np.zeros((0,3)),np.zeros(0),np.zeros(0),np.zeros(0,dtype=np.int64),np.zeros(0,dtype=bool)
-    kk=min(int(k),len(T));centres=T.mean(axis=1);tree=cKDTree(centres);fn=np.cross(T[:,1]-T[:,0],T[:,2]-T[:,0]);fn/=np.maximum(np.linalg.norm(fn,axis=1,keepdims=True),1e-12);R=R/np.maximum(np.linalg.norm(R,axis=1,keepdims=True),1e-12)
+    kk=min(int(k),len(T));_,tree,fn=_reference_surface_index(T);R=R/np.maximum(np.linalg.norm(R,axis=1,keepdims=True),1e-12)
     cp=np.empty((len(P),3),dtype=np.float64);fi=np.empty(len(P),dtype=np.int64);dist2=np.empty(len(P),dtype=np.float64);used=np.zeros(len(P),dtype=bool)
     for start in range(0,len(P),int(chunk_size)):
         stop=min(len(P),start+int(chunk_size));Pc=P[start:stop];Rc=R[start:stop];_,idx=tree.query(Pc,k=kk,workers=1);idx=idx if idx.ndim>1 else idx[:,None]
         m=len(Pc);Tc=T[idx.reshape(-1)];Q=np.repeat(Pc,kk,axis=0);C=trimesh.triangles.closest_point(Tc,Q).reshape(m,kk,3);dd=np.sum((C-Pc[:,None,:])**2,axis=2);align=np.einsum("mkj,mj->mk",fn[idx],Rc);allowed=align>=float(min_alignment);has=np.any(allowed,axis=1);masked=np.where(allowed,dd,np.inf);winner=np.argmin(masked,axis=1);fallback=np.argmin(dd,axis=1);winner=np.where(has,winner,fallback);rows=np.arange(m)
         cp[start:stop]=C[rows,winner];fi[start:stop]=idx[rows,winner];dist2[start:stop]=dd[rows,winner];used[start:stop]=has
     normals=fn[fi];signed=np.sum((P-cp)*normals,axis=1);distance=np.sqrt(dist2);return cp,normals,signed,distance,fi,used
-
 
 def _nearest_literal_surface_consistent_with_support(points: np.ndarray, literal_triangles: np.ndarray, support_triangles: np.ndarray | None, *, exact_base: bool=False, deep_negative: float=-.00075):
     """Reject an opposite-facing literal winner only for materially negative collision samples."""
@@ -3174,17 +3610,623 @@ def _preserve_authored_assembly_fresh(source_meshes: dict[str,dict[str,Any]], po
         shutil.rmtree(work_dir,ignore_errors=True)
 
 
+
+
+def _structural_component_features(vertices: np.ndarray, faces: np.ndarray):
+    P=np.asarray(vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64)
+    if len(P)==0:return {"max_extent":0.0,"middle_ratio":0.0,"thin_ratio":0.0,"boundary_fraction":0.0}
+    extent=np.ptp(P,axis=0);max_extent=float(np.max(extent));centred=P-P.mean(axis=0);sv=np.linalg.svd(centred,compute_uv=False)
+    middle=float(sv[1]/max(float(sv[0]),1e-12)) if len(sv)>1 else 0.0;thin=float(sv[2]/max(float(sv[0]),1e-12)) if len(sv)>2 else 0.0
+    boundary=0.0
+    if len(F):
+        edges=np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1);unique,count=np.unique(edges,axis=0,return_counts=True);be=unique[count==1]
+        boundary=float(len(np.unique(be))/max(len(P),1)) if len(be) else 0.0
+    return {"max_extent":max_extent,"middle_ratio":middle,"thin_ratio":thin,"boundary_fraction":boundary}
+
+
+def _structural_laplacian_regularize(source_vertices: np.ndarray, target_vertices: np.ndarray, faces: np.ndarray, strength: float):
+    """ARAP-style source differential reconstruction around the supplied macro target.
+
+    The old Runtime-8 implementation preserved differentials from one global affine fit.  That was
+    topology-safe but could flatten locally authored shape whenever the target body's deformation field
+    varied across the garment (breasts/hips/belly/shoulders are the obvious cases).  Here the B14/support
+    result remains a soft positional authority while source edge differentials are reconstructed through
+    locally fitted rotations.  No garment/body/anatomy names participate.
+    """
+    P=np.asarray(source_vertices,dtype=np.float64);Q=np.asarray(target_vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64)
+    if len(P)<4 or len(F)==0 or P.shape!=Q.shape:return Q.copy()
+    edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0)
+    if len(edges)<3:return Q.copy()
+    a=edges[:,0].astype(np.int64);b=edges[:,1].astype(np.int64);n=len(P)
+    degree=np.bincount(np.concatenate((a,b)),minlength=n).astype(np.float64)
+    # Keep the macro target authoritative.  `strength` only tunes how much local source structure survives.
+    structure_weight=float(np.clip(float(strength)/12.0,.70,2.60));anchor_weight=4.0
+    rows=np.concatenate((np.arange(n),a,b));cols=np.concatenate((np.arange(n),b,a));vals=np.concatenate((degree,-np.ones(len(a)),-np.ones(len(a))))
+    L=csr_matrix((vals,(rows,cols)),shape=(n,n));A=(structure_weight*L+anchor_weight*eye(n,format="csr")).tocsr();X=Q.copy();pedge=P[a]-P[b]
+    for _ in range(2):
+        xedge=X[a]-X[b]
+        covariance=np.zeros((n,3,3),dtype=np.float64);outer=np.einsum("ni,nj->nij",xedge,pedge)
+        np.add.at(covariance,a,outer);np.add.at(covariance,b,outer)
+        try:
+            u,_,vt=np.linalg.svd(covariance,full_matrices=False);rotation=np.einsum("nij,njk->nik",u,vt);det=np.linalg.det(rotation);bad=det<0.0
+            if np.any(bad):
+                u2=u[bad].copy();u2[:,:,-1]*=-1.0;rotation[bad]=np.einsum("nij,njk->nik",u2,vt[bad])
+        except np.linalg.LinAlgError:
+            return Q.copy()
+        edge_rotation=.5*(rotation[a]+rotation[b]);goal=np.einsum("nij,nj->ni",edge_rotation,pedge);rhs_edge=np.zeros((n,3),dtype=np.float64);np.add.at(rhs_edge,a,goal);np.add.at(rhs_edge,b,-goal)
+        rhs=structure_weight*rhs_edge+anchor_weight*Q
+        try:X=np.column_stack([spsolve(A,rhs[:,axis]) for axis in range(3)])
+        except Exception:return Q.copy()
+        if not np.all(np.isfinite(X)):return Q.copy()
+    # Never accept a structural reconstruction that worsens source-relative topology/edge pathology.
+    accepted,_,_,_=_coupled_topology_safe_alpha(P,Q,X,F)
+    return np.asarray(accepted,dtype=np.float64)
+
+
+def _garment_support_proxy(cache: dict[str,Any]):
+    """Build a source-relative multi-scale target support surface for clothing.
+
+    The selected target body owns broad anatomy and silhouette.  Only target-only high-frequency relief
+    is attenuated, with an intermediate band kept mostly target-authoritative.  This prevents small local
+    anatomy from embossing through close garments without flattening centimetre-scale hips/glutes/bust.
+    Literal target geometry remains absolute collision authority elsewhere in the solver.
+    """
+    cached=cache.get("_ravafit_garment_support_proxy")
+    if isinstance(cached,dict) and "V" in cached:return cached
+    TV=np.asarray(cache.get("target_support_V"),dtype=np.float64).copy();TF=np.asarray(cache.get("target_support_F"),dtype=np.int64)
+    SV=np.asarray(cache.get("source_support_V"),dtype=np.float64);SF=np.asarray(cache.get("source_support_F"),dtype=np.int64)
+    if len(TV)==0 or len(TF)==0:
+        result={"V":TV,"F":TF.copy(),"report":{"enabled":False,"reason":"missing target support"}};cache["_ravafit_garment_support_proxy"]=result;return result
+
+    raw_edges=np.sort(np.vstack((TF[:,[0,1]],TF[:,[1,2]],TF[:,[2,0]])),axis=1)
+    edges=np.unique(raw_edges,axis=0);ea,eb=edges[:,0],edges[:,1]
+    deg=np.bincount(np.concatenate((ea,eb)),minlength=len(TV)).astype(np.float64)
+    unique_edges,edge_counts=np.unique(raw_edges,axis=0,return_counts=True)
+    boundary=np.unique(unique_edges[edge_counts==1]) if np.any(edge_counts==1) else np.empty(0,dtype=np.int64)
+    edge_len=np.linalg.norm(TV[ea]-TV[eb],axis=1);median_edge=float(np.median(edge_len[edge_len>1e-8])) if np.any(edge_len>1e-8) else .0025
+
+    def lowpass(V: np.ndarray, iterations: int):
+        cur=np.asarray(V,dtype=np.float64).copy()
+        for _ in range(max(1,int(iterations))):
+            sums=np.zeros_like(cur);np.add.at(sums,ea,cur[eb]);np.add.at(sums,eb,cur[ea]);avg=sums/np.maximum(deg[:,None],1.0);cur=.74*cur+.26*avg
+        return cur
+
+    # Diffusion radius grows roughly with sqrt(iterations)*edge length.  Choose bands from physical scale,
+    # not anatomy names, so this remains generic across garments and bodies.
+    micro_iterations=int(np.clip(round((.006/max(median_edge,1e-5))**2),2,7))
+    broad_iterations=int(np.clip(round((.022/max(median_edge,1e-5))**2),14,42))
+    target_micro_lp=lowpass(TV,micro_iterations);target_broad=lowpass(TV,broad_iterations)
+    target_micro=TV-target_micro_lp;target_meso=target_micro_lp-target_broad
+    mode="target-multiscale-fallback";micro_alpha=np.ones(len(TV),dtype=np.float64);meso_alpha=np.ones(len(TV),dtype=np.float64)
+    if len(SV)==len(TV) and SF.shape==TF.shape and np.array_equal(SF,TF):
+        source_micro_lp=lowpass(SV,micro_iterations);source_broad=lowpass(SV,broad_iterations)
+        source_micro=SV-source_micro_lp;source_meso=source_micro_lp-source_broad
+        sm=np.linalg.norm(source_micro,axis=1);tm=np.linalg.norm(target_micro,axis=1)
+        ss=np.linalg.norm(source_meso,axis=1);ts=np.linalg.norm(target_meso,axis=1)
+        micro_alpha=np.clip((sm+.00016)/np.maximum(tm+.00016,1e-12),.12,1.0)
+        # Meso curvature carries broad clothing silhouette: retain at least 88% target authority.
+        meso_alpha=np.clip((ss+.00045)/np.maximum(ts+.00045,1e-12),.88,1.0)
+        for _ in range(3):
+            sums=np.zeros(len(micro_alpha),dtype=np.float64);np.add.at(sums,ea,micro_alpha[eb]);np.add.at(sums,eb,micro_alpha[ea]);micro_alpha=.72*micro_alpha+.28*sums/np.maximum(deg,1.0)
+        for _ in range(2):
+            sums=np.zeros(len(meso_alpha),dtype=np.float64);np.add.at(sums,ea,meso_alpha[eb]);np.add.at(sums,eb,meso_alpha[ea]);meso_alpha=.76*meso_alpha+.24*sums/np.maximum(deg,1.0)
+        out=target_broad+target_meso*meso_alpha[:,None]+target_micro*micro_alpha[:,None];mode="source-relative-multiscale-relief"
+    else:
+        out=target_broad+target_meso+target_micro*.70
+
+    delta=out-TV;mag=np.linalg.norm(delta,axis=1);cap=.0038;delta*=np.minimum(1.0,cap/np.maximum(mag,1e-12))[:,None]
+    if len(boundary):delta[boundary]*=.20
+    out=TV+delta;move=np.linalg.norm(delta,axis=1)
+    report={"enabled":True,"mode":mode,"median_edge_mm":median_edge*1000.0,"micro_iterations":micro_iterations,"broad_iterations":broad_iterations,
+        "move_p95_mm":float(np.percentile(move,95)*1000.0),"move_max_mm":float(np.max(move,initial=0.0)*1000.0),
+        "micro_authority_p05":float(np.percentile(micro_alpha,5)) if len(micro_alpha) else 1.0,"micro_authority_p50":float(np.percentile(micro_alpha,50)) if len(micro_alpha) else 1.0,
+        "meso_authority_p05":float(np.percentile(meso_alpha,5)) if len(meso_alpha) else 1.0,"meso_authority_p50":float(np.percentile(meso_alpha,50)) if len(meso_alpha) else 1.0,
+        "boundary_vertices":int(len(boundary)),"policy":"physical-scale support: target broad/macro silhouette preserved, meso curvature mostly target-authoritative, only target-only micro relief attenuated; literal body remains collision authority"}
+    result={"V":out,"F":TF.copy(),"report":report};cache["_ravafit_garment_support_proxy"]=result;return result
+
+def _structural_support_frame_target(points: np.ndarray, cache: dict[str,Any]):
+    P=np.asarray(points,dtype=np.float64);SV=np.asarray(cache.get("source_support_V"),dtype=np.float64);SF=np.asarray(cache.get("source_support_F"),dtype=np.int64);proxy=_garment_support_proxy(cache);TV=np.asarray(proxy.get("V"),dtype=np.float64);TF=np.asarray(proxy.get("F"),dtype=np.int64)
+    if len(P)==0 or len(SV)==0 or len(SF)==0 or len(TV)==0 or len(TF)==0 or len(SF)!=len(TF):return None
+    source_tri=cache.get("_ravafit_structural_source_support_triangles")
+    if source_tri is None:source_tri=SV[SF];cache["_ravafit_structural_source_support_triangles"]=source_tri
+    target_tri=cache.get("_ravafit_structural_target_support_triangles")
+    if target_tri is None:target_tri=TV[TF];cache["_ravafit_structural_target_support_triangles"]=target_tri
+    closest,_,signed,distance,face_index=_b14_nearest_surface(P,source_tri,k=48)
+    source_face=source_tri[face_index];target_face=target_tri[face_index];bary=trimesh.triangles.points_to_barycentric(source_face,closest);contact=np.einsum("ni,nij->nj",bary,target_face)
+    normal=np.cross(target_face[:,1]-target_face[:,0],target_face[:,2]-target_face[:,0]);normal/=np.maximum(np.linalg.norm(normal,axis=1,keepdims=True),1e-12)
+    stand=np.clip(np.maximum(np.asarray(signed,dtype=np.float64),.00045),.00045,.020)
+    return contact+stand[:,None]*normal,np.asarray(distance,dtype=np.float64),np.asarray(signed,dtype=np.float64)
+
+
+def _structural_transform_offset(source_triangle: np.ndarray, target_triangle: np.ndarray, offset: np.ndarray):
+    S=np.asarray(source_triangle,dtype=np.float64);T=np.asarray(target_triangle,dtype=np.float64);v=np.asarray(offset,dtype=np.float64)
+    se1=S[1]-S[0];se2=S[2]-S[0];sn=np.cross(se1,se2);sn/=max(float(np.linalg.norm(sn)),1e-12)
+    te1=T[1]-T[0];te2=T[2]-T[0];tn=np.cross(te1,te2);tn/=max(float(np.linalg.norm(tn)),1e-12)
+    A0=np.column_stack((se1,se2,sn));A1=np.column_stack((te1,te2,tn))
+    try:M=A1@np.linalg.inv(A0)
+    except np.linalg.LinAlgError:return v.copy()
+    u,sv,vt=np.linalg.svd(M);sv=np.clip(sv,.70,1.40);M=u@np.diag(sv)@vt
+    return M@v
+
+
+def _structural_fit_similarity_from_anchors(source_anchor: np.ndarray, target_anchor: np.ndarray, points: np.ndarray, scale_min: float=.75, scale_max: float=1.30):
+    A=np.asarray(source_anchor,dtype=np.float64);B=np.asarray(target_anchor,dtype=np.float64);P=np.asarray(points,dtype=np.float64)
+    if len(A)<3:return P.copy(),1.0
+    ca=A.mean(axis=0);cb=B.mean(axis=0);AA=A-ca;BB=B-cb;u,_,vt=np.linalg.svd(AA.T@BB);R=vt.T@u.T
+    if np.linalg.det(R)<0:vt[-1]*=-1;R=vt.T@u.T
+    Ar=AA@R.T;scale=float(np.sum(Ar*BB)/max(float(np.sum(Ar*Ar)),1e-12));scale=float(np.clip(scale,scale_min,scale_max))
+    return scale*(P-ca)@R.T+cb,scale
+
+
+def _structural_find_attachment(mesh_name: str, ids: np.ndarray, source_meshes: dict[str,dict[str,Any]], candidate: dict[str,np.ndarray], source_triangles: dict[str,np.ndarray] | None=None):
+    source=np.asarray(source_meshes[mesh_name]["V"],dtype=np.float64);P=source[ids];probe=P[::max(1,len(P)//96)];best=None
+    # Thousands of authored studs/rings may each ask the same few garment surfaces for an attachment.
+    # Reusing the exact immutable triangle arrays lets _reference_surface_index reuse its cKDTree/normals
+    # instead of rebuilding a full acceleration structure once per tiny component.  Query mathematics
+    # and component-local decisions remain unchanged.
+    triangles=source_triangles or {}
+    for other,row in source_meshes.items():
+        if other==mesh_name or other not in candidate:continue
+        SV=np.asarray(row["V"],dtype=np.float64);SF=np.asarray(row["F"],dtype=np.int64)
+        if len(SV)<3 or len(SF)==0:continue
+        tri=triangles.get(other)
+        if tri is None:tri=SV[SF]
+        _,_,_,distance,_=_nearest_surface_reference_chunked(probe,tri,k=32);median=float(np.median(distance));p10=float(np.percentile(distance,10));score=.70*p10+.30*median
+        if best is None or score<best[0]:best=(score,median,p10,other)
+    if best is None or best[2]>.012:return None
+    support=best[3];SV=np.asarray(source_meshes[support]["V"],dtype=np.float64);SF=np.asarray(source_meshes[support]["F"],dtype=np.int64);tri=triangles.get(support)
+    if tri is None:tri=SV[SF]
+    closest,normal,signed,distance,face_index=_nearest_surface_reference_chunked(P,tri,k=32);threshold=min(.010,float(np.percentile(distance,20))+.0025);anchors=np.flatnonzero(distance<=threshold)
+    if len(anchors)<3:anchors=np.argsort(distance)[:min(12,len(P))]
+    target_v=np.asarray(candidate[support],dtype=np.float64);source_anchor=[];target_anchor=[]
+    for ai in anchors:
+        face=int(face_index[ai]);st=tri[face];tt=target_v[SF[face]];cp=closest[ai];bary=trimesh.triangles.points_to_barycentric(st[None,:,:],cp[None,:])[0];tc=bary@tt;off=P[ai]-cp
+        source_anchor.append(P[ai]);target_anchor.append(tc+_structural_transform_offset(st,tt,off))
+    side=float(np.median(np.einsum("ij,ij->i",P-closest,normal)))
+    return {"support":support,"source_anchor":np.asarray(source_anchor),"target_anchor":np.asarray(target_anchor),"median_gap":best[1],"p10_gap":best[2],"source_side":1.0 if side>=0.0 else -1.0}
+
+
+def _structural_oriented_clearance(vertices: np.ndarray, faces: np.ndarray, source_vertices: np.ndarray, target_literal_tri: np.ndarray, target_support_tri: np.ndarray, rigid: bool, margin: float=.00070):
+    V=np.asarray(vertices,dtype=np.float64).copy();F=np.asarray(faces,dtype=np.int64);S=np.asarray(source_vertices,dtype=np.float64);literal=np.asarray(target_literal_tri,dtype=np.float64);support=np.asarray(target_support_tri,dtype=np.float64)
+    if len(V)==0 or len(literal)==0:return V,{"adjusted":False,"iterations":0}
+    edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0) if len(F) else np.empty((0,2),dtype=np.int64);neighbours=[[] for _ in range(len(V))]
+    for a,b in edges:neighbours[int(a)].append(int(b));neighbours[int(b)].append(int(a))
+    original=V.copy();rejections=0;history=[]
+    for iteration in range(6):
+        sample_parts=[V];owners=[np.arange(len(V),dtype=np.int64)[:,None]];weights=[np.ones((len(V),1),dtype=np.float64)]
+        if len(F):
+            cent=V[F].mean(axis=1);sample_parts.append(cent);owners.append(F);weights.append(np.full((len(F),3),1.0/3.0,dtype=np.float64))
+        samples=np.vstack(sample_parts);cp,normals,signed,_,_,rej=_nearest_literal_surface_consistent_with_support(samples,literal,support,exact_base=True,deep_negative=-.00035);rejections+=int(rej);need=np.maximum(float(margin)-signed,0.0);bad=need>1e-6
+        if not np.any(bad):break
+        history.append({"iteration":iteration+1,"min_mm":float(np.min(signed)*1000.0),"p01_mm":float(np.percentile(signed,1)*1000.0),"bad_samples":int(np.count_nonzero(bad))})
+        if rigid:
+            nn=np.asarray(normals[bad],dtype=np.float64);ww=need[bad];anchor=nn[int(np.argmax(ww))].copy();flip=np.einsum("ij,j->i",nn,anchor)<0.0;nn[flip]*=-1.0;direction=np.sum(nn*ww[:,None],axis=0);dn=float(np.linalg.norm(direction))
+            if dn<1e-12:break
+            direction/=dn;projection=nn@direction;positive=projection>.10
+            if not np.any(positive):break
+            step=float(min(.0035,np.max(ww[positive]/np.maximum(projection[positive],.10))+.00005));field=np.broadcast_to(direction*step,V.shape).copy()
+        else:
+            field=np.zeros_like(V);mass=np.zeros(len(V),dtype=np.float64);offset=0
+            vertex_count=len(V);vb=bad[:vertex_count]
+            if np.any(vb):field[vb]+=normals[:vertex_count][vb]*need[:vertex_count][vb,None];mass[vb]+=1.0
+            if len(F):
+                fb=bad[vertex_count:]
+                rows=np.flatnonzero(fb)
+                if len(rows):
+                    contrib=normals[vertex_count:][rows]*need[vertex_count:][rows,None]
+                    for corner in range(3):np.add.at(field,F[rows,corner],contrib/3.0);np.add.at(mass,F[rows,corner],1.0/3.0)
+            active=mass>0.0;field[active]/=mass[active,None]
+            for _ in range(5):
+                avg=np.zeros_like(field)
+                for i,ns in enumerate(neighbours):
+                    if ns:avg[i]=np.mean(field[ns],axis=0)
+                grown=np.linalg.norm(avg,axis=1)>1e-8;field=np.where(active[:,None],.82*field+.18*avg,.12*avg);active|=grown
+            mag=np.linalg.norm(field,axis=1);field*=np.minimum(1.0,.00150/np.maximum(mag,1e-12))[:,None]
+        accepted=None
+        for alpha in (1.0,.80,.60,.40,.25,.12,.06):
+            trial=V+float(alpha)*field
+            if len(F):
+                q=_component_topology_quality(S,trial,F);base=_component_topology_quality(S,V,F)
+                if q["flip_fraction"]>max(.002,base["flip_fraction"]+.0005) or q["orientation_p01"]<min(.02,base["orientation_p01"]-.03) or q["area_ratio_p01"]<min(.08,base["area_ratio_p01"]*.75):continue
+            accepted=trial;break
+        if accepted is None:break
+        V=accepted
+    sample_parts=[V]
+    if len(F):sample_parts.append(V[F].mean(axis=1))
+    samples=np.vstack(sample_parts);_,_,signed,_,_,rej=_nearest_literal_surface_consistent_with_support(samples,literal,support,exact_base=True,deep_negative=-.00035);rejections+=int(rej)
+    move=np.linalg.norm(V-original,axis=1)
+    return V,{"adjusted":bool(np.any(move>1e-7)),"iterations":len(history),"history":history,"move_p95_mm":float(np.percentile(move,95)*1000.0) if len(move) else 0.0,"move_max_mm":float(np.max(move)*1000.0) if len(move) else 0.0,"sample_min_mm":float(np.min(signed)*1000.0) if len(signed) else None,"sample_p01_mm":float(np.percentile(signed,1)*1000.0) if len(signed) else None,"opposite_facing_literal_rejections":rejections}
+
+
+def _finalize_modded_structural_solution(source: Any, cache: dict[str,Any], positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], records: dict[str,Any], contexts: dict[str,dict[str,Any]], local_affine_quality_rms_mm: float):
+    """Preserve source-authored garment structure around B14's target-body macro fit.
+
+    B14 remains body-transfer authority. This stage only reconstructs local garment structure,
+    carries rigid attachments with their authored garment support, and applies outward-only collision safety.
+    """
+    source_meshes={name:{"V":np.asarray(contexts[name]["data"]["V"],dtype=np.float64),"F":np.asarray(contexts[name]["data"]["F"],dtype=np.int64)} for name in positions}
+    # Immutable source surfaces are shared by every component attachment query in this conversion.
+    # Keep one triangle object per mesh so the exact nearest-surface accelerator is actually reusable.
+    source_triangles={name:row["V"][row["F"]] for name,row in source_meshes.items() if len(row["F"])}
+    candidate={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};component_rows={};detail_meshes=set();classification_counts={"rigid-detail":0,"structured-strip":0,"support-frame-cloth":0,"cloth-shell":0}
+    for name in sorted(candidate):
+        S=source_meshes[name]["V"];F=source_meshes[name]["F"];R=np.asarray(positions[name],dtype=np.float64);components=_masked_vertex_components(F,np.ones(len(S),dtype=bool));rows=[];rigid_count=0
+        for ci,ids in enumerate(components):
+            LF=_component_local_faces(F,ids,len(S));P=S[ids];Q=R[ids];feature=_structural_component_features(P,LF);maxe=feature["max_extent"];middle=feature["middle_ratio"];thin=feature["thin_ratio"];boundary=feature["boundary_fraction"]
+            rigid=(len(ids)<=650 and maxe<=.055) or (len(ids)<=220 and maxe<=.090 and thin<=.18);strip=(not rigid and maxe<=.34 and (thin<=.10 or boundary>=.28) and middle<=.45)
+            if rigid:
+                X,_=_similarity_fit_points(P,Q,scale_min=.72,scale_max=1.35);kind="rigid-detail";rigid_count+=1
+            elif strip:
+                X=_structural_laplacian_regularize(P,Q,LF,20.0);kind="structured-strip"
+            else:
+                frame=_structural_support_frame_target(P,cache);close=frame is not None and float(np.median(frame[1]))<=.018
+                if close:
+                    data_target=.10*Q+.90*frame[0];X=_structural_laplacian_regularize(P,data_target,LF,32.0 if maxe<.38 else 24.0);kind="support-frame-cloth"
+                else:
+                    X=_structural_laplacian_regularize(P,Q,LF,10.0);kind="cloth-shell"
+            candidate[name][ids]=X;classification_counts[kind]+=1;rows.append({"component":ci,"ids":ids,"faces":LF,"kind":kind,"features":feature})
+        component_rows[name]=rows
+        if len(components)>=12 and rigid_count>=8 and rigid_count>=int(np.ceil(.35*len(components))):detail_meshes.add(name)
+
+    attachment_reports=[]
+    for name in sorted(detail_meshes):
+        for row in component_rows[name]:
+            if row["kind"]!="rigid-detail":continue
+            ids=row["ids"];attachment=_structural_find_attachment(name,ids,source_meshes,candidate,source_triangles)
+            if attachment is None:continue
+            P=source_meshes[name]["V"][ids];X,scale=_structural_fit_similarity_from_anchors(attachment["source_anchor"],attachment["target_anchor"],P);candidate[name][ids]=X
+            # Preserve source stand-off from the garment support itself; this is a rigid translation only.
+            source_p10=float(attachment["p10_gap"]);before_gap=None;after_gap=None
+            if source_p10>.00020:
+                support=attachment["support"];SF=source_meshes[support]["F"];support_tri=np.asarray(candidate[support],dtype=np.float64)[SF];current=candidate[name][ids].copy();desired=max(.00035,source_p10*.85)
+                for _ in range(3):
+                    _,normal,_,distance,_=_nearest_surface_reference_chunked(current,support_tri,k=32);p10=float(np.percentile(distance,10));before_gap=p10 if before_gap is None else before_gap;deficit=desired-p10
+                    if deficit<=.00003:break
+                    near=distance<=np.percentile(distance,35);direction=np.mean(normal[near]*float(attachment["source_side"]),axis=0);dn=float(np.linalg.norm(direction))
+                    if dn<1e-12:break
+                    current=current+(direction/dn)*min(.0025,deficit+.00005)
+                candidate[name][ids]=current;_,_,_,distance,_=_nearest_surface_reference_chunked(current,support_tri,k=32);after_gap=float(np.percentile(distance,10))
+            attachment_reports.append({"mesh":name,"component":int(row["component"]),"support":attachment["support"],"vertices":int(len(ids)),"source_p10_gap_mm":source_p10*1000.0,"before_p10_gap_mm":None if before_gap is None else before_gap*1000.0,"after_p10_gap_mm":None if after_gap is None else after_gap*1000.0,"scale":float(scale)})
+
+    target_support_tri=np.asarray(cache.get("_ravafit_target_support_triangles"),dtype=np.float64) if cache.get("_ravafit_target_support_triangles") is not None else _triangles_from_surface(cache["target_support_V"],cache["target_support_F"])
+    target_literal_tri=cache.get("_ravafit_target_collision_triangles")
+    if target_literal_tri is None:
+        suppression=cache.get("_ravafit_source_body_suppression") or {};target_literal_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
+    target_literal_tri=np.asarray(target_literal_tri,dtype=np.float64)
+    clearance_reports=[];changed=set()
+    for name in sorted(candidate):
+        S=source_meshes[name]["V"];F=source_meshes[name]["F"];C=candidate[name].copy()
+        for row in component_rows[name]:
+            ids=row["ids"];LF=row["faces"];X,report=_structural_oriented_clearance(C[ids],LF,S[ids],target_literal_tri,target_support_tri,row["kind"]=="rigid-detail",margin=.00070);C[ids]=X
+            if report.get("adjusted"):changed.add(name)
+            clearance_reports.append({"mesh":name,"component":int(row["component"]),"kind":row["kind"],**report})
+        candidate[name]=C
+
+    # Any structurally reconstructed mesh gets authoritative target-body skinning recomputed from final geometry.
+    for name in sorted(candidate):
+        context=contexts[name];data=context["data"];w=context["w"];retargeted,stage=_retarget_garment_skinning(candidate[name],data["V"],data["W"],data["joint_names"],cache,context["behavior"],context["effective_behavior"],context["labels"],context["classes"],w["raw_to_weld"]);_assert_finite_stage(name,"structural finalizer skinning retarget",retargeted);skinning[name]={"weights":retargeted,"joint_names":list(data["joint_names"]),"stage":stage};records.setdefault(name,{})["skinning"]=stage;records[name]["structural_finalizer_applied"]=True
+
+    unresolved=[r for r in clearance_reports if r.get("sample_p01_mm") is not None and float(r["sample_p01_mm"])<-.10]
+    return candidate,skinning,records,{"local_affine_quality_rms_mm":float(local_affine_quality_rms_mm),"garment_mesh_count":len(candidate),"skinning_retargeted_mesh_count":len(skinning),"structural_finalizer":{"enabled":True,"policy":"B14 macro fit + source differential shape + smoothed support-frame close cloth + source-relative rigid attachments + outward-only literal collision veto","classification_counts":classification_counts,"detail_meshes":sorted(detail_meshes),"attachment_count":len(attachment_reports),"attachments":attachment_reports,"clearance":clearance_reports,"unresolved_p01_collision_components":len(unresolved)},"authored_layer_relations":0,"authored_layer_adjusted_meshes":0,"authored_layer_report":{"enabled":False,"reason":"superseded by structural finalizer"},"authored_cross_mesh_relations":0,"authored_cross_mesh_adjusted_meshes":0,"authored_cross_mesh_report":{"enabled":False,"reason":"superseded by source-relative attachment frames"},"authored_split_seams":{"enabled":False,"reason":"source differential reconstruction preserves authored topology"},"far_authored_structural_anchor":{"enabled":False,"reason":"superseded by structural component solve"},"authored_long_panel_shape_guard":{"enabled":False,"reason":"superseded by structural component solve"},"authored_ribbon_topology":{"enabled":False,"reason":"superseded by rigid/strip structural classes"},"authored_narrow_strip_shape_guard":{"enabled":False,"reason":"superseded by structured-strip solve"},"modded_source_coverage_clearance":{"enabled":False,"reason":"superseded by outward-only structural collision veto"},"dense_vanilla_expansion_clearance":{"enabled":False,"reason":"modded structural finalizer"},"body_support_proxy":{"enabled":True,"mode":"smoothed support-frame cloth with literal-body collision veto","slots":cache.get("slot_stats",[])},"source_body_suppression":_public_source_body_suppression(cache.get("_ravafit_source_body_suppression"))}
+
+def _coupled_support_frame(points: np.ndarray, cache: dict[str,Any], target_vertices: np.ndarray | None=None):
+    """Map arbitrary source-space points through the exact source->target support correspondence."""
+    P=np.asarray(points,dtype=np.float64);SV=np.asarray(cache.get("source_support_V"),dtype=np.float64);SF=np.asarray(cache.get("source_support_F"),dtype=np.int64);proxy=_garment_support_proxy(cache);TV=np.asarray(proxy.get("V") if target_vertices is None else target_vertices,dtype=np.float64);TF=np.asarray(proxy.get("F"),dtype=np.int64)
+    if len(P)==0 or len(SV)==0 or len(SF)==0 or len(TV)==0 or len(TF)==0 or len(SF)!=len(TF):return None
+    source_tri=SV[SF];target_tri=TV[TF];closest,source_normal,_,distance,face_index=_b14_nearest_surface(P,source_tri,k=48);source_face=source_tri[face_index];target_face=target_tri[face_index];bary=trimesh.triangles.points_to_barycentric(source_face,closest);contact=np.einsum("ni,nij->nj",bary,target_face);normal=np.cross(target_face[:,1]-target_face[:,0],target_face[:,2]-target_face[:,0]);normal/=np.maximum(np.linalg.norm(normal,axis=1,keepdims=True),1e-12)
+    # Preserve hemisphere orientation from the corresponding source face instead of trusting an unrelated nearest target face.
+    sf_normal=np.cross(source_face[:,1]-source_face[:,0],source_face[:,2]-source_face[:,0]);sf_normal/=np.maximum(np.linalg.norm(sf_normal,axis=1,keepdims=True),1e-12);same=np.einsum("ij,ij->i",sf_normal,source_normal)>=0.0;normal[~same]*=-1.0
+    return contact,normal,np.asarray(distance,dtype=np.float64),np.asarray(face_index,dtype=np.int64)
+
+
+def _build_auxiliary_envelope_support(cache: dict[str,Any]):
+    """Create a broad support-frame envelope around target-body auxiliary geometry.
+
+    The envelope is deliberately wider than the literal accessory silhouette.  Aux geometry is therefore
+    a collision veto (cloth must bridge over it) rather than a sculpting tool (cloth must not emboss it).
+    """
+    cached=cache.get("_ravafit_auxiliary_envelope_support")
+    if isinstance(cached,dict) and "V" in cached:return cached
+    proxy=_garment_support_proxy(cache);TV=np.asarray(proxy.get("V"),dtype=np.float64);TF=np.asarray(proxy.get("F"),dtype=np.int64)
+    if len(TV)==0 or len(TF)==0:
+        result={"V":TV.copy(),"F":TF.copy(),"height":np.zeros(len(TV)),"report":{"enabled":False,"reason":"missing target support"}};cache["_ravafit_auxiliary_envelope_support"]=result;return result
+    normals=_vertex_normals_from_faces(TV,TF);tri=TV[TF];tree=cKDTree(TV);height=np.zeros(len(TV),dtype=np.float64);seed=np.zeros(len(TV),dtype=np.float64);components=cache.get("_ravafit_target_auxiliary_components") or [];rows=[]
+    for row in components:
+        P=np.asarray(row.get("V",[]),dtype=np.float64)
+        if len(P)<3:continue
+        cp,n,signed,distance,_=_nearest_surface_reference_chunked(P,tri,k=48);positive=np.maximum(np.asarray(signed,dtype=np.float64),0.0);effective=np.maximum(positive,.40*np.asarray(distance,dtype=np.float64));stride=max(1,len(P)//160);used=0;max_h=0.0
+        for qi in range(0,len(P),stride):
+            h=float(np.clip(effective[qi]+.00070,.00075,.00650))
+            if effective[qi]<.00010:continue
+            sigma=float(np.clip(max(.0070,2.2*h),.0070,.0140));ids=np.asarray(tree.query_ball_point(cp[qi],r=3.0*sigma),dtype=np.int64)
+            if not len(ids):continue
+            align=np.einsum("ij,j->i",normals[ids],n[qi]);ids=ids[align>.15]
+            if not len(ids):continue
+            dist=np.linalg.norm(TV[ids]-cp[qi],axis=1);bump=h*np.exp(-.5*np.square(dist/sigma));seed[ids]=np.maximum(seed[ids],bump);used+=1;max_h=max(max_h,h)
+        if used:rows.append({"slot":row.get("slot"),"mesh":row.get("mesh"),"component":row.get("component"),"samples":used,"max_height_mm":max_h*1000.0})
+    height=seed.copy()
+    if np.any(height>0.0):
+        edges=np.unique(np.sort(np.vstack((TF[:,[0,1]],TF[:,[1,2]],TF[:,[2,0]])),axis=1),axis=0);ea,eb=edges[:,0],edges[:,1];deg=np.bincount(np.concatenate((ea,eb)),minlength=len(TV)).astype(np.float64)
+        for _ in range(5):
+            sums=np.zeros(len(TV),dtype=np.float64);np.add.at(sums,ea,height[eb]);np.add.at(sums,eb,height[ea]);avg=sums/np.maximum(deg,1.0);height=np.maximum(.90*seed,.68*height+.32*avg)
+    V=TV+normals*height[:,None];report={"enabled":bool(rows),"auxiliary_components":len(rows),"support_vertices_raised":int(np.count_nonzero(height>.00005)),"height_p95_mm":float(np.percentile(height,95)*1000.0) if len(height) else 0.0,"height_max_mm":float(np.max(height,initial=0.0)*1000.0),"components":rows,"policy":"broad smoothed body-relative auxiliary envelope; auxiliaries veto occupancy without imprinting their literal silhouette"};result={"V":V,"F":TF.copy(),"height":height,"report":report};cache["_ravafit_auxiliary_envelope_support"]=result;return result
+
+
+def _coupled_edge_metric(source_vertices: np.ndarray, vertices: np.ndarray, faces: np.ndarray):
+    S=np.asarray(source_vertices,dtype=np.float64);V=np.asarray(vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64)
+    if len(F)==0:return {"min":1.0,"p001":1.0,"p01":1.0,"p99":1.0,"p999":1.0,"max":1.0}
+    edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);a=np.linalg.norm(S[edges[:,1]]-S[edges[:,0]],axis=1);b=np.linalg.norm(V[edges[:,1]]-V[edges[:,0]],axis=1);valid=a>.00015;ratio=b[valid]/np.maximum(a[valid],1e-12)
+    if not len(ratio):return {"min":1.0,"p001":1.0,"p01":1.0,"p99":1.0,"p999":1.0,"max":1.0}
+    return {"min":float(np.min(ratio)),"p001":float(np.percentile(ratio,.1)),"p01":float(np.percentile(ratio,1)),"p99":float(np.percentile(ratio,99)),"p999":float(np.percentile(ratio,99.9)),"max":float(np.max(ratio))}
+
+
+def _coupled_topology_safe_alpha(source_vertices: np.ndarray, before: np.ndarray, proposed: np.ndarray, faces: np.ndarray):
+    S=np.asarray(source_vertices,dtype=np.float64);B=np.asarray(before,dtype=np.float64);P=np.asarray(proposed,dtype=np.float64);F=np.asarray(faces,dtype=np.int64);base=_source_relative_topology_summary(S,B,F);base_edge=_coupled_edge_metric(S,B,F)
+    for alpha in (1.0,.80,.60,.45,.30,.20,.12,.07,.04):
+        C=B+alpha*(P-B);m=_source_relative_topology_summary(S,C,F);e=_coupled_edge_metric(S,C,F)
+        flip_limit=max(.0125,base["flip_fraction"]+.0025);p99_limit=max(1.90,base_edge["p99"]*1.05);p999_limit=max(2.80,base_edge["p999"]*1.08);max_limit=max(3.25,base_edge["max"]*1.02);p01_floor=min(.42,base_edge["p01"]*.92);p001_floor=min(.25,base_edge["p001"]*.90);min_floor=min(.12,base_edge["min"]*.85);area_floor=min(.12,base["area_p01"]*.70)
+        if (m["flip_fraction"]<=flip_limit and e["p99"]<=p99_limit and e["p999"]<=p999_limit and e["max"]<=max_limit
+                and e["p01"]>=p01_floor and e["p001"]>=p001_floor and e["min"]>=min_floor and m["area_p01"]>=area_floor):return C,float(alpha),m,e
+    return B.copy(),0.0,base,base_edge
+
+
+def _coupled_component_clearance(source_vertices: np.ndarray, vertices: np.ndarray, faces: np.ndarray, cache: dict[str,Any], env: dict[str,Any], margin: float=.00065, precomputed: dict[str,np.ndarray] | None=None, enforce_support: bool=True):
+    """Clear one authored component with broad patches and a literal-body hemisphere veto.
+
+    Source->target support correspondence is immutable for a component and may be precomputed once per
+    garment mesh.  Literal target geometry only supplies occupancy and, for deep wrong-side contacts,
+    the outward hemisphere; its high-frequency surface is never copied into the cloth field.
+    """
+    S=np.asarray(source_vertices,dtype=np.float64);V=np.asarray(vertices,dtype=np.float64).copy();F=np.asarray(faces,dtype=np.int64)
+    if len(S)==0 or len(F)==0:return V,{"adjusted":False,"rounds":0}
+    envV=np.asarray(env["V"],dtype=np.float64);envF=np.asarray(env["F"],dtype=np.int64);base_support=np.asarray(cache["target_support_V"],dtype=np.float64)[np.asarray(cache["target_support_F"],dtype=np.int64)]
+    literal=cache.get("_ravafit_target_collision_triangles")
+    if literal is None:
+        suppression=cache.get("_ravafit_source_body_suppression") or {};literal=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
+    literal=np.asarray(literal,dtype=np.float64)
+    edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);ea,eb=edges[:,0],edges[:,1];deg=np.bincount(np.concatenate((ea,eb)),minlength=len(V)).astype(np.float64);feature=_structural_component_features(S,F);rigid=(len(S)<=650 and feature["max_extent"]<=.055) or (len(S)<=220 and feature["max_extent"]<=.090 and feature["thin_ratio"]<=.18) or (len(S)<=180 and feature["max_extent"]<=.170 and feature["boundary_fraction"]>=.50 and feature["middle_ratio"]<=.35)
+    if precomputed is None:
+        vf=_coupled_support_frame(S,cache,envV);ff=_coupled_support_frame(S[F].mean(axis=1),cache,envV)
+        if vf is None:return V,{"adjusted":False,"rounds":0,"reason":"support frame unavailable"}
+        v_contact,v_normal,v_distance,_=vf
+        if ff is None:f_contact=f_normal=f_distance=None
+        else:f_contact,f_normal,f_distance,_=ff
+    else:
+        v_contact=np.asarray(precomputed["v_contact"],dtype=np.float64);v_normal=np.asarray(precomputed["v_normal"],dtype=np.float64);v_distance=np.asarray(precomputed["v_distance"],dtype=np.float64)
+        f_contact=np.asarray(precomputed.get("f_contact"),dtype=np.float64) if precomputed.get("f_contact") is not None else None;f_normal=np.asarray(precomputed.get("f_normal"),dtype=np.float64) if precomputed.get("f_normal") is not None else None;f_distance=np.asarray(precomputed.get("f_distance"),dtype=np.float64) if precomputed.get("f_distance") is not None else None
+    initial=V.copy();round_reports=[];hemisphere_flips=0;patch_fallbacks=0
+
+    def patchwise_accept(before: np.ndarray, proposed: np.ndarray, source: np.ndarray, active_seed: np.ndarray):
+        nonlocal patch_fallbacks
+        mask=np.asarray(active_seed,dtype=bool).copy()
+        # Four topology rings provide a feather boundary around the collision core.
+        for _ in range(4):
+            grown=mask.copy();hit=mask[ea]|mask[eb];grown[ea[hit]]=True;grown[eb[hit]]=True;mask=grown
+        comps=_masked_vertex_components(F,mask);out=before.copy();accepted_any=False
+        for core in comps:
+            if len(core)<1:continue
+            face_mask=np.any(np.isin(F,core),axis=1);fids=np.flatnonzero(face_mask)
+            if not len(fids):continue
+            patch=np.unique(F[fids].reshape(-1));lookup=np.full(len(before),-1,dtype=np.int64);lookup[patch]=np.arange(len(patch),dtype=np.int64);LF=lookup[F[fids]]
+            local_before=out[patch].copy();local_prop=local_before.copy();core_set=np.zeros(len(before),dtype=bool);core_set[core]=True;moving=patch[core_set[patch]]
+            if not len(moving):continue
+            li=lookup[moving];local_prop[li]=proposed[moving]
+            safe,alpha,_,_=_coupled_topology_safe_alpha(source[patch],local_before,local_prop,LF)
+            if alpha>0.0 and np.max(np.linalg.norm(safe-local_before,axis=1),initial=0.0)>1e-8:out[patch]=safe;accepted_any=True
+        if accepted_any:patch_fallbacks+=1
+        return out,accepted_any
+
+    max_rounds=5 if enforce_support else 7
+    for round_index in range(max_rounds):
+        contact=v_contact;normal=v_normal.copy();source_distance=v_distance
+        if enforce_support:
+            source_floor=np.clip(source_distance,float(margin),.030);projection=np.einsum("ij,ij->i",V-contact,normal);seed=np.maximum(source_floor-projection,0.0);seed[source_distance>.035]=0.0
+        else:
+            seed=np.zeros(len(V),dtype=np.float64)
+        face_bad=0
+        if enforce_support and f_contact is not None:
+            floor=np.clip(f_distance,float(margin),.030);proj=np.einsum("ij,ij->i",V[F].mean(axis=1)-f_contact,f_normal);deficit=np.maximum(floor-proj,0.0);active=deficit>.00003;face_bad=int(np.count_nonzero(active))
+            if np.any(active):
+                rows=np.flatnonzero(active);contrib=deficit[rows]
+                for corner in range(3):np.maximum.at(seed,F[rows,corner],contrib)
+        # Literal target geometry is absolute occupancy authority: never replace a genuine nearest-body
+        # collision with a farther support-consistent triangle.  The smooth source-corresponding support
+        # still controls the cloth displacement field; literal normals are used only to disambiguate the
+        # outward hemisphere for deep wrong-side contacts, so local anatomy cannot emboss the garment.
+        samples=np.vstack((V,V[F].mean(axis=1)));_,literal_normals,signed,_,_=_nearest_literal_occupancy(samples,literal,k=48,exact_band=float(margin)+.0020);need=np.maximum(float(margin)-signed,0.0);vb=need[:len(V)];seed=np.maximum(seed,vb);fb=need[len(V):];rows=np.flatnonzero(fb>.00003)
+        if len(rows):
+            for corner in range(3):np.maximum.at(seed,F[rows,corner],fb[rows])
+        # Deep literal penetration may reveal that source correspondence selected the opposite side of a close body fold.
+        literal_vn=literal_normals[:len(V)];agreement=np.einsum("ij,ij->i",normal,literal_vn);wrong=(signed[:len(V)]<-.0010)&(agreement<-.10)
+        if np.any(wrong):normal[wrong]*=-1.0;hemisphere_flips+=int(np.count_nonzero(wrong))
+        # On the final literal-only polish, a narrow/rigid authored piece moves as one object.  Literal
+        # normals may therefore choose its translation direction without embossing their local shape.
+        if rigid and not enforce_support:
+            lit_use=(need[:len(V)]>.00003)
+            if np.any(lit_use):normal[lit_use]=literal_vn[lit_use]
+        max_seed=float(np.max(seed,initial=0.0))
+        if max_seed<=.00003:break
+        before=V.copy();active_seed=seed>.00003
+        if rigid:
+            active=active_seed;direction=np.sum(normal[active]*seed[active,None],axis=0) if np.any(active) else np.zeros(3);dn=float(np.linalg.norm(direction))
+            if dn<1e-12:break
+            direction/=dn;proj=np.einsum("ij,j->i",normal[active],direction);good=proj>.12
+            if not np.any(good):break
+            step=float(min(.0040,np.max(seed[active][good]/np.maximum(proj[good],.12))+.00005));proposed=V+direction*step
+        else:
+            if not enforce_support:
+                # Final literal-only collision patches diffuse the *vector* displacement rather than a
+                # scalar magnitude multiplied by every local body normal.  This bridges folds over a
+                # coherent cloth patch and avoids reprinting crotch/under-glute/nipple-scale relief.
+                anchor=normal*seed[:,None];field_vec=anchor.copy();active_anchor=seed>.00003
+                for _ in range(8):
+                    sums=np.zeros_like(field_vec);np.add.at(sums,ea,field_vec[eb]);np.add.at(sums,eb,field_vec[ea]);avg=sums/np.maximum(deg[:,None],1.0)
+                    field_vec=np.where(active_anchor[:,None],.78*anchor+.22*avg,.78*avg)
+                proj=np.einsum("ij,ij->i",field_vec,normal);low=active_anchor&(proj<seed*.55)
+                if np.any(low):field_vec[low]+=normal[low]*(seed[low]*.55-proj[low])[:,None]
+                mag=np.linalg.norm(field_vec,axis=1);field_vec*=np.minimum(1.0,.0022/np.maximum(mag,1e-12))[:,None];proposed=V+field_vec
+            else:
+                field=seed.copy()
+                for _ in range(6):
+                    nbr=np.zeros(len(V),dtype=np.float64);np.maximum.at(nbr,ea,field[eb]);np.maximum.at(nbr,eb,field[ea]);field=np.maximum(field,.76*nbr)
+                for _ in range(3):
+                    sums=np.zeros(len(V),dtype=np.float64);np.add.at(sums,ea,field[eb]);np.add.at(sums,eb,field[ea]);avg=sums/np.maximum(deg,1.0);field=np.maximum(seed,.68*field+.32*avg)
+                field=np.minimum(field,.0035);proposed=V+normal*field[:,None]
+        accepted,alpha,topology,edge_metric=_coupled_topology_safe_alpha(S,V,proposed,F)
+        if alpha<=0.0 and not rigid:
+            accepted,ok=patchwise_accept(V,proposed,S,active_seed)
+            if ok:
+                alpha=-1.0;topology=_source_relative_topology_summary(S,accepted,F);edge_metric=_coupled_edge_metric(S,accepted,F)
+        V=accepted;moved=np.linalg.norm(V-before,axis=1);round_reports.append({"round":round_index+1,"rigid":bool(rigid),"max_seed_mm":max_seed*1000.0,"face_deficits":face_bad,"accepted_alpha":float(alpha),"moved_vertices":int(np.count_nonzero(moved>1e-7)),"move_p95_mm":float(np.percentile(moved,95)*1000.0),"topology":topology,"edge":edge_metric})
+        if alpha==0.0 or float(np.max(moved,initial=0.0))<1e-7:break
+    total=np.linalg.norm(V-initial,axis=1);return V,{"adjusted":bool(np.any(total>1e-7)),"rounds":len(round_reports),"move_p95_mm":float(np.percentile(total,95)*1000.0),"move_max_mm":float(np.max(total,initial=0.0)*1000.0),"hemisphere_flips":int(hemisphere_flips),"patch_fallbacks":int(patch_fallbacks),"round_reports":round_reports,"policy":"precomputed source-corresponding support clearance + broad topology-coherent literal/auxiliary collision patches; literal geometry only disambiguates occupancy/outward hemisphere","support_authority":bool(enforce_support)}
+
+def _coupled_target_clearance_guard(positions: dict[str,np.ndarray], contexts: dict[str,dict[str,Any]], cache: dict[str,Any], margin: float=.00065, enforce_support: bool=True):
+    """Late coupled clearance with one batched occupancy/support gate per mesh.
+
+    The expensive component solver runs only for components that demonstrably violate either the
+    source-corresponding support field (first pass) or the literal target body (all passes).  Later
+    convergence passes intentionally use literal occupancy only so they cannot re-imprint local target
+    relief or fight the already-established source-relative garment shape.
+    """
+    out={k:np.asarray(v,dtype=np.float64).copy() for k,v in positions.items()};changed=set();rows=[];env=_build_auxiliary_envelope_support(cache);envV=np.asarray(env["V"],dtype=np.float64)
+    literal=cache.get("_ravafit_target_collision_triangles")
+    if literal is None:
+        suppression=cache.get("_ravafit_source_body_suppression") or {};literal=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
+    literal=np.asarray(literal,dtype=np.float64)
+    for name in sorted(out):
+        context=contexts[name];S=np.asarray(context["data"]["V"],dtype=np.float64);F=np.asarray(context["data"]["F"],dtype=np.int64);current=out[name];components=_masked_vertex_components(F,np.ones(len(S),dtype=bool));component_reports=[]
+        pre_key=(id(cache),len(S),len(F),int(np.asarray(F,dtype=np.int64).sum(dtype=np.int64)))
+        pre=context.get("_ravafit_coupled_clearance_precomputed")
+        if not isinstance(pre,dict) or pre.get("key")!=pre_key:
+            vf=_coupled_support_frame(S,cache,envV);ff=_coupled_support_frame(S[F].mean(axis=1),cache,envV)
+            if vf is None:
+                rows.append({"mesh":name,"components":[],"reason":"support frame unavailable"});continue
+            vc,vn,vd,_=vf
+            if ff is None:fc=fn=fd=None
+            else:fc,fn,fd,_=ff
+            comp_label=np.full(len(S),-1,dtype=np.int64)
+            for ci,ids in enumerate(components):comp_label[np.asarray(ids,dtype=np.int64)]=ci
+            face_component=comp_label[F[:,0]]
+            pre={"key":pre_key,"vc":vc,"vn":vn,"vd":vd,"fc":fc,"fn":fn,"fd":fd,"face_component":face_component}
+            context["_ravafit_coupled_clearance_precomputed"]=pre
+        else:
+            vc=np.asarray(pre["vc"],dtype=np.float64);vn=np.asarray(pre["vn"],dtype=np.float64);vd=np.asarray(pre["vd"],dtype=np.float64);fc=pre.get("fc");fn=pre.get("fn");fd=pre.get("fd");face_component=np.asarray(pre["face_component"],dtype=np.int64)
+
+        face_centres=current[F].mean(axis=1) if len(F) else np.empty((0,3),dtype=np.float64)
+        samples=np.vstack((current,face_centres));_,_,literal_signed,_,_=_nearest_literal_occupancy(samples,literal,k=48,exact_band=float(margin)+.0020)
+        literal_v_bad=literal_signed[:len(current)] < float(margin)-.00003
+        literal_f_bad=literal_signed[len(current):] < float(margin)-.00003 if len(F) else np.zeros(0,dtype=bool)
+
+        # Build direct component maps once.  Source-relative support is a cloth-shaping authority, not a
+        # reason to repeatedly process hundreds of tiny buckles/rings/details.  Only substantial or
+        # demonstrably sheet-like components participate in support convergence; literal occupancy still
+        # applies to every component regardless of size.
+        vertex_component=np.full(len(S),-1,dtype=np.int64);support_eligible=np.zeros(len(components),dtype=bool)
+        for ci,ids in enumerate(components):
+            ids=np.asarray(ids,dtype=np.int64);vertex_component[ids]=ci;LF=_component_local_faces(F,ids,len(S))
+            if len(LF):
+                feature=_structural_component_features(S[ids],LF);support_eligible[ci]=(len(ids)>=96 or feature["max_extent"]>=.055) and not (len(ids)<=48 and feature["max_extent"]<.040)
+        support_v_bad=np.zeros(len(current),dtype=bool);support_f_bad=np.zeros(len(F),dtype=bool)
+        if enforce_support:
+            source_floor=np.clip(vd,float(margin),.030);projection=np.einsum("ij,ij->i",current-vc,vn);support_v_bad=(vd<=.035)&((source_floor-projection)>.00003)
+            support_v_bad &= support_eligible[np.maximum(vertex_component,0)]
+            if fc is not None and len(F):
+                floor=np.clip(np.asarray(fd,dtype=np.float64),float(margin),.030);proj=np.einsum("ij,ij->i",face_centres-np.asarray(fc,dtype=np.float64),np.asarray(fn,dtype=np.float64));support_f_bad=(floor-proj)>.00003
+                support_f_bad &= support_eligible[np.maximum(np.asarray(pre["face_component"],dtype=np.int64),0)]
+        active_v=literal_v_bad|support_v_bad;active_f=literal_f_bad|support_f_bad
+        active_components=set(int(x) for x in np.unique(np.concatenate((vertex_component[active_v],np.asarray(pre["face_component"],dtype=np.int64)[active_f]))) if int(x)>=0)
+
+        skipped=0
+        for ci,ids in enumerate(components):
+            ids=np.asarray(ids,dtype=np.int64);fids=np.flatnonzero(face_component==ci);LF=_component_local_faces(F,ids,len(S))
+            if len(LF)==0:continue
+            if ci not in active_components:
+                skipped+=1;continue
+            local_pre={"v_contact":vc[ids],"v_normal":vn[ids],"v_distance":vd[ids]}
+            if fc is not None:local_pre.update({"f_contact":fc[fids],"f_normal":fn[fids],"f_distance":fd[fids]})
+            candidate,rep=_coupled_component_clearance(S[ids],current[ids],LF,cache,env,margin,precomputed=local_pre,enforce_support=enforce_support);current[ids]=candidate
+            if rep.get("adjusted"):changed.add(name)
+            component_reports.append({"component":int(ci),"vertices":int(len(ids)),**rep})
+        out[name]=current;rows.append({"mesh":name,"components":component_reports,"active_components":int(len(active_components)),"skipped_components":int(skipped),"literal_bad_samples":int(np.count_nonzero(literal_v_bad)+np.count_nonzero(literal_f_bad)),"support_bad_samples":int(np.count_nonzero(support_v_bad)+np.count_nonzero(support_f_bad))})
+    return out,changed,{"enabled":True,"adjusted_mesh_count":len(changed),"meshes":rows,"auxiliary_envelope":env["report"],"support_authority":bool(enforce_support),"policy":"single batched literal occupancy gate + component-local broad collision patches; support frame is enforced only on the first convergence pass, while later passes preserve the fitted shape and enforce literal occupancy only"}
+
+def _coupled_validation_summary(positions: dict[str,np.ndarray], contexts: dict[str,dict[str,Any]], cache: dict[str,Any]):
+    env=_build_auxiliary_envelope_support(cache);env_tri=np.asarray(env["V"],dtype=np.float64)[np.asarray(env["F"],dtype=np.int64)];rows=[];worst_edge=1.0;worst_edge_max=1.0;worst_edge_min=1.0;worst_flip=0.0;worst_env=999.0
+    for name in sorted(positions):
+        S=np.asarray(contexts[name]["data"]["V"],dtype=np.float64);F=np.asarray(contexts[name]["data"]["F"],dtype=np.int64);V=np.asarray(positions[name],dtype=np.float64);top=_source_relative_topology_summary(S,V,F);edge=_coupled_edge_metric(S,V,F);samples=np.vstack((V,V[F].mean(axis=1)));_,_,signed,_,_=_nearest_literal_occupancy(samples,env_tri,k=48,exact_band=.0030);p01=float(np.percentile(signed,1)*1000.0);rows.append({"mesh":name,"topology":top,"edge":edge,"envelope_signed_p01_mm":p01,"envelope_signed_min_mm":float(np.min(signed)*1000.0)});worst_edge=max(worst_edge,edge["p999"]);worst_edge_max=max(worst_edge_max,edge["max"]);worst_edge_min=min(worst_edge_min,edge["min"]);worst_flip=max(worst_flip,top["flip_fraction"]);worst_env=min(worst_env,p01)
+    return {"meshes":rows,"worst_edge_p999":float(worst_edge),"worst_edge_max":float(worst_edge_max),"worst_edge_min":float(worst_edge_min),"worst_flip_fraction":float(worst_flip),"worst_envelope_p01_mm":float(worst_env),"auxiliary":cache.get("_ravafit_target_auxiliary_report",{})}
+
+
+def _finalize_modded_coupled_solution(source: Any, cache: dict[str,Any], positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], records: dict[str,Any], contexts: dict[str,dict[str,Any]], local_affine_quality_rms_mm: float):
+    """B14 macro transfer followed by bounded local-structure/layer/collision convergence."""
+    candidate,skinning,records,struct_stats=_finalize_modded_structural_solution(source,cache,positions,skinning,records,contexts,local_affine_quality_rms_mm)
+    source_tri=cache.get("_ravafit_source_support_triangles")
+    if source_tri is None:source_tri=_triangles_from_surface(cache["source_support_V"],cache["source_support_F"]);cache["_ravafit_source_support_triangles"]=source_tri
+    target_tri=cache.get("_ravafit_target_support_triangles")
+    if target_tri is None:target_tri=_triangles_from_surface(cache["target_support_V"],cache["target_support_F"]);cache["_ravafit_target_support_triangles"]=target_tri
+    meshes={name:{"V":np.asarray(contexts[name]["data"]["V"],dtype=np.float64),"F":np.asarray(contexts[name]["data"]["F"],dtype=np.int64)} for name in candidate}
+    local_relations=_infer_local_authored_layer_relations(meshes,source_tri)
+
+    candidate,layered,layer_stage1=_preserve_authored_garment_layers(meshes,candidate,source_tri,target_tri)
+    candidate,local_layered,local_layer_stage1=_preserve_local_authored_garment_layers(meshes,candidate,source_tri,target_tri,relations=local_relations,pass_count=2,quick_verify=False)
+    pairs={frozenset((str(r.get("inner")),str(r.get("outer")))) for r in layer_stage1.get("relations",[]) if r.get("inner") and r.get("outer")};pairs|={frozenset((str(a),str(b))) for a,b in local_layer_stage1.get("cross_mesh_pairs",[]) if a and b}
+    candidate,cross,cross_stage1=_preserve_authored_cross_mesh_assembly(meshes,candidate,pairs)
+    candidate,seams,seam_stage1=_preserve_authored_weld_splits(candidate,contexts)
+    candidate,long_meshes,long_stage=_long_panel_authored_shape_guard(candidate,contexts,cache);candidate,narrow,narrow_stage=_narrow_authored_strip_shape_guard(candidate,contexts,cache);candidate,ribbons,ribbon_stage=_preserve_authored_ribbon_components(candidate,contexts)
+
+    candidate,clear1,clear_stage1=_coupled_target_clearance_guard(candidate,contexts,cache,margin=.00065,enforce_support=True)
+    candidate,seams2,seam_stage2=_preserve_authored_weld_splits(candidate,contexts)
+    candidate,layered2,layer_stage2=_preserve_authored_garment_layers(meshes,candidate,source_tri,target_tri)
+    # Only relations actually disturbed by clearance are expensive enough to revisit.
+    candidate,local_layered2,local_layer_stage2=_preserve_local_authored_garment_layers(meshes,candidate,source_tri,target_tri,relations=local_relations,pass_count=1,quick_verify=True)
+    pairs2={frozenset((str(r.get("inner")),str(r.get("outer")))) for r in layer_stage2.get("relations",[]) if r.get("inner") and r.get("outer")};pairs2|={frozenset((str(a),str(b))) for a,b in local_layer_stage2.get("cross_mesh_pairs",[]) if a and b}
+    candidate,cross2,cross_stage2=_preserve_authored_cross_mesh_assembly(meshes,candidate,pairs2)
+    candidate,clear2,clear_stage2=_coupled_target_clearance_guard(candidate,contexts,cache,margin=.00065,enforce_support=False)
+    candidate,seams3,seam_stage3=_preserve_authored_weld_splits(candidate,contexts)
+    # Seam reconciliation is no longer allowed to be the last geometry mutation.  Literal target clearance wins final authority.
+    candidate,clear3,clear_stage3=_coupled_target_clearance_guard(candidate,contexts,cache,margin=.00070,enforce_support=False)
+    # Last-resort contact polish uses a tiny positive margin.  This lets topology-safe incremental patches
+    # and rigid authored strips clear sparse residual contacts without re-sculpting the established fit.
+    candidate,clear4,clear_stage4=_coupled_target_clearance_guard(candidate,contexts,cache,margin=.00012,enforce_support=False)
+    candidate,unilateral_pair_stage=_preserve_final_unilateral_pair_separation(source,candidate)
+
+    for name in sorted(candidate):
+        context=contexts[name];data=context["data"];w=context["w"];retargeted,stage=_retarget_garment_skinning(candidate[name],data["V"],data["W"],data["joint_names"],cache,context["behavior"],context["effective_behavior"],context["labels"],context["classes"],w["raw_to_weld"]);_assert_finite_stage(name,"coupled final skinning retarget",retargeted);skinning[name]={"weights":retargeted,"joint_names":list(data["joint_names"]),"stage":stage};records.setdefault(name,{})["skinning"]=stage;records[name]["coupled_core_finalizer_applied"]=True
+        if name in (set(layered)|set(local_layered)|set(layered2)|set(local_layered2)):records[name]["layer_order_preserved"]=True
+        if name in (set(cross)|set(cross2)):records[name]["authored_cross_mesh_assembly_preserved"]=True
+        if name in (set(seams)|set(seams2)|set(seams3)):records[name]["authored_split_seams_preserved"]=True
+
+    validation=_coupled_validation_summary(candidate,contexts,cache);proxy=_garment_support_proxy(cache)
+    struct_stats.update({
+        "authored_layer_relations":int(layer_stage2.get("relation_count",0)),"authored_layer_adjusted_meshes":int(layer_stage2.get("adjusted_mesh_count",0)),"authored_layer_report":{"first":layer_stage1,"final":layer_stage2},
+        "local_authored_layer_relations":int(local_layer_stage2.get("relation_count",0)),"local_authored_layer_adjusted_meshes":int(local_layer_stage2.get("adjusted_mesh_count",0)),"local_authored_layer_report":{"first":local_layer_stage1,"final":local_layer_stage2},
+        "authored_cross_mesh_relations":int(cross_stage2.get("relation_count",0)),"authored_cross_mesh_adjusted_meshes":int(cross_stage2.get("adjusted_mesh_count",0)),"authored_cross_mesh_report":{"first":cross_stage1,"final":cross_stage2},
+        "authored_split_seams":{"first":seam_stage1,"middle":seam_stage2,"final":seam_stage3},"authored_long_panel_shape_guard":long_stage,"authored_narrow_strip_shape_guard":narrow_stage,"authored_ribbon_topology":ribbon_stage,
+        "coupled_target_clearance":{"first":clear_stage1,"second":clear_stage2,"final_after_seams":clear_stage3,"residual_contact_polish":clear_stage4},"final_unilateral_pair_separation":unilateral_pair_stage,"coupled_validation":validation,"target_body_auxiliary_obstacles":cache.get("_ravafit_target_auxiliary_report",{}),"garment_support_proxy":proxy.get("report",{}),
+        "core_policy":"B14 macro fit -> source-relative differential shape -> whole/local authored layers -> component/topology-safe seams -> broad body+aux clearance -> verified layer reconciliation -> final literal clearance -> source-proven unilateral-pair separation"})
+    return candidate,skinning,records,struct_stats
+
 def _finalize_garment_solution(source: Any, cache: dict[str, Any], positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], records: dict[str,Any], local_affine_quality_rms_mm: float, _assembly_in_process: bool = False):
     """Run the shared authored-assembly/final-clearance lane after independent mesh solves."""
     if not positions:
         raise ValueError("No garment meshes were eligible for B14 fitting after removing the source body.")
     dense_vanilla_proxy=bool(cache.get("dense_vanilla_source_proxy",False))
-    source_tri=cache.get("_ravafit_source_support_triangles")
-    if source_tri is None:
-        source_tri=_triangles_from_surface(cache["source_support_V"],cache["source_support_F"]);cache["_ravafit_source_support_triangles"]=source_tri
-    target_tri=cache.get("_ravafit_target_support_triangles")
-    if target_tri is None:
-        target_tri=_triangles_from_surface(cache["target_support_V"],cache["target_support_F"]);cache["_ravafit_target_support_triangles"]=target_tri
+    strict_b14_contract=bool(cache.get("_ravafit_strict_b14_contract",False))
+    if strict_b14_contract:
+        source_tri=cache.get("_ravafit_strict_source_surface_triangles")
+        if source_tri is None:
+            source_tri=_triangles_from_surface(cache.get('_ravafit_strict_source_surface_V',cache['source_surface_V']),cache.get('_ravafit_strict_source_surface_F',cache['source_surface_F']));cache["_ravafit_strict_source_surface_triangles"]=source_tri
+        target_tri=cache.get("_ravafit_strict_target_surface_triangles")
+        if target_tri is None:
+            target_tri=_triangles_from_surface(cache.get('_ravafit_strict_target_surface_V',cache['target_surface_V']),cache.get('_ravafit_strict_target_surface_F',cache['target_surface_F']));cache["_ravafit_strict_target_surface_triangles"]=target_tri
+    else:
+        source_tri=cache.get("_ravafit_source_support_triangles")
+        if source_tri is None:
+            source_tri=_triangles_from_surface(cache["source_support_V"],cache["source_support_F"]);cache["_ravafit_source_support_triangles"]=source_tri
+        target_tri=cache.get("_ravafit_target_support_triangles")
+        if target_tri is None:
+            target_tri=_triangles_from_surface(cache["target_support_V"],cache["target_support_F"]);cache["_ravafit_target_support_triangles"]=target_tri
 
     layer_meshes: dict[str,dict[str,Any]]={}
     retarget_contexts: dict[str,dict[str,Any]]={}
@@ -3196,6 +4238,9 @@ def _finalize_garment_solution(source: Any, cache: dict[str, Any], positions: di
         effective_behavior=str(record.get("behavior") or behavior)
         layer_meshes[name]={"V":np.asarray(data["V"],dtype=np.float64),"F":np.asarray(data["F"],dtype=np.int64)}
         retarget_contexts[name]={"data":data,"w":w,"behavior":behavior,"effective_behavior":effective_behavior,"features":features,"labels":labels,"classes":classes}
+
+    if not dense_vanilla_proxy:
+        return _finalize_modded_coupled_solution(source,cache,positions,skinning,records,retarget_contexts,local_affine_quality_rms_mm)
 
     if _assembly_in_process:
         def _assembly_local():
@@ -3271,6 +4316,1410 @@ def _finalize_garment_solution(source: Any, cache: dict[str, Any], positions: di
         "source_body_suppression":_public_source_body_suppression(cache.get("_ravafit_source_body_suppression")),
     }
 
+
+@dataclass(frozen=True)
+class GarmentLayerMember:
+    mesh_name: str
+    component_index: int
+    vertex_ids: tuple[int, ...]
+    face_ids: tuple[int, ...]
+    material: str
+    structural_classification: str
+    source_clearance_median_mm: float
+    source_clearance_p95_mm: float
+    source_signed_clearance_median_mm: float
+
+    @property
+    def stable_component_id(self) -> str:
+        return f"{self.mesh_name}::component-{self.component_index}"
+
+
+@dataclass(frozen=True)
+class GarmentLayer:
+    """Geometry-inferred authored garment layer used only to orchestrate strict B14.
+
+    The representation is deliberately garment-name agnostic.  Faces are stored in layer-local
+    vertex indexing; members retain the exact source mesh/component identities so disconnected,
+    bilateral, decorative and peer structures never lose their authored identity.
+    """
+    stable_id: str
+    members: tuple[GarmentLayerMember, ...]
+    faces: np.ndarray
+    materials: tuple[str, ...]
+    source_clearance_median_mm: float
+    source_clearance_p95_mm: float
+    connected_components: tuple[str, ...]
+    structural_classification: str
+    source_signed_clearance_median_mm: float = 0.0
+    source_ordering_relationships: tuple[str, ...] = ()
+
+    @property
+    def source_meshes(self) -> tuple[str, ...]:
+        return tuple(sorted({member.mesh_name for member in self.members}))
+
+
+@dataclass(frozen=True)
+class B14LayerResult:
+    """Immutable geometry returned by the untouched strict B14 worker for one authored layer."""
+    stable_id: str
+    positions: np.ndarray
+    behavior: str
+    source_clearance_median_mm: float
+    source_clearance_p95_mm: float
+    solve_time_sec: float
+    stage: dict[str, Any]
+
+
+def _readonly_array(value: np.ndarray, dtype=np.float64) -> np.ndarray:
+    out=np.asarray(value,dtype=dtype).copy()
+    out.setflags(write=False)
+    return out
+
+
+def _component_classification(vertices: np.ndarray, faces: np.ndarray) -> str:
+    feature=_structural_component_features(vertices,faces)
+    n=int(len(vertices));extent=float(feature.get("max_extent",0.0));middle=float(feature.get("middle_ratio",0.0));thin=float(feature.get("thin_ratio",0.0));boundary=float(feature.get("boundary_fraction",0.0))
+    # Physical scale and shape outrank tessellation density. XIV accessories can contain hundreds of
+    # seam/normal-split vertices in a centimetre-scale buckle or charm; vertex count must not turn
+    # those into cloth shells.
+    if extent<=.018 or (n<96 and extent<.045):
+        return "rigid_detail"
+    # Narrow open strips such as bands/straps keep their own authority. They are deformable by the
+    # body correspondence but must not enter a broad shell optimiser merely because they are dense.
+    if extent<=.055 and thin<=.08 and middle<=.38 and boundary>=.18:
+        return "ribbon_or_strap"
+    if extent>.045 and (thin<.10 or middle<.26) and boundary>.08:
+        return "ribbon_or_strap"
+    if boundary>.10:
+        return "open_shell"
+    return "shell"
+
+
+def _component_clearance_stats(vertices: np.ndarray, source_body_triangles: np.ndarray) -> tuple[float,float,float]:
+    P=np.asarray(vertices,dtype=np.float64)
+    if not len(P):
+        return 0.0,0.0,0.0
+    _,_,signed,distance,_=_b14_nearest_surface(P,source_body_triangles,k=32)
+    distance=np.asarray(distance,dtype=np.float64);signed=np.asarray(signed,dtype=np.float64)
+    return float(np.median(distance)*1000.0),float(np.percentile(distance,95)*1000.0),float(np.median(signed)*1000.0)
+
+
+def _discover_garment_components(source: Any, body_mesh_names: set[str], mesh_filter: set[str] | None, source_body_triangles: np.ndarray) -> list[dict[str,Any]]:
+    """Discover authored connected structures on welded/rendered topology.
+
+    XIV MDLs commonly duplicate coincident vertices at UV/material/smoothing seams.  Raw-index
+    connectivity therefore fragments one authored panel into many apparent components.  Component
+    identity is discovered on ``weld_mesh`` topology, then expanded back to the exact raw vertex and
+    face storage so the production solve still preserves authored seams and untouched dead vertices.
+    """
+    components=[]
+    for mesh_name in source.mesh_names():
+        if not mesh_name or mesh_name in body_mesh_names or (mesh_filter is not None and mesh_name not in mesh_filter):
+            continue
+        try:
+            data=source.data(mesh_name)
+        except Exception:
+            continue
+        V=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64)
+        if not len(V) or not len(F):
+            continue
+        welded=weld_mesh(data)
+        WV=np.asarray(welded.get("V",[]),dtype=np.float64);WF=np.asarray(welded.get("F",[]),dtype=np.int64);raw_to_weld=np.asarray(welded.get("raw_to_weld",[]),dtype=np.int64)
+        if not len(WV) or not len(WF) or raw_to_weld.shape!=(len(V),):
+            raise ValueError(f"{mesh_name} could not expose stable welded topology for layer discovery.")
+        welded_groups=_masked_vertex_components(WF,np.ones(len(WV),dtype=bool))
+        sortable=[]
+        for welded_ids in welded_groups:
+            welded_ids=np.asarray(welded_ids,dtype=np.int64)
+            if not len(welded_ids):continue
+            weld_mask=np.zeros(len(WV),dtype=bool);weld_mask[welded_ids]=True
+            raw_ids=np.flatnonzero(weld_mask[raw_to_weld]).astype(np.int64)
+            if not len(raw_ids):continue
+            raw_membership=np.zeros(len(V),dtype=bool);raw_membership[raw_ids]=True
+            face_ids=np.flatnonzero(np.all(raw_membership[F],axis=1)).astype(np.int64)
+            if not len(face_ids):continue
+            raw_local_faces=_component_local_faces(F,raw_ids,len(V))
+            welded_membership=np.zeros(len(WV),dtype=bool);welded_membership[welded_ids]=True
+            welded_face_ids=np.flatnonzero(np.all(welded_membership[WF],axis=1))
+            welded_local_faces=_component_local_faces(WF,welded_ids,len(WV)) if len(welded_face_ids) else np.zeros((0,3),dtype=np.int64)
+            raw_P=V[raw_ids];structural_P=WV[welded_ids]
+            median,p95,signed_median=_component_clearance_stats(structural_P,source_body_triangles)
+            classification=_component_classification(structural_P,welded_local_faces)
+            sortable.append((int(np.min(raw_ids)),{
+                "mesh_name":str(mesh_name),
+                "component_index":0,
+                "vertex_ids":raw_ids,
+                "face_ids":face_ids,
+                "V":raw_P,
+                "F":raw_local_faces,
+                "material":_normalise_material(data.get("material")),
+                "classification":classification,
+                "clearance_median_mm":median,
+                "clearance_p95_mm":p95,
+                "signed_clearance_median_mm":signed_median,
+                "centroid":np.mean(structural_P,axis=0),
+                "extent":np.ptp(structural_P,axis=0),
+                "vertex_count":int(len(raw_P)),
+                "rendered_vertex_count":int(len(structural_P)),
+                "raw_seam_duplicate_count":int(len(raw_P)-len(structural_P)),
+            }))
+        for component_index,(_,row) in enumerate(sorted(sortable,key=lambda item:item[0])):
+            row["component_index"]=int(component_index);components.append(row)
+    return components
+
+
+def _component_distance_sample(component: dict[str,Any]) -> tuple[np.ndarray,cKDTree]:
+    cached=component.get("_distance_sample")
+    if cached is not None:return cached
+    V=np.asarray(component["V"],dtype=np.float64)
+    if len(V)>256:V=V[np.unique(np.linspace(0,len(V)-1,256,dtype=np.int64))]
+    cached=(V,cKDTree(V) if len(V) else None);component["_distance_sample"]=cached
+    return cached
+
+def _sample_min_component_distance(a: dict[str,Any], b: dict[str,Any]) -> float:
+    av,at=_component_distance_sample(a);bv,bt=_component_distance_sample(b)
+    if not len(av) or not len(bv):return float("inf")
+    return float(min(np.min(bt.query(av,k=1)[0]),np.min(at.query(bv,k=1)[0])))
+
+
+def _components_are_nested_layers(a: dict[str,Any], b: dict[str,Any], source_body_triangles: np.ndarray) -> bool:
+    # Small rigid decorations are assembly members, not competing garment shells.  Skipping the
+    # expensive directional shell test here also keeps dense ornament packs linear enough to run.
+    if a.get("classification")=="rigid_detail" or b.get("classification")=="rigid_detail":return False
+    av=np.asarray(a["V"],dtype=np.float64);bv=np.asarray(b["V"],dtype=np.float64)
+    if not _expanded_aabb_overlap(av,bv,.010):
+        return False
+    at=av[np.asarray(a["F"],dtype=np.int64)];bt=bv[np.asarray(b["F"],dtype=np.int64)]
+    ae=_local_layer_directional_evidence(av,bt,source_body_triangles,close_distance=.010)
+    be=_local_layer_directional_evidence(bv,at,source_body_triangles,close_distance=.010)
+    if ae is not None and be is not None:
+        opposing=(ae["positive_fraction"]>=.72 and be["negative_fraction"]>=.72) or (be["positive_fraction"]>=.72 and ae["negative_fraction"]>=.72)
+        radial=max(abs(float(ae["median"])),abs(float(be["median"])))
+        if opposing and radial>=.00018:
+            return True
+    clearance_delta=abs(float(a["clearance_median_mm"])-float(b["clearance_median_mm"]))
+    return clearance_delta>=1.10 and _sample_min_component_distance(a,b)<=.010
+
+
+def _mirrored_component_peers(a: dict[str,Any], b: dict[str,Any]) -> bool:
+    ca=np.asarray(a["centroid"],dtype=np.float64);cb=np.asarray(b["centroid"],dtype=np.float64)
+    if ca[0]*cb[0]>=0.0 or min(abs(ca[0]),abs(cb[0]))<.004:
+        return False
+    ea=np.asarray(a["extent"],dtype=np.float64);eb=np.asarray(b["extent"],dtype=np.float64)
+    scale=max(float(np.linalg.norm(ea)),float(np.linalg.norm(eb)),1e-6)
+    lateral=abs(abs(float(ca[0]))-abs(float(cb[0])))
+    non_lateral=float(np.linalg.norm(ca[1:]-cb[1:]))
+    extent_error=float(np.linalg.norm(ea-eb))/scale
+    count_ratio=min(a["vertex_count"],b["vertex_count"])/max(a["vertex_count"],b["vertex_count"],1)
+    return lateral<=max(.010,.18*scale) and non_lateral<=max(.025,.32*scale) and extent_error<=.38 and count_ratio>=.45
+
+
+def _component_layer_affinity(a: dict[str,Any], b: dict[str,Any], source_body_triangles: np.ndarray) -> float:
+    mirrored=_mirrored_component_peers(a,b)
+    if not mirrored and _components_are_nested_layers(a,b,source_body_triangles):
+        return -100.0
+    same_material=bool(a["material"]) and a["material"]==b["material"]
+    clearance_delta=abs(float(a["clearance_median_mm"])-float(b["clearance_median_mm"]))
+    clearance_scale=max(1.25,.30*max(float(a["clearance_p95_mm"]),float(b["clearance_p95_mm"]),2.0))
+    clearance_similar=clearance_delta<=clearance_scale
+    near=_sample_min_component_distance(a,b)
+    close=near<=.0065
+    overlap=_expanded_aabb_overlap(np.asarray(a["V"]),np.asarray(b["V"]),.004)
+    same_kind=a["classification"]==b["classification"]
+    same_mesh=a["mesh_name"]==b["mesh_name"]
+    score=0.0
+    if same_material:score+=3.0
+    if clearance_similar:score+=1.75
+    if mirrored:score+=3.0
+    if close:score+=2.0
+    if overlap:score+=.75
+    if same_kind:score+=.75
+    if same_mesh:score+=.50
+    detail_attachment=(a["classification"]=="rigid_detail")^(b["classification"]=="rigid_detail")
+    if detail_attachment and same_material and near<=.009:
+        score+=2.25
+    # Two substantial disconnected structures with different materials should not fuse merely
+    # because they occupy the same body region. Mirrored peers remain a deliberate exception.
+    substantial=a["classification"]!="rigid_detail" and b["classification"]!="rigid_detail"
+    if substantial and not same_material and not mirrored:
+        score-=2.0
+    # Two substantial overlapping shells require stronger evidence than merely sharing a material.
+    if substantial and overlap and not mirrored and not close:
+        score-=1.5
+    return score
+
+
+def _layer_stable_id(members: list[dict[str,Any]]) -> str:
+    identity="|".join(sorted(f"{m['mesh_name']}:{m['component_index']}:{m['material']}" for m in members))
+    return "layer-"+hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+
+
+def _layer_local_faces_and_members(source: Any, members: list[dict[str,Any]]) -> tuple[np.ndarray,tuple[GarmentLayerMember,...]]:
+    faces=[];offset=0;public=[]
+    for comp in sorted(members,key=lambda x:(x["mesh_name"],x["component_index"])):
+        local=np.asarray(comp["F"],dtype=np.int64)
+        faces.append(local+offset)
+        public.append(GarmentLayerMember(
+            mesh_name=str(comp["mesh_name"]),
+            component_index=int(comp["component_index"]),
+            vertex_ids=tuple(int(x) for x in np.asarray(comp["vertex_ids"],dtype=np.int64)),
+            face_ids=tuple(int(x) for x in np.asarray(comp["face_ids"],dtype=np.int64)),
+            material=str(comp["material"]),
+            structural_classification=str(comp["classification"]),
+            source_clearance_median_mm=float(comp["clearance_median_mm"]),
+            source_clearance_p95_mm=float(comp["clearance_p95_mm"]),
+            source_signed_clearance_median_mm=float(comp["signed_clearance_median_mm"]),
+        ))
+        offset+=len(comp["vertex_ids"])
+    F=np.vstack(faces) if faces else np.zeros((0,3),dtype=np.int64)
+    F.setflags(write=False)
+    return F,tuple(public)
+
+
+def _infer_garment_layers(source: Any, body_mesh_names: set[str], mesh_filter: set[str] | None, source_body_triangles: np.ndarray) -> tuple[list[GarmentLayer],dict[str,dict[str,Any]]]:
+    components=_discover_garment_components(source,body_mesh_names,mesh_filter,source_body_triangles)
+    if not components:
+        return [],{}
+    parent=list(range(len(components)))
+    def find(i):
+        while parent[i]!=i:
+            parent[i]=parent[parent[i]];i=parent[i]
+        return i
+    def union(a,b):
+        ra,rb=find(a),find(b)
+        if ra==rb:
+            return
+        left=[i for i in range(len(components)) if find(i)==ra]
+        right=[i for i in range(len(components)) if find(i)==rb]
+        # Prevent a decorative/peer bridge from transitively collapsing two authored nested shells.
+        if any(_components_are_nested_layers(components[li],components[ri],source_body_triangles) and not _mirrored_component_peers(components[li],components[ri]) for li in left for ri in right):
+            return
+        parent[rb]=ra
+    # Only substantial structures participate in authored-layer union.  Disconnected rigid details
+    # deliberately remain independent deformation authorities; assembly membership is relationship
+    # metadata, never permission for a neighbouring shell to deform them.  Materials are also a hard
+    # layer boundary here: nested shirt/bra/fishnet shells may occupy the same slot but must never
+    # collapse into one solve merely because their AABBs overlap.
+    for ai,a in enumerate(components):
+        if a["classification"]=="rigid_detail":continue
+        for bi in range(ai+1,len(components)):
+            b=components[bi]
+            if b["classification"]=="rigid_detail" or a["material"]!=b["material"]:continue
+            if _component_layer_affinity(a,b,source_body_triangles)>=5.0:
+                union(ai,bi)
+    groups={}
+    for i,comp in enumerate(components):
+        groups.setdefault(find(i),[]).append(comp)
+    layers=[];component_lookup={}
+    for members in sorted(groups.values(),key=lambda g:min((m["mesh_name"],m["component_index"]) for m in g)):
+        layer_id=_layer_stable_id(members)
+        F,public_members=_layer_local_faces_and_members(source,members)
+        layer_vertices=np.vstack([np.asarray(m["V"],dtype=np.float64) for m in members])
+        layer_clearance_median,layer_clearance_p95,layer_signed_median=_component_clearance_stats(layer_vertices,source_body_triangles)
+        classifications=[m["classification"] for m in members]
+        if any(c in {"shell","open_shell"} for c in classifications):layer_class="shell"
+        elif any(c=="ribbon_or_strap" for c in classifications):layer_class="ribbon_or_strap"
+        else:layer_class="rigid_assembly"
+        layer=GarmentLayer(
+            stable_id=layer_id,
+            members=public_members,
+            faces=F,
+            materials=tuple(sorted({str(m["material"]) for m in members})),
+            source_clearance_median_mm=float(layer_clearance_median),
+            source_clearance_p95_mm=float(layer_clearance_p95),
+            connected_components=tuple(member.stable_component_id for member in public_members),
+            structural_classification=layer_class,
+            source_signed_clearance_median_mm=float(layer_signed_median),
+        )
+        layers.append(layer)
+        for m in members:
+            component_lookup[f"{m['mesh_name']}::{m['component_index']}"]=m
+    return layers,component_lookup
+
+
+def _layer_virtual_data(source: Any, layer: GarmentLayer) -> tuple[dict[str,Any],tuple[tuple[str,int],...]]:
+    union_names=[]
+    for member in layer.members:
+        for name in source.data(member.mesh_name).get("joint_names",[]):
+            if name not in union_names:union_names.append(name)
+    name_index={name:i for i,name in enumerate(union_names)}
+    verts=[];weights=[];uv=[];have_uv=True;mapping=[]
+    for member in layer.members:
+        data=source.data(member.mesh_name);ids=np.asarray(member.vertex_ids,dtype=np.int64)
+        verts.append(np.asarray(data["V"],dtype=np.float64)[ids])
+        src_w=np.asarray(data["W"],dtype=np.float64)[ids];src_names=list(data.get("joint_names",[]))
+        W=np.zeros((len(ids),len(union_names)),dtype=np.float64)
+        for col,name in enumerate(src_names):
+            if col<src_w.shape[1]:W[:,name_index[name]]+=src_w[:,col]
+        total=W.sum(axis=1,keepdims=True);good=total[:,0]>1e-12
+        if not np.all(good):raise ValueError(f"{layer.stable_id} contains vertices with no skin weights.")
+        W/=total;weights.append(W)
+        source_uv=data.get("UV")
+        if source_uv is None or len(source_uv)!=len(data["V"]):
+            have_uv=False
+        else:
+            uv.append(np.asarray(source_uv,dtype=np.float64)[ids])
+        mapping.extend((member.mesh_name,int(i)) for i in ids)
+    V=np.vstack(verts) if verts else np.zeros((0,3),dtype=np.float64)
+    W=np.vstack(weights) if weights else np.zeros((0,len(union_names)),dtype=np.float64)
+    UV=np.vstack(uv) if have_uv and uv else None
+    material="|".join(layer.materials)
+    return {"V":V,"F":np.asarray(layer.faces,dtype=np.int64),"W":W,"UV":UV,"N":None,"joint_names":union_names,"material":material,"name":layer.stable_id},tuple(mapping)
+
+
+def _surface_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    V=np.asarray(vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64);N=np.zeros_like(V)
+    if len(V)==0 or len(F)==0:return N
+    face_n=np.cross(V[F[:,1]]-V[F[:,0]],V[F[:,2]]-V[F[:,0]]);np.add.at(N,F[:,0],face_n);np.add.at(N,F[:,1],face_n);np.add.at(N,F[:,2],face_n)
+    N/=np.maximum(np.linalg.norm(N,axis=1,keepdims=True),1e-12);return N
+
+
+def _infer_thin_volume_surface(w: dict[str,Any], source_body_triangles: np.ndarray) -> dict[str,Any] | None:
+    """Recognise a source-authored thin closed volume and expose its garment-facing surface.
+
+    This is source construction discovery, not a fitting rule.  The target body is never consulted.
+    A qualifying volume must prove that almost all welded vertices have a mutual, opposite-facing
+    partner at a stable millimetre-scale thickness.  B14 then fits only the authored outside surface;
+    the full volume is reconstructed from that solved surface using source-local offsets.
+    """
+    V=np.asarray(w.get("V",[]),dtype=np.float64);F=np.asarray(w.get("F",[]),dtype=np.int64)
+    if len(V)<24 or len(F)<24:return None
+    feature=_structural_component_features(V,F)
+    if float(feature.get("boundary_fraction",1.0))>.035:return None
+    N=_surface_vertex_normals(V,F);tree=cKDTree(V);k=min(32,len(V));distance,index=tree.query(V,k=k);distance=distance if distance.ndim>1 else distance[:,None];index=index if index.ndim>1 else index[:,None]
+    partner=np.full(len(V),-1,dtype=np.int64);pair_distance=np.full(len(V),np.inf,dtype=np.float64)
+    for col in range(1,index.shape[1]):
+        candidate=index[:,col];alignment=np.einsum("ij,ij->i",N,N[candidate]);valid=(alignment<=-.55)&(distance[:,col]>=.00035)&(distance[:,col]<=.0060)&(distance[:,col]<pair_distance)
+        partner[valid]=candidate[valid];pair_distance[valid]=distance[valid,col]
+    safe_partner=np.maximum(partner,0);mutual=(partner>=0)&(partner[safe_partner]==np.arange(len(V),dtype=np.int64));coverage=float(np.mean(mutual))
+    if coverage<.90:return None
+    thickness=pair_distance[mutual]
+    if not len(thickness):return None
+    p50=float(np.median(thickness));p95=float(np.percentile(thickness,95))
+    if p50<.00045 or p50>.0050 or p95>max(.0060,p50*1.45):return None
+    _,body_normals,_,body_distance,_=_b14_nearest_surface(V,np.asarray(source_body_triangles,dtype=np.float64),k=32);body_distance=np.asarray(body_distance,dtype=np.float64);body_normals=np.asarray(body_normals,dtype=np.float64)
+    outer=np.zeros(len(V),dtype=bool);seen=set()
+    for i in np.flatnonzero(mutual):
+        j=int(partner[i]);key=(min(int(i),j),max(int(i),j))
+        if key in seen:continue
+        seen.add(key)
+        if abs(float(body_distance[i]-body_distance[j]))>.00015:chosen=int(i) if body_distance[i]>body_distance[j] else j
+        else:
+            ai=float(np.dot(N[i],body_normals[i]));aj=float(np.dot(N[j],body_normals[j]));chosen=int(i) if ai>=aj else j
+        outer[chosen]=True
+    # Rare unpaired wall/seam vertices use authored normal orientation only for surface selection.
+    for i in np.flatnonzero(~mutual):outer[i]=float(np.dot(N[i],body_normals[i]))>=0.0
+    outer_face_mask=np.all(outer[F],axis=1);outer_faces_global=F[outer_face_mask]
+    if len(outer_faces_global)<max(12,int(len(F)*.25)):return None
+    outer_ids=np.unique(outer_faces_global.reshape(-1));remap=np.full(len(V),-1,dtype=np.int64);remap[outer_ids]=np.arange(len(outer_ids),dtype=np.int64);outer_faces=remap[outer_faces_global]
+    outer_feature=_structural_component_features(V[outer_ids],outer_faces)
+    # A useful garment surface must reveal authored openings/boundaries hidden by the closed volume.
+    if float(outer_feature.get("boundary_fraction",0.0))<.025:return None
+    return {"outer_ids":_readonly_array(outer_ids,dtype=np.int64),"outer_faces":_readonly_array(outer_faces,dtype=np.int64),"paired_fraction":coverage,"thickness_p50_mm":p50*1000.0,"thickness_p95_mm":p95*1000.0,"outer_vertex_count":int(len(outer_ids)),"outer_face_count":int(len(outer_faces)),"source_vertex_count":int(len(V)),"source_face_count":int(len(F)),"outer_boundary_fraction":float(outer_feature.get("boundary_fraction",0.0))}
+
+
+def _thin_volume_surface_data(w: dict[str,Any], thin: dict[str,Any], name: str) -> dict[str,Any]:
+    ids=np.asarray(thin["outer_ids"],dtype=np.int64);UV=w.get("UV");N=w.get("N")
+    return {"V":np.asarray(w["V"],dtype=np.float64)[ids].copy(),"F":np.asarray(thin["outer_faces"],dtype=np.int64).copy(),"W":np.asarray(w["W"],dtype=np.float64)[ids].copy(),"UV":None if UV is None else np.asarray(UV,dtype=np.float64)[ids].copy(),"N":None if N is None else np.asarray(N,dtype=np.float64)[ids].copy(),"joint_names":list(w.get("joint_names",[])),"material":str(w.get("material","")),"name":name}
+
+
+def _orthonormal_triangle_frames(triangles: np.ndarray) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
+    T=np.asarray(triangles,dtype=np.float64);tangent=T[:,1]-T[:,0];tangent/=np.maximum(np.linalg.norm(tangent,axis=1,keepdims=True),1e-12);normal=np.cross(T[:,1]-T[:,0],T[:,2]-T[:,0]);normal/=np.maximum(np.linalg.norm(normal,axis=1,keepdims=True),1e-12);bitangent=np.cross(normal,tangent);bitangent/=np.maximum(np.linalg.norm(bitangent,axis=1,keepdims=True),1e-12);return tangent,bitangent,normal
+
+
+def _reconstruct_thin_volume_from_surface(w: dict[str,Any], thin: dict[str,Any], solved_outer: np.ndarray) -> np.ndarray:
+    """Expand a solved garment-facing surface back to its authored source thickness.
+
+    Only the source shell supplies offsets/thickness.  No target geometry participates here.
+    """
+    V=np.asarray(w["V"],dtype=np.float64);outer_ids=np.asarray(thin["outer_ids"],dtype=np.int64);outer_faces=np.asarray(thin["outer_faces"],dtype=np.int64);Q=np.asarray(solved_outer,dtype=np.float64)
+    if Q.shape!=(len(outer_ids),3):raise ValueError(f"Thin-volume solved surface shape {Q.shape} != {(len(outer_ids),3)}")
+    source_outer=V[outer_ids];source_tri=source_outer[outer_faces];target_tri=Q[outer_faces];closest,_,_,_,face_index=_b14_nearest_surface(V,source_tri,k=24);face_index=np.asarray(face_index,dtype=np.int64);bary=trimesh.triangles.points_to_barycentric(source_tri[face_index],np.asarray(closest,dtype=np.float64));target_contact=np.einsum("ni,nij->nj",bary,target_tri[face_index]);offset=V-np.asarray(closest,dtype=np.float64)
+    se,sb,sn=_orthonormal_triangle_frames(source_tri[face_index]);te,tb,tn=_orthonormal_triangle_frames(target_tri[face_index]);local=np.column_stack((np.einsum("ij,ij->i",offset,se),np.einsum("ij,ij->i",offset,sb),np.einsum("ij,ij->i",offset,sn)))
+    out=target_contact+te*local[:,0,None]+tb*local[:,1,None]+tn*local[:,2,None];out[outer_ids]=Q;return out
+
+def _layer_member_virtual_data(source: Any, layer: GarmentLayer, member: GarmentLayerMember) -> dict[str,Any]:
+    data=source.data(member.mesh_name);ids=np.asarray(member.vertex_ids,dtype=np.int64)
+    Fraw=np.asarray(data["F"],dtype=np.int64)[np.asarray(member.face_ids,dtype=np.int64)]
+    remap=np.full(len(data["V"]),-1,dtype=np.int64);remap[ids]=np.arange(len(ids),dtype=np.int64)
+    F=remap[Fraw]
+    if np.any(F<0):raise ValueError(f"{member.stable_component_id} face remap escaped its authored component.")
+    UV=data.get("UV");N=data.get("N")
+    return {
+        "V":np.asarray(data["V"],dtype=np.float64)[ids].copy(),
+        "F":np.asarray(F,dtype=np.int64).copy(),
+        "W":np.asarray(data["W"],dtype=np.float64)[ids].copy(),
+        "UV":None if UV is None else np.asarray(UV,dtype=np.float64)[ids].copy(),
+        "N":None if N is None else np.asarray(N,dtype=np.float64)[ids].copy(),
+        "joint_names":list(data.get("joint_names",[])),
+        "material":str(data.get("material","")),
+        "name":f"{layer.stable_id}/{member.stable_component_id}",
+    }
+
+
+def _layer_geometry_from_source(source: Any, layer: GarmentLayer) -> np.ndarray:
+    rows=[]
+    for member in layer.members:
+        data=source.data(member.mesh_name);rows.append(np.asarray(data["V"],dtype=np.float64)[np.asarray(member.vertex_ids,dtype=np.int64)])
+    return np.vstack(rows) if rows else np.zeros((0,3),dtype=np.float64)
+
+
+def _infer_layer_order_graph(source: Any, layers: list[GarmentLayer], source_body_triangles: np.ndarray) -> tuple[list[GarmentLayer],list[dict[str,Any]]]:
+    geometry={layer.stable_id:_layer_geometry_from_source(source,layer) for layer in layers}
+    relations=[]
+    for ai,a in enumerate(layers):
+        # Rigid ornaments do not define garment inside/outside shell ordering. Their placement is
+        # independently body-corresponded and frozen; including them here creates false layer edges
+        # and quadratic work in ornament-heavy outfits.
+        if a.structural_classification=="rigid_assembly":continue
+        AV=geometry[a.stable_id];AF=np.asarray(a.faces,dtype=np.int64)
+        if not len(AV) or not len(AF):continue
+        for b in layers[ai+1:]:
+            if b.structural_classification=="rigid_assembly":continue
+            # Ordering describes distinct authored layers, not disconnected peers/trims belonging to
+            # the same material construction. Same-material components retain their own deformation
+            # authority but must never manufacture an inside/outside constraint between each other.
+            if set(a.materials)&set(b.materials):continue
+            BV=geometry[b.stable_id];BF=np.asarray(b.faces,dtype=np.int64)
+            if not len(BV) or not len(BF) or not _expanded_aabb_overlap(AV,BV,.012):continue
+            ae=_layer_directional_evidence(AV,BV[BF],source_body_triangles,close_distance=.012)
+            be=_layer_directional_evidence(BV,AV[AF],source_body_triangles,close_distance=.012)
+            outer=inner=None;OV=IV=None;OF=IF=None
+            evidence=None
+            # A real authored stack must be evidenced in both directions over a meaningful patch.
+            # One-sided proximity is common for straps, trims, buckles and crossing decorations and
+            # must not manufacture a global inside/outside relationship. The graph is deliberately
+            # conservative: ambiguous overlap remains component-local rather than becoming assembly
+            # authority.
+            if ae is not None and be is not None and ae["fraction"]>=.08 and be["fraction"]>=.08:
+                if ae["positive_fraction"]>=.68 and be["negative_fraction"]>=.68 and ae["median"]>.00010:
+                    outer,inner=a,b;OV,OF,IV,IF=AV,AF,BV,BF;evidence=ae
+                elif be["positive_fraction"]>=.68 and ae["negative_fraction"]>=.68 and be["median"]>.00010:
+                    outer,inner=b,a;OV,OF,IV,IF=BV,BF,AV,AF;evidence=be
+            if outer is None:continue
+            closest,_,_,distance,inner_face_index=_b14_nearest_surface(OV,IV[IF],k=32)
+            inner_face_index=np.asarray(inner_face_index,dtype=np.int64)
+            source_inner_tri=IV[IF][inner_face_index]
+            inner_barycentric=trimesh.triangles.points_to_barycentric(source_inner_tri,np.asarray(closest,dtype=np.float64))
+            _,body_normals,_,_,_=_b14_nearest_surface(OV,source_body_triangles,k=32)
+            radial=np.sum((OV-closest)*body_normals,axis=1)
+            mask=(distance<=.012)&np.isfinite(radial)&(radial>.00002)
+            if int(np.count_nonzero(mask))<max(6,int(len(OV)*.01)):continue
+            source_gap=np.zeros(len(OV),dtype=np.float64);source_gap[mask]=radial[mask]
+            relation_id=f"{inner.stable_id}->{outer.stable_id}"
+            relations.append({
+                "id":relation_id,"inner":inner.stable_id,"outer":outer.stable_id,
+                "source_gap":_readonly_array(source_gap),
+                # Closest-surface correspondence is frozen in source topology. Reconciliation must
+                # compare the same authored surface patch after independent fitting rather than
+                # performing a new nearest-surface lookup that can jump across folds/openings.
+                "inner_face_index":_readonly_array(inner_face_index),
+                "inner_barycentric":_readonly_array(np.asarray(inner_barycentric,dtype=np.float64)),
+                "source_gap_p50_mm":float(np.median(radial[mask])*1000.0),
+                "source_gap_p95_mm":float(np.percentile(radial[mask],95)*1000.0),
+                "overlap_vertices":int(np.count_nonzero(mask)),"influence_m":float(np.clip(np.percentile(distance[mask],95)*1.5,.004,.014)),
+                "source_directional_median_mm":float((evidence or {}).get("median",0.0)*1000.0),
+            })
+    relation_ids={layer.stable_id:[] for layer in layers}
+    for relation in relations:
+        relation_ids[relation["inner"]].append(relation["id"]);relation_ids[relation["outer"]].append(relation["id"])
+    layers=[replace(layer,source_ordering_relationships=tuple(sorted(relation_ids[layer.stable_id]))) for layer in layers]
+    return layers,relations
+
+
+def _source_relative_body_penetration_state(source_vertices: np.ndarray, vertices: np.ndarray, source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, tolerance: float=.00002, body_margin_m: float=.00002):
+    """Classify target-body penetration relative to the authored source/body relationship.
+
+    A negative nearest-normal sign is not, by itself, evidence that a solved garment has crossed the
+    body: concave and bilateral anatomy can legitimately produce the same sign in the untouched
+    source.  Source-negative vertices are therefore allowed to retain their authored signed relation;
+    only a target result that becomes materially *more* negative is a new penetration.  Vertices that
+    were not source-negative retain the normal literal-body rule.
+    """
+    S=np.asarray(source_vertices,dtype=np.float64);V=np.asarray(vertices,dtype=np.float64)
+    if S.shape!=V.shape:raise ValueError(f"Source-relative body validation requires matching geometry, got {S.shape} and {V.shape}.")
+    if not len(V):
+        return {"count":0,"source_signed":np.zeros(0,dtype=np.float64),"target_signed":np.zeros(0,dtype=np.float64),"target_normals":np.zeros((0,3),dtype=np.float64),"required":np.zeros(0,dtype=np.float64),"authored_negative":np.zeros(0,dtype=bool)}
+    _,_,source_signed,_,_=_b14_nearest_surface(S,source_body_triangles,k=32)
+    _,target_normals,target_signed,_,_=_b14_nearest_surface(V,target_body_triangles,k=32)
+    source_signed=np.asarray(source_signed,dtype=np.float64);target_signed=np.asarray(target_signed,dtype=np.float64);target_normals=np.asarray(target_normals,dtype=np.float64)
+    tol=abs(float(tolerance));authored_negative=source_signed<-tol
+    # Source-negative points may keep the relationship the source garment was actually authored with.
+    # Everything else is expected not to cross the target body's literal zero surface.
+    violation_floor=np.where(authored_negative,source_signed-tol,-tol)
+    desired=np.where(authored_negative,source_signed,float(body_margin_m))
+    violation=target_signed<violation_floor
+    required=np.where(violation,np.maximum(0.0,desired-target_signed),0.0)
+    return {"count":int(np.count_nonzero(violation)),"source_signed":source_signed,"target_signed":target_signed,"target_normals":target_normals,"required":required,"authored_negative":authored_negative}
+
+
+def _layer_body_penetration_count(vertices: np.ndarray, target_body_triangles: np.ndarray, tolerance: float=.00002, source_vertices: np.ndarray | None=None, source_body_triangles: np.ndarray | None=None) -> int:
+    if source_vertices is not None and source_body_triangles is not None:
+        return int(_source_relative_body_penetration_state(source_vertices,vertices,source_body_triangles,target_body_triangles,tolerance=tolerance)["count"])
+    if not len(vertices):return 0
+    _,_,signed,_,_=_b14_nearest_surface(np.asarray(vertices,dtype=np.float64),target_body_triangles,k=32)
+    return int(np.count_nonzero(np.asarray(signed)<-abs(float(tolerance))))
+
+
+def _layer_relation_mapped_inner(inner: np.ndarray, inner_faces: np.ndarray, relation: dict[str,Any]) -> np.ndarray:
+    face_rows=np.asarray(relation.get("inner_face_index"),dtype=np.int64)
+    bary=np.asarray(relation.get("inner_barycentric"),dtype=np.float64)
+    faces=np.asarray(inner_faces,dtype=np.int64)
+    if face_rows.ndim!=1 or bary.shape!=(len(face_rows),3):
+        raise ValueError(f"{relation.get('id','layer relation')} has invalid source closest-surface correspondence metadata.")
+    if np.any(face_rows<0) or np.any(face_rows>=len(faces)):
+        raise ValueError(f"{relation.get('id','layer relation')} source closest-surface face mapping is out of range.")
+    return np.einsum("ni,nij->nj",bary,np.asarray(inner,dtype=np.float64)[faces[face_rows]])
+
+
+def _layer_order_violation_count(outer: np.ndarray, inner: np.ndarray, inner_faces: np.ndarray, target_body_triangles: np.ndarray, relation: dict[str,Any]) -> int:
+    if not len(outer) or not len(inner_faces):return 0
+    closest=_layer_relation_mapped_inner(inner,inner_faces,relation)
+    distance=np.linalg.norm(np.asarray(outer,dtype=np.float64)-closest,axis=1)
+    _,body_normals,_,_,_=_b14_nearest_surface(outer,target_body_triangles,k=32)
+    radial=np.sum((outer-closest)*body_normals,axis=1);gap=np.asarray(relation["source_gap"],dtype=np.float64)
+    eligible=(gap>0)&(distance<=float(relation["influence_m"])*1.25)
+    # Source gap is relationship metadata, not a target-space modelling instruction. A violation is
+    # therefore a genuine crossing/collapse, not merely a smaller-but-valid target-space gap.
+    minimum_gap=np.minimum(gap*.10,.00025)
+    return int(np.count_nonzero(eligible&(radial<minimum_gap-.00003)))
+
+
+def _reconcile_frozen_b14_layers(layers: list[GarmentLayer], frozen: dict[str,B14LayerResult], relations: list[dict[str,Any]], target_body_triangles: np.ndarray, displacement_cap_m: float=.0020, body_margin_m: float=.00002, source_layer_geometry: dict[str,np.ndarray] | None=None, source_body_triangles: np.ndarray | None=None):
+    """Tiny bounded post-B14 assembly pass: ordering, source gap, then literal body penetration only."""
+    final={layer.stable_id:np.asarray(frozen[layer.stable_id].positions,dtype=np.float64).copy() for layer in layers}
+    faces={layer.stable_id:np.asarray(layer.faces,dtype=np.int64) for layer in layers}
+    original={layer.stable_id:np.asarray(frozen[layer.stable_id].positions,dtype=np.float64) for layer in layers}
+    total={layer.stable_id:np.zeros(len(final[layer.stable_id]),dtype=np.float64) for layer in layers}
+    per_layer_order_before={layer.stable_id:0 for layer in layers}
+    source_relative_body_validation=source_layer_geometry is not None and source_body_triangles is not None
+    per_layer_body_before={layer.stable_id:_layer_body_penetration_count(final[layer.stable_id],target_body_triangles,source_vertices=(source_layer_geometry or {}).get(layer.stable_id) if source_relative_body_validation else None,source_body_triangles=source_body_triangles if source_relative_body_validation else None) for layer in layers}
+    for r in relations:
+        count=_layer_order_violation_count(final[r["outer"]],final[r["inner"]],faces[r["inner"]],target_body_triangles,r)
+        per_layer_order_before[r["outer"]]+=count
+    relation_before=sum(per_layer_order_before.values())
+    body_before=sum(per_layer_body_before.values())
+    unresolved_required_mm=0.0
+
+    # Inner/outer reconciliation: move only the authored outer layer, never refit or smooth either shell.
+    for relation in relations:
+        outer_id=relation["outer"];inner_id=relation["inner"];OV=final[outer_id];IV=final[inner_id];IF=faces[inner_id]
+        closest=_layer_relation_mapped_inner(IV,IF,relation)
+        distance=np.linalg.norm(np.asarray(OV,dtype=np.float64)-closest,axis=1)
+        _,body_normals,_,_,_=_b14_nearest_surface(OV,target_body_triangles,k=32)
+        radial=np.sum((OV-closest)*body_normals,axis=1);gap=np.asarray(relation["source_gap"],dtype=np.float64)
+        eligible=(gap>0)&(distance<=float(relation["influence_m"])*1.25)
+        # Reconciliation is assembly, never a second fit. Preserve ordering and repair only a
+        # collapsed inter-layer clearance. Do not force the source body's full millimetre gap onto
+        # different target anatomy. The source distribution determines the collapse floor; movement
+        # remains the smallest displacement that restores a physically separate stack.
+        minimum_gap=np.minimum(gap*.10,.00025)
+        required=np.where(eligible,np.maximum(0.0,minimum_gap-radial),0.0)
+        unresolved_required_mm=max(unresolved_required_mm,float(np.max(required,initial=0.0)*1000.0))
+        remaining=np.maximum(0.0,float(displacement_cap_m)-total[outer_id])
+        move=np.minimum(required,remaining)
+        if np.any(move>0):
+            final[outer_id]=OV+body_normals*move[:,None];total[outer_id]+=move
+
+    # Literal target-body correction remains tiny and bounded, but penetration classification is
+    # source-relative when the authored source/body relationship is available. This prevents a
+    # nearest-normal sign flip in concave/bilateral anatomy from being mistaken for a new crossing.
+    for layer in layers:
+        lid=layer.stable_id;V=final[lid]
+        if source_relative_body_validation:
+            state=_source_relative_body_penetration_state((source_layer_geometry or {})[lid],V,source_body_triangles,target_body_triangles,tolerance=body_margin_m,body_margin_m=body_margin_m)
+            normals=np.asarray(state["target_normals"],dtype=np.float64);required=np.asarray(state["required"],dtype=np.float64)
+        else:
+            _,normals,signed,_,_=_b14_nearest_surface(V,target_body_triangles,k=32)
+            signed=np.asarray(signed,dtype=np.float64);normals=np.asarray(normals,dtype=np.float64)
+            required=np.where(signed<0.0,np.maximum(0.0,float(body_margin_m)-signed),0.0)
+        unresolved_required_mm=max(unresolved_required_mm,float(np.max(required,initial=0.0)*1000.0))
+        remaining=np.maximum(0.0,float(displacement_cap_m)-total[lid]);move=np.minimum(required,remaining)
+        if np.any(move>0):
+            final[lid]=V+normals*move[:,None];total[lid]+=move
+
+    per_layer_order_after={layer.stable_id:0 for layer in layers}
+    per_layer_body_after={layer.stable_id:_layer_body_penetration_count(final[layer.stable_id],target_body_triangles,source_vertices=(source_layer_geometry or {}).get(layer.stable_id) if source_relative_body_validation else None,source_body_triangles=source_body_triangles if source_relative_body_validation else None) for layer in layers}
+    for r in relations:
+        count=_layer_order_violation_count(final[r["outer"]],final[r["inner"]],faces[r["inner"]],target_body_triangles,r)
+        per_layer_order_after[r["outer"]]+=count
+    relation_after=sum(per_layer_order_after.values())
+    body_after=sum(per_layer_body_after.values())
+    layer_reports={}
+    warnings=[]
+    for layer in layers:
+        lid=layer.stable_id;delta=np.linalg.norm(final[lid]-original[lid],axis=1)
+        moved=delta>1e-12
+        p50=float(np.percentile(delta,50)*1000.0) if len(delta) else 0.0
+        p95=float(np.percentile(delta,95)*1000.0) if len(delta) else 0.0
+        maximum=float(np.max(delta,initial=0.0)*1000.0)
+        warning=p95>1.0 or maximum>=float(displacement_cap_m)*1000.0*.90
+        if warning:warnings.append(f"{lid}: reconciliation p95={p95:.3f} mm max={maximum:.3f} mm")
+        layer_reports[lid]={"reconciled_vertices":int(np.count_nonzero(moved)),"p50_mm":p50,"p95_mm":p95,"max_mm":maximum,"warning":warning,
+                            "layer_order_violations_before":int(per_layer_order_before[lid]),"layer_order_violations_after":int(per_layer_order_after[lid]),
+                            "body_penetrations_before":int(per_layer_body_before[lid]),"body_penetrations_after":int(per_layer_body_after[lid])}
+    if unresolved_required_mm>float(displacement_cap_m)*1000.0+1e-9:
+        warnings.append(f"B14 layer solve requires {unresolved_required_mm:.3f} mm of assembly correction, beyond the {displacement_cap_m*1000.0:.3f} mm hard cap; treat this solve as failed.")
+    if relation_after:
+        warnings.append(f"{relation_after} source layer-order violations remain after bounded reconciliation; treat this solve as failed.")
+    if body_after:
+        warnings.append(f"{body_after} target-body penetrations remain after bounded reconciliation; treat this solve as failed.")
+    report={
+        "policy":"bounded relationship-only reconciliation; no post-B14 macro/body fitting",
+        "source_relative_body_validation":bool(source_relative_body_validation),
+        "displacement_cap_mm":float(displacement_cap_m*1000.0),
+        "layer_order_violations_before":int(relation_before),"layer_order_violations_after":int(relation_after),
+        "body_penetrations_before":int(body_before),"body_penetrations_after":int(body_after),
+        "largest_unbounded_requested_correction_mm":float(unresolved_required_mm),
+        "passed":bool(relation_after==0 and body_after==0 and unresolved_required_mm<=float(displacement_cap_m)*1000.0+1e-9),
+        "layers":layer_reports,"warnings":warnings,
+    }
+    final={layer_id:_readonly_array(value) for layer_id,value in final.items()}
+    return final,report
+
+
+def _scatter_layer_positions_to_meshes(source: Any, layers: list[GarmentLayer], layer_positions: dict[str,np.ndarray]) -> dict[str,np.ndarray]:
+    out={}
+    for layer in layers:
+        candidate=np.asarray(layer_positions[layer.stable_id],dtype=np.float64);offset=0
+        for member in layer.members:
+            ids=np.asarray(member.vertex_ids,dtype=np.int64);count=len(ids)
+            if member.mesh_name not in out:out[member.mesh_name]=np.asarray(source.data(member.mesh_name)["V"],dtype=np.float64).copy()
+            out[member.mesh_name][ids]=candidate[offset:offset+count];offset+=count
+        if offset!=len(candidate):raise ValueError(f"{layer.stable_id} scatter map consumed {offset} of {len(candidate)} vertices.")
+    return out
+
+
+def _weld_positions_from_raw(w: dict[str,Any], raw_positions: np.ndarray) -> np.ndarray:
+    raw=np.asarray(raw_positions,dtype=np.float64);mapping=np.asarray(w["raw_to_weld"],dtype=np.int64);n=len(w["V"])
+    if len(raw)!=len(mapping):raise ValueError(f"Raw position count {len(raw)} does not match weld map {len(mapping)}")
+    out=np.zeros((n,3),dtype=np.float64);count=np.zeros(n,dtype=np.float64);np.add.at(out,mapping,raw);np.add.at(count,mapping,1.0)
+    return out/np.maximum(count[:,None],1.0)
+
+
+def _apply_b14_local_structural_retarget(source: Any, positions: dict[str,np.ndarray], cache: dict[str,Any], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, source_asset_has_embedded_body: bool=False) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Apply the universal coherent refit to already-good Frozen B14 geometry.
+
+    Construction/detail remains source/B14 authority.  The target body contributes only a smooth,
+    continuous source->target deformation field whose influence is determined from the authored
+    source-body clearance.  Spatially attached disconnected pieces share that same field, so a
+    strap/ring/trim cannot wander away from the garment assembly.  Literal body geometry is used
+    only as distributed collision authority.
+    """
+    X=np.asarray(cache["X"],dtype=np.float64);Y=np.asarray(cache["Y"],dtype=np.float64);BW=np.asarray(cache["BW"],dtype=np.float64)
+    local_affines=cache.get("_ravafit_local_affines")
+    if local_affines is None:
+        local_affines=precompute_body_local_affines(X,Y,BW);cache["_ravafit_local_affines"]=local_affines
+    A,_,tree=local_affines
+    body_motion=np.linalg.norm(Y-X,axis=1)
+    body_motion_p95=float(np.percentile(body_motion,95)) if len(body_motion) else 0.0
+    body_macro_transform=fit_body_macro_transform(X,Y) if len(X)>=4 else None
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};reports={};changed_meshes=[]
+    for name in sorted(out):
+        data=source.data(name);w=weld_mesh(data);b14_w=_weld_positions_from_raw(w,out[name])
+        Wg,_=solver_body_weights(w["V"],X,BW,tree)
+        correspondence=local_body_field_map_soft(w["V"],Wg,X,Y,BW,A,tree=tree,tau=.004)[0]
+        corrected,report=coherent_universal_refit(
+            w["V"],w["F"],b14_w,correspondence,source_body_triangles,target_body_triangles,
+            body_motion_p95_m=body_motion_p95,nearest_surface_fn=_b14_nearest_surface,macro_transform=body_macro_transform,source_weights=w.get("W"),allow_authored_standoff_noop=not bool(source_asset_has_embedded_body))
+        corrected,ribbon_report=retarget_attached_ribbons_to_assembly(
+            w["V"],w["F"],b14_w,correspondence,corrected,source_body_triangles,target_body_triangles,
+            nearest_surface_fn=_b14_nearest_surface,collision_polish_fn=_b14_residual_collision_polish)
+        combined_move=np.linalg.norm(np.asarray(corrected,dtype=np.float64)-b14_w,axis=1)
+        report["attached_ribbon_retarget"]=ribbon_report
+        report["changed_vertex_count"]=int(np.count_nonzero(combined_move>1e-12))
+        report["displacement_p95_mm"]=float(np.percentile(combined_move,95)*1000.0) if len(combined_move) else 0.0
+        report["displacement_max_mm"]=float(np.max(combined_move,initial=0.0)*1000.0)
+        reports[name]=report
+        if int(report.get("changed_vertex_count",0))<=0:continue
+        raw=expand_welded(w,corrected)
+        if raw.shape!=out[name].shape:raise ValueError(f"{name}: universal coherent refit expansion produced {raw.shape}, expected {out[name].shape}")
+        out[name]=np.asarray(raw,dtype=np.float64);changed_meshes.append(name)
+    return out,{"enabled":True,"policy":"same authored garment, one continuous source-clearance-weighted body field, distributed literal collision","body_motion_p95_mm":body_motion_p95*1000.0,"changed_meshes":changed_meshes,"changed_mesh_count":len(changed_meshes),"meshes":reports}
+
+
+def _apply_final_local_shell_bridge(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, max_passes: int=8) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Bridge target-only local convex relief after the last body/layer fit, before attachment closure.
+
+    This is intentionally a bounded post-fit cleanup, not another body solver.  The untouched source
+    garment proves whether a convexity is new, the surrounding solved shell proves the bridge surface,
+    and the literal target body remains a penetration veto.  Running a few bounded evidence-gated
+    passes lets a sharp local artifact relax without one aggressive topology-changing move.
+    """
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};mesh_reports={};changed=[]
+    for name in sorted(out):
+        data=source.data(name);w=weld_mesh(data);source_w=np.asarray(w["V"],dtype=np.float64);faces=np.asarray(w["F"],dtype=np.int64)
+        current=_weld_positions_from_raw(w,out[name]);initial=current.copy();passes=[]
+        for pass_index in range(max(1,int(max_passes))):
+            candidate,report=_bridge_new_local_curvature(source_w,faces,current,source_body_triangles,target_body_triangles,nearest_surface_fn=_b14_nearest_surface,config=None)
+            candidate=np.asarray(candidate,dtype=np.float64);step=np.linalg.norm(candidate-current,axis=1);changed_count=int(np.count_nonzero(step>1e-12))
+            passes.append({"pass":pass_index+1,"changed_vertex_count":changed_count,"step_p95_mm":float(np.percentile(step[step>1e-12],95)*1000.0) if changed_count else 0.0,"step_max_mm":float(np.max(step,initial=0.0)*1000.0),"bridge":report})
+            if changed_count<=0:break
+            current=candidate
+        cumulative=np.linalg.norm(current-initial,axis=1);mesh_changed=int(np.count_nonzero(cumulative>1e-12))
+        mesh_reports[name]={"passes":passes,"pass_count":len(passes),"changed_vertex_count":mesh_changed,"cumulative_p95_mm":float(np.percentile(cumulative[cumulative>1e-12],95)*1000.0) if mesh_changed else 0.0,"cumulative_max_mm":float(np.max(cumulative,initial=0.0)*1000.0)}
+        if mesh_changed:
+            raw=expand_welded(w,current)
+            if raw.shape!=out[name].shape:raise ValueError(f"{name}: final local shell bridge produced {raw.shape}, expected {out[name].shape}")
+            out[name]=np.asarray(raw,dtype=np.float64);changed.append(name)
+    return out,{"enabled":bool(changed),"policy":"iterative source-proven local convexity bridge after final fit; literal target remains penetration veto; no control geometry","max_passes":int(max_passes),"changed_meshes":changed,"changed_mesh_count":len(changed),"meshes":mesh_reports}
+
+
+def _preserve_final_unilateral_pair_separation(source: Any, positions: dict[str,np.ndarray], *, preserve_proximal_structure: bool = True) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Reassert source-proven left/right leg-component separation after all body/layer fitting.
+
+    Production requires unilateral leg-skinning evidence so mirrored non-leg structures (cups, gloves,
+    shoulder ornaments, etc.) cannot enter this lane on geometry symmetry alone.  Connectivity and gap
+    measurements are performed on welded render topology, then expanded back to authored raw storage.
+
+    ``preserve_proximal_structure=False`` is used only for the final post-carrier guard: at that point
+    raw authored bands/cuffs have already inherited their coherent solved carrier frame, so the welded
+    bilateral authority owns the centreline separation floor only and must not reshape those structures.
+    """
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    cfg=UnilateralPairSeparationConfig(require_leg_evidence=True,preserve_proximal_structure=bool(preserve_proximal_structure))
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};mesh_reports={};changed=[]
+    total_pairs=0;total_moved=0;maximum_correction=0.0
+    for name in sorted(out):
+        data=source.data(name);w=weld_mesh(data);source_w=np.asarray(w.get("V",[]),dtype=np.float64);faces=np.asarray(w.get("F",[]),dtype=np.int64);weights=np.asarray(w.get("W",[]),dtype=np.float64);joint_names=list(data.get("joint_names") or w.get("joint_names") or [])
+        if not len(source_w) or not len(faces) or weights.ndim!=2 or len(weights)!=len(source_w) or weights.shape[1]!=len(joint_names):
+            mesh_reports[name]={"enabled":False,"reason":"missing welded topology or compatible source skinning","pair_count":0,"moved_vertices":0};continue
+        left_columns,right_columns=_leg_joint_columns(joint_names)
+        if not left_columns or not right_columns:
+            mesh_reports[name]={"enabled":False,"reason":"no unilateral leg-joint columns","pair_count":0,"moved_vertices":0};continue
+        current_w=_weld_positions_from_raw(w,out[name]);left_mass=weights[:,left_columns].sum(axis=1);right_mass=weights[:,right_columns].sum(axis=1)
+        corrected,report=preserve_source_unilateral_pair_separation(source_w,current_w,faces,left_leg_mass=left_mass,right_leg_mass=right_mass,config=cfg)
+        mesh_reports[name]=report;total_pairs+=int(report.get("pair_count",0));total_moved+=int(report.get("moved_vertices",0));maximum_correction=max(maximum_correction,float(report.get("maximum_correction_mm",0.0)))
+        if int(report.get("moved_vertices",0))<=0:continue
+        raw=expand_welded(w,corrected)
+        if raw.shape!=out[name].shape:raise ValueError(f"{name}: unilateral pair separation expansion produced {raw.shape}, expected {out[name].shape}")
+        _assert_finite_stage(name,"final unilateral pair separation",raw);out[name]=np.asarray(raw,dtype=np.float64);changed.append(name)
+    policy=("source-proven disconnected unilateral leg pairs preserve target-scaled authored centreline separation plus proximal structure after fitting" if preserve_proximal_structure else "source-proven disconnected unilateral leg pairs preserve the target-scaled authored centreline separation floor only after coherent structural-carrier placement")
+    return out,{"enabled":bool(total_pairs),"policy":policy,"preserve_proximal_structure":bool(preserve_proximal_structure),"pair_count":int(total_pairs),"moved_vertices":int(total_moved),"maximum_correction_mm":float(maximum_correction),"changed_meshes":changed,"changed_mesh_count":len(changed),"meshes":mesh_reports}
+
+
+
+def _preserve_final_surface_relative_detail_layout(source: Any, positions: dict[str,np.ndarray]) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Keep compact disconnected authored details in the local frame of the solved garment beneath them.
+
+    The carrier is selected entirely from untouched source connectivity/proximity.  Source geometry
+    supplies layout/shape only; the already-solved carrier supplies target placement and scale.
+    """
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};names=[];source_parts=[];current_parts=[];face_parts=[];ranges={};offset=0
+    for name in sorted(out):
+        data=source.data(name);w=weld_mesh(data);source_w=np.asarray(w.get("V",[]),dtype=np.float64);faces=np.asarray(w.get("F",[]),dtype=np.int64)
+        if not len(source_w) or not len(faces):continue
+        current_w=_weld_positions_from_raw(w,out[name]);start=offset;end=start+len(source_w);ranges[name]=(start,end,w);names.append(name);source_parts.append(source_w);current_parts.append(current_w);face_parts.append(faces+start);offset=end
+    if not source_parts:return out,{"enabled":False,"reason":"no welded garment topology"}
+    source_all=np.vstack(source_parts);current_all=np.vstack(current_parts);faces_all=np.vstack(face_parts)
+    corrected,report=preserve_surface_relative_detail_layout(source_all,current_all,faces_all,config=SurfaceRelativeDetailConfig())
+    corrected=np.asarray(corrected,dtype=np.float64);changed=[]
+    for name in names:
+        start,end,w=ranges[name];piece=corrected[start:end];before=current_all[start:end]
+        if np.max(np.linalg.norm(piece-before,axis=1),initial=0.0)<=1.0e-12:continue
+        raw=expand_welded(w,piece)
+        if raw.shape!=out[name].shape:raise ValueError(f"{name}: surface-relative detail layout expansion produced {raw.shape}, expected {out[name].shape}")
+        _assert_finite_stage(name,"surface-relative detail layout",raw);out[name]=np.asarray(raw,dtype=np.float64);changed.append(name)
+    report=dict(report);report["changed_meshes"]=changed;report["changed_mesh_count"]=len(changed)
+    return out,report
+
+
+def _preserve_final_source_relative_structural_carriers(source: Any, positions: dict[str,np.ndarray]) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Preserve raw authored carried bands and compact multi-piece assemblies in solved carrier frames.
+
+    Unlike attachment/seam logic, this authority intentionally uses the untouched *raw render topology*.
+    A decorative cuff or nested ornament can be authored as a disconnected source component whose seam
+    vertices happen to occupy the same coordinates as its host. Welding would erase that authored
+    structural boundary and make the very band we need to preserve indistinguishable from cloth.
+    Concatenating raw meshes still permits cross-mesh proximity clustering without using item names.
+    """
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};names=[];source_parts=[];current_parts=[];face_parts=[];group_parts=[];ranges={};offset=0
+    for group_index,name in enumerate(sorted(out)):
+        data=source.data(name);source_v=np.asarray(data.get("V",[]),dtype=np.float64);faces=np.asarray(data.get("F",[]),dtype=np.int64);current=np.asarray(out[name],dtype=np.float64)
+        if not len(source_v) or not len(faces):continue
+        if current.shape!=source_v.shape:raise ValueError(f"{name}: structural carrier raw geometry mismatch source={source_v.shape}, current={current.shape}")
+        start=offset;end=start+len(source_v);ranges[name]=(start,end);names.append(name);source_parts.append(source_v);current_parts.append(current);face_parts.append(faces+start);group_parts.append(np.full(len(source_v),group_index,dtype=np.int64));offset=end
+    if not source_parts:return out,{"enabled":False,"reason":"no raw garment topology"}
+    source_all=np.vstack(source_parts);current_all=np.vstack(current_parts);faces_all=np.vstack(face_parts);group_all=np.concatenate(group_parts)
+    corrected,report=preserve_source_relative_structural_carriers(source_all,current_all,faces_all,config=StructuralCarrierConfig(),vertex_group_ids=group_all)
+    corrected=np.asarray(corrected,dtype=np.float64);changed=[]
+    for name in names:
+        start,end=ranges[name];piece=np.asarray(corrected[start:end],dtype=np.float64);before=current_all[start:end]
+        if np.max(np.linalg.norm(piece-before,axis=1),initial=0.0)<=1.0e-12:continue
+        if piece.shape!=out[name].shape:raise ValueError(f"{name}: structural carrier raw slice produced {piece.shape}, expected {out[name].shape}")
+        _assert_finite_stage(name,"source-relative raw structural carrier preservation",piece);out[name]=piece;changed.append(name)
+    report=dict(report);report["changed_meshes"]=changed;report["changed_mesh_count"]=len(changed);report["topology_authority"]="untouched raw render connectivity (no welding)"
+    return out,report
+
+
+def _preserve_support_stable_components(source: Any, positions: dict[str,np.ndarray], cache: dict[str,Any], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, *, min_component_vertices: int=180, displacement_gate_m: float=.012, support_gate_m: float=.010, displacement_support_ratio: float=2.4, allowed_worsening_m: float=.00020) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Preserve exact source geometry for components whose local body support is effectively unchanged.
+
+    This is intentionally *regional* evidence, not a slot-wide shortcut.  If a connected garment
+    component moves far more than the source->target body support directly under it, and keeping the
+    untouched source component does not materially worsen the exact source-relative target-body audit,
+    then the body solver is overreaching.  Preserve that component exactly instead of inventing a new
+    refit.  This catches long sleeve/boot-style false positives while leaving genuinely body-coupled
+    regions under normal target-fit authority.
+    """
+    if not positions:
+        return {}, {"enabled":False,"reason":"no garment meshes"}
+    X=np.asarray(cache["X"],dtype=np.float64);Y=np.asarray(cache["Y"],dtype=np.float64);BW=np.asarray(cache["BW"],dtype=np.float64)
+    local_affines=cache.get("_ravafit_local_affines")
+    if local_affines is None:
+        local_affines=precompute_body_local_affines(X,Y,BW);cache["_ravafit_local_affines"]=local_affines
+    A,_,tree=local_affines
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
+    mesh_reports={};changed_meshes=[];total_components=0;preserved_components=0;total_vertices=0;max_component_motion=0.0
+    tol=2.0e-5
+    for name in sorted(out):
+        data=source.data(name)
+        S=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64);P=np.asarray(out[name],dtype=np.float64)
+        if len(S)==0 or len(F)==0 or S.shape!=P.shape:
+            mesh_reports[name]={"enabled":False,"reason":"missing geometry or mismatched shape"}
+            continue
+        try:
+            Wg,_=solver_body_weights(S,X,BW,tree)
+            support=np.asarray(local_body_field_map_soft(S,Wg,X,Y,BW,A,tree=tree,tau=.004)[0],dtype=np.float64)
+        except Exception as exc:
+            mesh_reports[name]={"enabled":False,"reason":f"support field failed: {exc}"}
+            continue
+        support_motion=np.linalg.norm(support-S,axis=1)
+        solved_motion=np.linalg.norm(P-S,axis=1)
+        source_state=_source_relative_body_penetration_state(S,S,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+        current_state=_source_relative_body_penetration_state(S,P,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+        source_required=np.asarray(source_state["required"],dtype=np.float64)
+        current_required=np.asarray(current_state["required"],dtype=np.float64)
+        comps=_masked_vertex_components(F,np.ones(len(S),dtype=bool))
+        comp_reports=[];mesh_changed=False
+        for comp_index,ids in enumerate(comps):
+            ids=np.asarray(ids,dtype=np.int64);total_components+=1
+            comp_report={"component":int(comp_index),"vertex_count":int(len(ids))}
+            if len(ids)<int(min_component_vertices):
+                comp_report.update({"status":"skipped_small"});comp_reports.append(comp_report);continue
+            comp_support=support_motion[ids];comp_solved=solved_motion[ids]
+            support_p95=float(np.percentile(comp_support,95)) if len(comp_support) else 0.0
+            solved_p95=float(np.percentile(comp_solved,95)) if len(comp_solved) else 0.0
+            support_p50=float(np.percentile(comp_support,50)) if len(comp_support) else 0.0
+            solved_p50=float(np.percentile(comp_solved,50)) if len(comp_solved) else 0.0
+            source_req_max=float(np.max(source_required[ids],initial=0.0))
+            current_req_max=float(np.max(current_required[ids],initial=0.0))
+            worsened_vertices=int(np.count_nonzero(source_required[ids]>current_required[ids]+float(allowed_worsening_m)+1e-12))
+            exact_source_safe=source_req_max<=current_req_max+float(allowed_worsening_m)+1e-12 and worsened_vertices==0
+            overreacting=solved_p95>=max(float(displacement_gate_m), support_p95*float(displacement_support_ratio))
+            support_stable=support_p95<=float(support_gate_m)
+            comp_report.update({
+                "support_motion_p50_mm":support_p50*1000.0,
+                "support_motion_p95_mm":support_p95*1000.0,
+                "solved_displacement_p50_mm":solved_p50*1000.0,
+                "solved_displacement_p95_mm":solved_p95*1000.0,
+                "source_required_max_mm":source_req_max*1000.0,
+                "current_required_max_mm":current_req_max*1000.0,
+                "worsened_vertices_if_source_preserved":int(worsened_vertices),
+                "support_stable":bool(support_stable),
+                "exact_source_safe":bool(exact_source_safe),
+                "overreacting":bool(overreacting),
+            })
+            if not (support_stable and exact_source_safe and overreacting):
+                reason=[]
+                if not support_stable:reason.append("support_changed")
+                if not exact_source_safe:reason.append("source_worsens_body_relation")
+                if not overreacting:reason.append("deformation_not_disproportionate")
+                comp_report["status"]="skipped_"+"+".join(reason)
+                comp_reports.append(comp_report)
+                continue
+            moved=np.linalg.norm(P[ids]-S[ids],axis=1)
+            out[name][ids]=S[ids]
+            mesh_changed=True;preserved_components+=1;total_vertices+=int(np.count_nonzero(moved>1e-12));max_component_motion=max(max_component_motion,float(np.max(moved,initial=0.0)))
+            comp_report.update({"status":"preserved_exact_source","moved_vertex_count":int(np.count_nonzero(moved>1e-12)),"maximum_reverted_motion_mm":float(np.max(moved,initial=0.0)*1000.0)})
+            comp_reports.append(comp_report)
+        mesh_reports[name]={"enabled":bool(mesh_changed),"component_count":len(comps),"preserved_component_count":sum(1 for row in comp_reports if row.get("status")=="preserved_exact_source"),"components":comp_reports}
+        if mesh_changed:changed_meshes.append(name)
+    return out,{"enabled":bool(changed_meshes),"policy":"connected components whose local source->target support field changes little, whose exact source geometry stays body-safe, and whose current deformation is disproportionate are preserved exactly as source authority","changed_meshes":changed_meshes,"changed_mesh_count":len(changed_meshes),"preserved_component_count":int(preserved_components),"preserved_vertex_count":int(total_vertices),"maximum_reverted_motion_mm":float(max_component_motion*1000.0),"min_component_vertices":int(min_component_vertices),"displacement_gate_mm":float(displacement_gate_m*1000.0),"support_gate_mm":float(support_gate_m*1000.0),"displacement_support_ratio":float(displacement_support_ratio),"allowed_body_worsening_mm":float(allowed_worsening_m*1000.0),"meshes":mesh_reports}
+
+
+def _veto_worsened_source_relative_body_penetration(source: Any, before_positions: dict[str,np.ndarray], proposed_positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, tolerance: float=.00002, allowed_worsening_m: float=.00002) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Keep post-fit structural authorities from making an already-safer body relationship worse.
+
+    The normal B14/body fit remains authoritative.  Later source-structure authorities may preserve an
+    opening, attachment, or carried detail, but they are not allowed to introduce a new source-relative
+    target-body crossing or materially deepen one that already existed.  Only the structural-authority
+    displacement is backtracked; the underlying target refit is never replaced by source geometry.
+
+    Per-vertex safe fractions are found on the segment from the pre-authority solve to the proposed
+    structural result, then conservatively diffused over raw mesh edges so the veto itself cannot make
+    isolated dents.  This is deliberately generic and topology/body-evidence based.
+    """
+    if not proposed_positions:
+        return {}, {"enabled":False,"reason":"no garment meshes"}
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in proposed_positions.items()}
+    reports={};total_restricted=0;total_new_before=0;total_new_after=0;max_reverted=0.0
+    tol=abs(float(tolerance));worsen=max(0.0,float(allowed_worsening_m))
+    for name in sorted(out):
+        if name not in before_positions:
+            continue
+        data=source.data(name);S=np.asarray(data["V"],dtype=np.float64);B=np.asarray(before_positions[name],dtype=np.float64);A=np.asarray(out[name],dtype=np.float64)
+        if S.shape!=B.shape or B.shape!=A.shape:
+            raise ValueError(f"{name}: collision-veto geometry mismatch source={S.shape}, before={B.shape}, proposed={A.shape}")
+        before_state=_source_relative_body_penetration_state(S,B,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+        proposed_state=_source_relative_body_penetration_state(S,A,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+        before_required=np.asarray(before_state["required"],dtype=np.float64);proposed_required=np.asarray(proposed_state["required"],dtype=np.float64)
+        allowed=before_required+worsen
+        coherent_band_rescues=[]
+        # A source-proven broad band may already be a perfect carrier-relative similarity when the
+        # body veto sees it.  Per-vertex backtracking would make that safe by bending the band back out
+        # of shape.  First try to keep the band coherent and restore its source-relative standoff by
+        # expanding only its two broad axes around the already-solved carrier centre.  This changes
+        # neither its bend/orientation nor its thin-axis profile and is accepted only when the exact
+        # source-relative body audit proves the whole component safe.
+        faces=np.asarray(data.get("F",np.zeros((0,3),dtype=np.int64)),dtype=np.int64)
+        initial_worsened=proposed_required>allowed+1e-12
+        if len(faces) and np.any(initial_worsened):
+            cfg=StructuralCarrierConfig()
+            for ids in _masked_vertex_components(faces,np.ones(len(S),dtype=bool)):
+                ids=np.asarray(ids,dtype=np.int64);n=len(ids)
+                if n<int(cfg.band_min_vertices) or n>int(cfg.band_max_vertices) or not np.any(initial_worsened[ids]):continue
+                extent=np.ptp(S[ids],axis=0);ordered=np.sort(np.asarray(extent,dtype=np.float64))
+                if ordered[2]<float(cfg.band_min_major_extent_m) or ordered[1]<float(cfg.band_min_middle_extent_m) or ordered[0]>float(cfg.band_max_minor_extent_m):continue
+                if ordered[0]/max(float(ordered[1]),1e-12)>float(cfg.band_max_minor_to_middle_ratio):continue
+                coherent,base_scale=_similarity_fit_points(S[ids],A[ids],scale_min=.55,scale_max=1.55)
+                coherence_error=np.linalg.norm(coherent-A[ids],axis=1);coherence_p95=float(np.percentile(coherence_error,95))
+                if coherence_p95>.00035:continue
+                centre=np.mean(coherent,axis=0);centred=coherent-centre
+                try:_,_,vt=np.linalg.svd(centred,full_matrices=False)
+                except np.linalg.LinAlgError:continue
+                if len(vt)<3:continue
+                minor=np.asarray(vt[-1],dtype=np.float64);minor/=max(float(np.linalg.norm(minor)),1e-12)
+                axial=(centred@minor)[:,None]*minor[None,:];broad=centred-axial
+                def expanded(factor: float) -> np.ndarray:
+                    return centre+axial+broad*float(factor)
+                safe_factor=None;safe_points=None;prev_factor=1.0
+                # Search only a bounded structural expansion.  If the required standoff needs more,
+                # fall back to the conservative vertex veto rather than inventing garment scale.
+                for factor in np.linspace(1.0,1.35,36):
+                    Q=expanded(float(factor))
+                    qstate=_source_relative_body_penetration_state(S[ids],Q,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+                    qrequired=np.asarray(qstate["required"],dtype=np.float64)
+                    if np.all(qrequired<=allowed[ids]+1e-12):
+                        lo=prev_factor;hi=float(factor);best=Q
+                        for _ in range(8):
+                            mid=(lo+hi)*.5;M=expanded(mid)
+                            mstate=_source_relative_body_penetration_state(S[ids],M,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+                            if np.all(np.asarray(mstate["required"],dtype=np.float64)<=allowed[ids]+1e-12):hi=mid;best=M
+                            else:lo=mid
+                        safe_factor=hi;safe_points=best;break
+                    prev_factor=float(factor)
+                if safe_points is None:continue
+                max_delta=float(np.max(np.linalg.norm(safe_points-A[ids],axis=1),initial=0.0))
+                if max_delta>.030:continue
+                A[ids]=safe_points
+                coherent_band_rescues.append({
+                    "vertex_count":int(n),"base_similarity_scale":float(base_scale),"broad_plane_expansion":float(safe_factor),
+                    "coherence_error_p95_mm":coherence_p95*1000.0,"maximum_body_safe_adjustment_mm":max_delta*1000.0,
+                    "status":"coherent_broad_band_body_safe",
+                })
+            if coherent_band_rescues:
+                proposed_state=_source_relative_body_penetration_state(S,A,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+                proposed_required=np.asarray(proposed_state["required"],dtype=np.float64)
+        worsened=proposed_required>allowed+1e-12
+        alpha=np.ones(len(A),dtype=np.float64)
+        restricted=np.flatnonzero(worsened)
+        # Find the largest structural-authority fraction that retains the pre-authority body relationship.
+        for idx in restricted.tolist():
+            lo=0.0;hi=1.0;src=S[idx:idx+1];base=B[idx:idx+1];delta=(A-B)[idx:idx+1];limit=float(allowed[idx])
+            for _ in range(10):
+                mid=(lo+hi)*.5
+                state=_source_relative_body_penetration_state(src,base+delta*mid,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+                req=float(np.asarray(state["required"],dtype=np.float64)[0])
+                if req<=limit+1e-12:lo=mid
+                else:hi=mid
+            alpha[idx]=lo
+        # Lower neighbouring authority gradually rather than leaving sharp one-vertex reversions.
+        if len(restricted) and len(faces):
+            edges=np.vstack((faces[:,[0,1]],faces[:,[1,2]],faces[:,[2,0]]))
+            edges=np.sort(edges,axis=1);edges=np.unique(edges,axis=0)
+            for _ in range(4):
+                prev=alpha.copy()
+                for i,j in edges.tolist():
+                    alpha[i]=min(alpha[i],prev[j]+.22);alpha[j]=min(alpha[j],prev[i]+.22)
+        candidate=B+(A-B)*alpha[:,None]
+        # After the safety veto, broad source-proven bands can end up safe but slightly slanted because
+        # neighbouring vertices retained different fractions of the structural authority.  Project such a
+        # candidate back to its nearest coherent source-relative similarity *only when* the exact body
+        # audit proves that the straighter result remains safe.  This restores levelness/planarity without
+        # giving the band permission to float off the fitted host leg.
+        if len(faces):
+            cfg=StructuralCarrierConfig()
+            for ids in _masked_vertex_components(faces,np.ones(len(S),dtype=bool)):
+                ids=np.asarray(ids,dtype=np.int64);n=len(ids)
+                if n<int(cfg.band_min_vertices) or n>int(cfg.band_max_vertices) or not np.any(alpha[ids] < 1.0-1e-12):
+                    continue
+                extent=np.ptp(S[ids],axis=0);ordered=np.sort(np.asarray(extent,dtype=np.float64))
+                if ordered[2]<float(cfg.band_min_major_extent_m) or ordered[1]<float(cfg.band_min_middle_extent_m) or ordered[0]>float(cfg.band_max_minor_extent_m):
+                    continue
+                if ordered[0]/max(float(ordered[1]),1e-12)>float(cfg.band_max_minor_to_middle_ratio):
+                    continue
+                coherent,_=_similarity_fit_points(S[ids],candidate[ids],scale_min=.55,scale_max=1.55)
+                pre_err=np.linalg.norm(candidate[ids]-coherent,axis=1)
+                pre_p95=float(np.percentile(pre_err,95)) if len(pre_err) else 0.0
+                if pre_p95<=0.00035:
+                    continue
+                sim_state=_source_relative_body_penetration_state(S[ids],coherent,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+                sim_required=np.asarray(sim_state["required"],dtype=np.float64)
+                if np.all(sim_required<=allowed[ids]+1e-12):
+                    delta=np.linalg.norm(coherent-candidate[ids],axis=1)
+                    if float(np.max(delta,initial=0.0))<=0.015:
+                        candidate[ids]=coherent
+        # A final exact audit is authoritative.  Any rare non-monotonic nearest-surface case that still
+        # worsens is returned all the way to the already-fitted pre-authority position.
+        final_state=_source_relative_body_penetration_state(S,candidate,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+        final_required=np.asarray(final_state["required"],dtype=np.float64)
+        still=final_required>allowed+1e-12
+        if np.any(still):
+            candidate[still]=B[still];alpha[still]=0.0
+            final_state=_source_relative_body_penetration_state(S,candidate,source_body_triangles,target_body_triangles,tolerance=tol,body_margin_m=tol)
+            final_required=np.asarray(final_state["required"],dtype=np.float64)
+        changed=alpha<1.0-1e-12
+        displacement=np.linalg.norm(A-candidate,axis=1)
+        out[name]=candidate
+        introduced_before=int(np.count_nonzero((proposed_required>allowed+1e-12)))
+        introduced_after=int(np.count_nonzero(final_required>allowed+1e-12))
+        total_restricted+=int(np.count_nonzero(changed));total_new_before+=introduced_before;total_new_after+=introduced_after
+        max_reverted=max(max_reverted,float(np.max(displacement,initial=0.0)))
+        reports[name]={
+            "before_penetrations":int(before_state["count"]),
+            "proposed_penetrations":int(proposed_state["count"]),
+            "final_penetrations":int(final_state["count"]),
+            "materially_worsened_before_veto":introduced_before,
+            "materially_worsened_after_veto":introduced_after,
+            "restricted_vertex_count":int(np.count_nonzero(changed)),
+            "hard_reverted_vertex_count":int(np.count_nonzero(still)),
+            "authority_fraction_p50":float(np.median(alpha[changed])) if np.any(changed) else 1.0,
+            "authority_fraction_min":float(np.min(alpha,initial=1.0)),
+            "veto_displacement_p95_mm":float(np.percentile(displacement[changed],95)*1000.0) if np.any(changed) else 0.0,
+            "veto_displacement_max_mm":float(np.max(displacement,initial=0.0)*1000.0),
+            "coherent_band_body_safe_rescues":coherent_band_rescues,
+            "coherent_band_body_safe_rescue_count":int(len(coherent_band_rescues)),
+        }
+    return out,{
+        "enabled":True,
+        "policy":"post-fit structural authority may preserve source structure only while not materially worsening the source-relative target-body relationship",
+        "allowed_worsening_mm":worsen*1000.0,
+        "restricted_vertex_count":int(total_restricted),
+        "materially_worsened_before_veto":int(total_new_before),
+        "materially_worsened_after_veto":int(total_new_after),
+        "veto_displacement_max_mm":max_reverted*1000.0,
+        "meshes":reports,
+    }
+
+
+def _preserve_final_source_attachment_continuity(source: Any, positions: dict[str,np.ndarray]) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Run the source-proven attachment closure only after all layer reconciliation is final.
+
+    Each mesh is welded before concatenation so duplicate raw storage/seam rows cannot manufacture
+    fake disconnected components.  Concatenating the welded meshes also lets real attachments cross
+    source mesh boundaries.  The corrected welded result is expanded back into the original raw
+    storage layout without changing topology or any non-position attribute.
+    """
+    if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    names=sorted(positions);parts=[];faces=[];meta=[];offset=0
+    for name in names:
+        data=source.data(name);w=weld_mesh(data);source_w=np.asarray(w["V"],dtype=np.float64);current_w=_weld_positions_from_raw(w,np.asarray(positions[name],dtype=np.float64));F=np.asarray(w["F"],dtype=np.int64)
+        parts.append(source_w);faces.append(F+offset if len(F) else F);meta.append((name,w,offset,len(source_w),current_w));offset+=len(source_w)
+    if not parts:return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no welded garment vertices"}
+    source_all=np.vstack(parts);current_all=np.vstack([row[4] for row in meta]);faces_all=np.vstack(faces) if any(len(x) for x in faces) else np.zeros((0,3),dtype=np.int64)
+    corrected,report=preserve_source_proven_attachment_continuity(source_all,faces_all,current_all)
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};changed=[]
+    for name,w,start,count,_ in meta:
+        solved=np.asarray(corrected[start:start+count],dtype=np.float64);raw=expand_welded(w,solved)
+        if raw.shape!=out[name].shape:raise ValueError(f"{name}: final attachment closure expansion produced {raw.shape}, expected {out[name].shape}")
+        if not np.array_equal(raw,out[name]):changed.append(name)
+        out[name]=raw
+    report=dict(report);report["changed_meshes"]=changed;report["changed_mesh_count"]=len(changed);report["cross_mesh_capable"]=True
+    return out,report
+
+
+def _gather_layer_positions_from_meshes(layers: list[GarmentLayer], positions: dict[str,np.ndarray]) -> dict[str,B14LayerResult]:
+    """Rebuild layer-coordinate arrays after universal refit so authored layer ordering can be revalidated."""
+    out={}
+    for layer in layers:
+        parts=[]
+        for member in layer.members:
+            ids=np.asarray(member.vertex_ids,dtype=np.int64)
+            parts.append(np.asarray(positions[member.mesh_name],dtype=np.float64)[ids])
+        V=np.vstack(parts) if parts else np.zeros((0,3),dtype=np.float64)
+        out[layer.stable_id]=B14LayerResult(layer.stable_id,_readonly_array(V),"universal_coherent_refit",float(layer.source_clearance_median_mm),float(layer.source_clearance_p95_mm),0.0,{"mode":"universal_coherent_refit"})
+    return out
+
+def _retarget_frozen_layer_skinning(source: Any, positions: dict[str,np.ndarray], cache: dict[str,Any], source_body_triangles: np.ndarray):
+    """Retarget weights once, after final geometry is frozen. This function never edits positions."""
+    before={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
+    skinning={};records={}
+    for name,final_pos in positions.items():
+        data=source.data(name);w=weld_mesh(data);behavior,features,labels,classes,details=infer_shell_behavior(w,source_body_triangles)
+        weights,stage=_retarget_garment_skinning(np.asarray(final_pos,dtype=np.float64),np.asarray(data["V"],dtype=np.float64),np.asarray(data["W"],dtype=np.float64),list(data["joint_names"]),cache,behavior,behavior,labels,classes,w["raw_to_weld"])
+        skinning[name]={"weights":weights,"joint_names":list(data["joint_names"]),"stage":stage}
+        records[name]={"behavior":behavior,"features":features,"component_count":len(details),"skinning":stage}
+    for name in positions:
+        if not np.array_equal(before[name],np.asarray(positions[name])):
+            raise AssertionError(f"Skinning retarget moved geometry for {name}; geometry must be frozen before skinning.")
+    return skinning,records
+
+
+def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names: set[str], mesh_filter: set[str] | None=None):
+    """Discover authored layers, run untouched strict B14 independently, freeze, reconcile, then skin once."""
+    X=cache["X"];Y=cache["Y"];BW=cache["BW"];NS=cache["NS"];NT=cache["NT"];names=list(cache["names"])
+    local_affines=cache.get("_ravafit_local_affines")
+    if local_affines is None:
+        local_affines=precompute_body_local_affines(X,Y,BW);cache["_ravafit_local_affines"]=local_affines
+    A,quality,tree=local_affines
+    axes=skeleton_bone_axes(source,names)
+    source_tri=cache.get("_ravafit_strict_source_surface_triangles")
+    if source_tri is None:source_tri=_triangles_from_surface(cache.get("_ravafit_strict_source_surface_V",cache["source_support_V"]),cache.get("_ravafit_strict_source_surface_F",cache["source_support_F"]))
+    target_tri=cache.get("_ravafit_strict_target_surface_triangles")
+    if target_tri is None:target_tri=_triangles_from_surface(cache.get("_ravafit_strict_target_surface_V",cache["target_support_V"]),cache.get("_ravafit_strict_target_surface_F",cache["target_support_F"]))
+    target_collision_tri=cache.get("_ravafit_target_collision_triangles")
+    if target_collision_tri is None:
+        suppression=cache.get("_ravafit_source_body_suppression") or {}
+        target_collision_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
+        cache["_ravafit_target_collision_triangles"]=target_collision_tri
+
+    layers,_=_infer_garment_layers(source,body_mesh_names,mesh_filter,source_tri)
+    if not layers:raise ValueError("No garment layers were inferred after removing the source body.")
+    layers,relations=_infer_layer_order_graph(source,layers,source_tri)
+    frozen={};layer_diagnostics=[]
+    # B14 layer solves are independent by invariant, so solve structural/cloth layers before large
+    # waves of rigid ornament layers. This keeps expensive historical flexible/shell solves in a
+    # clean numerical state without allowing solve order to affect geometry or authority.
+    solve_layers=sorted(layers,key=lambda layer:(layer.structural_classification=="rigid_assembly", layer.stable_id))
+    for layer in solve_layers:
+        member_results=[];member_stages=[];layer_started=time.perf_counter()
+        for member in layer.members:
+            data=_layer_member_virtual_data(source,layer,member)
+            component_id=member.stable_component_id
+            _assert_finite_stage(component_id,"component source import",data["V"])
+            source_w=weld_mesh(data);_assert_finite_stage(component_id,"component welding",source_w["V"])
+            thin=_infer_thin_volume_surface(source_w,source_tri)
+            solve_data=data;w=source_w
+            if thin is not None:
+                solve_data=_thin_volume_surface_data(source_w,thin,component_id+"::garment-surface")
+                w=weld_mesh(solve_data);_assert_finite_stage(component_id,"thin-volume garment surface",w["V"])
+            Wg,_=_finite_stage_call(component_id,"component body-weight transfer",lambda w=w:solver_body_weights(w["V"],X,BW,tree))
+            base_result=_finite_stage_call(component_id,"strict historical local body-field mapping",lambda w=w,Wg=Wg:local_body_field_map_soft(w["V"],Wg,X,Y,BW,A,tree=tree,tau=.004))
+            base,contact,_,_,_,_=base_result
+            behavior,features,labels,classes,details=infer_shell_behavior(w,source_tri)
+            member_shape=_structural_component_features(np.asarray(w["V"],dtype=np.float64),np.asarray(w["F"],dtype=np.int64))
+            compact_strip=(float(member_shape.get("max_extent",0.0))<=.055 and float(member_shape.get("middle_ratio",1.0))<=.40 and float(member_shape.get("thin_ratio",1.0))<=.10)
+            if member.structural_classification in {"rigid_detail","ribbon_or_strap"} or compact_strip:
+                behavior="conservative_component_assembly"
+                if member.structural_classification=="rigid_detail":
+                    classes={int(c):"rigid" for c in np.unique(labels)}
+            started=time.perf_counter()
+            U,ids,F,stage=_finite_stage_call(component_id,"strict frozen B14 component solve",lambda solve_data=solve_data,w=w,Wg=Wg,base=base,contact=contact,labels=labels,classes=classes,features=features,behavior=behavior,component_id=component_id:_strict_frozen_b14_solve(source,component_id,solve_data,w,Wg,base,contact,X,Y,BW,NS,NT,names,axes,source_tri,target_tri,labels,classes,features,behavior))
+            elapsed=time.perf_counter()-started
+            solved_w=expand_welded(w,U);_assert_finite_stage(component_id,"strict frozen B14 component expansion",solved_w)
+            if thin is not None:
+                reconstructed=_finite_stage_call(component_id,"source-authored thin-volume reconstruction",lambda source_w=source_w,thin=thin,solved_w=solved_w:_reconstruct_thin_volume_from_surface(source_w,thin,solved_w))
+                raw=expand_welded(source_w,reconstructed)
+                thin_stage={k:v for k,v in thin.items() if k not in {"outer_ids","outer_faces"}}
+                stage={"mode":"source_authored_thin_volume","surface_behavior":behavior,"thin_volume":thin_stage,"b14":stage}
+            else:
+                raw=solved_w
+            _assert_finite_stage(component_id,"strict frozen B14 final component expansion",raw)
+            if raw.shape!=data["V"].shape:raise ValueError(f"{component_id} strict B14 produced {raw.shape}, expected {data['V'].shape}")
+            member_results.append(np.asarray(raw,dtype=np.float64))
+            member_stages.append({
+                "component_id":component_id,"mesh_name":member.mesh_name,"component_index":int(member.component_index),
+                "structural_classification":member.structural_classification,"behavior":behavior,"solve_time_sec":float(elapsed),
+                "thin_volume":bool(thin is not None),
+                "source_clearance_median_mm":float(member.source_clearance_median_mm),"source_clearance_p95_mm":float(member.source_clearance_p95_mm),"stage":stage,
+            })
+        raw=np.vstack(member_results) if member_results else np.zeros((0,3),dtype=np.float64)
+        elapsed=time.perf_counter()-layer_started
+        behaviors=sorted({str(row["behavior"]) for row in member_stages})
+        behavior=behaviors[0] if len(behaviors)==1 else "component_independent:"+",".join(behaviors)
+        stage={"mode":"strict_component_independent_layer","components":member_stages}
+        frozen[layer.stable_id]=B14LayerResult(layer.stable_id,_readonly_array(raw),behavior,float(layer.source_clearance_median_mm),float(layer.source_clearance_p95_mm),float(elapsed),stage)
+        layer_diagnostics.append({"layer_id":layer.stable_id,"components":list(layer.connected_components),"source_meshes":list(layer.source_meshes),"materials":list(layer.materials),"structural_classification":layer.structural_classification,"source_ordering_relationships":list(layer.source_ordering_relationships),"b14_behavior":behavior,"source_clearance_median_mm":float(layer.source_clearance_median_mm),"source_clearance_p95_mm":float(layer.source_clearance_p95_mm),"source_signed_clearance_median_mm":float(layer.source_signed_clearance_median_mm),"b14_solve_time_sec":float(elapsed),"stage":stage})
+
+    source_layer_geometry={layer.stable_id:_layer_geometry_from_source(source,layer) for layer in layers}
+    final_layers,reconciliation=_reconcile_frozen_b14_layers(layers,frozen,relations,target_collision_tri,displacement_cap_m=.0020,source_layer_geometry=source_layer_geometry,source_body_triangles=source_tri)
+    positions=_scatter_layer_positions_to_meshes(source,layers,final_layers)
+    positions,local_retarget=_apply_b14_local_structural_retarget(source,positions,cache,source_tri,target_collision_tri,source_asset_has_embedded_body=bool(body_mesh_names))
+    # The universal field is allowed to change fit, but never authored assembly ordering. Re-run only
+    # the tiny relationship/body reconciler after the fit so layered garments remain one construction.
+    post_universal_frozen=_gather_layer_positions_from_meshes(layers,positions)
+    post_layers,post_universal_reconciliation=_reconcile_frozen_b14_layers(layers,post_universal_frozen,relations,target_collision_tri,displacement_cap_m=.0020,source_layer_geometry=source_layer_geometry,source_body_triangles=source_tri)
+    positions=_scatter_layer_positions_to_meshes(source,layers,post_layers)
+    # Local target-only relief (nipples, sharp body detail, similar small convexities) is collision
+    # evidence, not garment-shape authority.  Bridge only source-disproved convexities after the final
+    # fit, then run attachment closure last so straps/rings remain attached to that final shell.
+    positions,final_local_shell_bridge=_apply_final_local_shell_bridge(source,positions,source_tri,target_collision_tri,max_passes=8)
+    positions,support_stable_component_preserve=_preserve_support_stable_components(source,positions,cache,source_tri,target_collision_tri)
+    pre_structural_authority_positions={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
+    # Reassert disconnected unilateral leg-pair separation after every body/layer/reconciliation stage
+    # that can move medial edges.  Attachment closure stays last so source-proven physical joints keep
+    # their final construction authority.
+    positions,pre_attachment_unilateral_pair_separation=_preserve_final_unilateral_pair_separation(source,positions)
+    # Attachment continuity still closes genuine source-proven physical joints.  It is not allowed to
+    # become placement authority for nearby disconnected ornamentation.
+    positions,final_attachment_continuity=_preserve_final_source_attachment_continuity(source,positions)
+    # Attachment closure can perturb a previously-correct unilateral opening.  Reassert both its
+    # target-scaled separation and its short source-proximal similarity structure afterwards.
+    positions,final_unilateral_pair_separation=_preserve_final_unilateral_pair_separation(source,positions)
+    # Finally, compact disconnected details inherit the local frame of the now-final carrier surface.
+    # This keeps authored motifs/layout coherent without freezing the carrier's actual target refit.
+    positions,final_surface_relative_detail_layout=_preserve_final_surface_relative_detail_layout(source,positions)
+    # Individual compact details are not enough for authored multi-piece structures: nested ornaments,
+    # chain/link assemblies and broad carried cuffs now share one solved carrier frame so their internal
+    # shape/layout cannot drift while the underlying garment still genuinely refits the target.
+    positions,final_source_relative_structural_carriers=_preserve_final_source_relative_structural_carriers(source,positions)
+    # Structural carrier placement never owns bilateral separation; reassert the target-scaled floor.
+    positions,post_detail_unilateral_pair_separation=_preserve_final_unilateral_pair_separation(source,positions,preserve_proximal_structure=False)
+    # Structural preservation must never trade a clean target fit for a prettier source-relative shape.
+    # Backtrack only the post-fit structural delta where literal body evidence proves it made the
+    # already-resolved source-relative body relationship worse.
+    positions,final_structural_body_veto=_veto_worsened_source_relative_body_penetration(source,pre_structural_authority_positions,positions,source_tri,target_collision_tri)
+    skinning,mesh_skin_records=_retarget_frozen_layer_skinning(source,positions,cache,source_tri)
+    records={}
+    for layer_diag in layer_diagnostics:
+        rr=reconciliation["layers"][layer_diag["layer_id"]]
+        layer_diag.update({"post_b14_reconciliation_vertex_count":int(rr["reconciled_vertices"]),"reconciliation_p50_mm":float(rr["p50_mm"]),"reconciliation_p95_mm":float(rr["p95_mm"]),"reconciliation_max_mm":float(rr["max_mm"]),"reconciliation_warning":bool(rr["warning"]),
+                           "layer_order_violations_before":int(rr["layer_order_violations_before"]),"layer_order_violations_after":int(rr["layer_order_violations_after"]),
+                           "body_penetrations_before":int(rr["body_penetrations_before"]),"body_penetrations_after":int(rr["body_penetrations_after"])})
+        print(f"[RavaFit layer] {layer_diag['layer_id']} components={layer_diag['components']} behavior={layer_diag['b14_behavior']} "
+              f"clearance_p50/p95={layer_diag['source_clearance_median_mm']:.3f}/{layer_diag['source_clearance_p95_mm']:.3f} mm "
+              f"B14={layer_diag['b14_solve_time_sec']:.3f}s reconcile_vertices={layer_diag['post_b14_reconciliation_vertex_count']} "
+              f"reconcile_p50/p95/max={layer_diag['reconciliation_p50_mm']:.3f}/{layer_diag['reconciliation_p95_mm']:.3f}/{layer_diag['reconciliation_max_mm']:.3f} mm "
+              f"order={layer_diag['layer_order_violations_before']}->{layer_diag['layer_order_violations_after']} body={layer_diag['body_penetrations_before']}->{layer_diag['body_penetrations_after']}",
+              file=sys.stderr,flush=True)
+    for warning in reconciliation.get("warnings",[]):
+        print(f"[RavaFit layer WARNING] {warning}",file=sys.stderr,flush=True)
+    for name in positions:
+        records[name]={"mode":"strict_layered_b14","layers":[layer.stable_id for layer in layers if name in layer.source_meshes],**mesh_skin_records[name]}
+    stats={
+        "strict_frozen_b14":True,"strict_layer_orchestration":True,
+        "principle":"B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.",
+        "strict_contract_report":cache.get("_ravafit_strict_b14_report"),
+        "garment_layer_count":len(layers),"layer_order_relation_count":len(relations),
+        "layers":layer_diagnostics,
+        "layer_order_graph":[{k:v for k,v in relation.items() if k!="source_gap"} for relation in relations],
+        "reconciliation":reconciliation,
+        "local_structural_retarget":local_retarget,
+        "post_universal_reconciliation":post_universal_reconciliation,
+        "final_local_shell_bridge":final_local_shell_bridge,
+        "support_stable_component_preserve":support_stable_component_preserve,
+        "pre_attachment_unilateral_pair_separation":pre_attachment_unilateral_pair_separation,
+        "final_source_attachment_continuity":final_attachment_continuity,
+        "final_unilateral_pair_separation":final_unilateral_pair_separation,
+        "final_surface_relative_detail_layout":final_surface_relative_detail_layout,
+        "final_source_relative_structural_carriers":final_source_relative_structural_carriers,
+        "post_detail_unilateral_pair_separation":post_detail_unilateral_pair_separation,
+        "final_structural_body_veto":final_structural_body_veto,
+        "local_affine_quality_rms_mm":float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0),
+        "garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning),
+        "post_b14_geometry_mutation":"bounded_layer_reconciler_then_evidence_gated_local_retarget_then_iterative_local_shell_bridge_then_support_stable_component_preserve_then_unilateral_proximal_guard_then_source_attachment_closure_then_unilateral_proximal_reassert_then_surface_relative_detail_layout_then_source_relative_structural_carriers_then_final_unilateral_floor_then_source_relative_body_veto",
+        "post_b14_body_or_macro_solver_called":False,
+        "skinning_after_geometry_freeze":True,
+    }
+    return positions,skinning,records,stats
+
+
+_STRICT_B14_INPROCESS_LOCK=threading.RLock()
+
+def _strict_frozen_flexible_inprocess(w: dict[str,Any], Wg: np.ndarray, base: np.ndarray, axes: np.ndarray, target_tri: np.ndarray, labels: np.ndarray, features: dict[str,Any]):
+    """Run the exact frozen flexible function in-process with Runtime11 patches temporarily removed.
+
+    This avoids repeated heavyweight child-process startup for large flexible layers while preserving
+    frozen B14 semantics.  Every monkey-patched import surface touched by ``b14_compat`` is restored
+    to its original function for the duration of the call, under a process-wide lock, then restored
+    exactly afterward.  Frozen source files remain untouched.
+    """
+    import b14_compat as compat
+    with _STRICT_B14_INPROCESS_LOCK:
+        worker=compat._worker
+        saved={
+            "worker_nearest":worker.nearest_surface,
+            "worker_refine_component":worker.refine_component,
+            "worker_refine_lobofit":worker.refine_lobofit,
+            "worker_collision":worker.smooth_collision_polish,
+            "collision_nearest":compat._collision_eval.nearest_surface,
+            "construction_nearest":compat._construction_fields.nearest_surface,
+            "lobofit_nearest":compat._lobofit_official.nearest_surface,
+        }
+        try:
+            worker.nearest_surface=compat._original_nearest_surface
+            worker.refine_component=compat._original_refine_component
+            worker.refine_lobofit=compat._original_refine_lobofit
+            worker.smooth_collision_polish=compat._original_smooth_collision_polish
+            compat._collision_eval.nearest_surface=compat._original_nearest_surface
+            compat._construction_fields.nearest_surface=compat._original_nearest_surface
+            compat._lobofit_official.nearest_surface=compat._original_nearest_surface
+            return worker.solve_flexible(w,Wg,base,axes,target_tri,labels,features)
+        finally:
+            worker.nearest_surface=saved["worker_nearest"]
+            worker.refine_component=saved["worker_refine_component"]
+            worker.refine_lobofit=saved["worker_refine_lobofit"]
+            worker.smooth_collision_polish=saved["worker_collision"]
+            compat._collision_eval.nearest_surface=saved["collision_nearest"]
+            compat._construction_fields.nearest_surface=saved["construction_nearest"]
+            compat._lobofit_official.nearest_surface=saved["lobofit_nearest"]
+
+def _strict_frozen_b14_solve(source: Any, name: str, data: dict[str,Any], w: dict[str,Any], Wg: np.ndarray, base: np.ndarray, contact: np.ndarray, X: np.ndarray, Y: np.ndarray, BW: np.ndarray, NS: np.ndarray, NT: np.ndarray, names: list[str], axes: np.ndarray, source_tri: np.ndarray, target_tri: np.ndarray, labels: np.ndarray, classes: dict[int,str], features: dict[str,Any], behavior: str):
+    """Execute untouched historical B14 behaviour for one frozen layer.
+
+    Conservative component assembly is intentionally executed in-process.  Frozen B14's
+    ``solve_conservative`` is geometry-local: it only applies the already-computed body field and
+    rigid Kabsch fits; it does not call the Runtime11-patched collision/refinement machinery.
+    Running that exact function directly avoids spawning hundreds of short-lived Python workers for
+    buckles, trims and other disconnected rigid details while keeping cloth/shell solves isolated.
+    Structured/flexible behaviours still execute in the clean worker whose import path excludes
+    ``b14_compat``.
+    """
+    if behavior not in {"constructed_close_shell","stand_off_structured_shell","body_following_flexible_layer"}:
+        started=time.perf_counter()
+        U,ids,F,stage=solve_conservative(w,Wg,base,labels,classes,features)
+        _assert_finite_stage(name,"strict frozen B14 direct conservative solve",U)
+        return np.asarray(U,dtype=np.float64),np.asarray(ids,dtype=np.int64),np.asarray(F,dtype=np.int64),{
+            "mode":"strict_frozen_b14_direct_conservative",
+            "solve":stage,
+            "worker":{"wall_sec":float(time.perf_counter()-started),"in_process":True,"exact_frozen_function":True},
+        }
+    if behavior=="body_following_flexible_layer":
+        started=time.perf_counter()
+        U,ids,F,stage=_strict_frozen_flexible_inprocess(w,Wg,base,axes,target_tri,labels,features)
+        _assert_finite_stage(name,"strict frozen B14 in-process flexible solve",U)
+        return np.asarray(U,dtype=np.float64),np.asarray(ids,dtype=np.int64),np.asarray(F,dtype=np.int64),{
+            "mode":"strict_frozen_b14_inprocess_flexible",
+            "solve":stage,
+            "worker":{"wall_sec":float(time.perf_counter()-started),"in_process":True,"runtime11_patches_temporarily_removed":True},
+        }
+
+    # Structured B14 remains process-isolated so Runtime11 compatibility patches can never
+    # affect its historical refinement/collision behaviour.
+
+    worker=_MODULE_DIR/'strict_b14_shell_worker.py'
+    if not worker.exists():raise FileNotFoundError(worker)
+    work_dir=Path(tempfile.mkdtemp(prefix='ravafit-strict-b14-'));input_path=work_dir/'input.npz';meta_path=work_dir/'meta.json';output_path=work_dir/'output.npz';stage_path=work_dir/'stage.json';started=time.perf_counter()
+    try:
+        np.savez_compressed(input_path,w_V=np.asarray(w['V'],dtype=np.float64),w_F=np.asarray(w['F'],dtype=np.int64),w_W=np.asarray(w.get('W',np.zeros((len(w['V']),0))),dtype=np.float64),Wg=np.asarray(Wg,dtype=np.float64),base=np.asarray(base,dtype=np.float64),contact=np.asarray(contact,dtype=np.int64),X=np.asarray(X,dtype=np.float64),Y=np.asarray(Y,dtype=np.float64),BW=np.asarray(BW,dtype=np.float64),NS=np.asarray(NS,dtype=np.float64),NT=np.asarray(NT,dtype=np.float64),axes=np.asarray(axes,dtype=np.float64),source_tri=np.asarray(source_tri,dtype=np.float64),target_tri=np.asarray(target_tri,dtype=np.float64),labels=np.asarray(labels,dtype=np.int64))
+        meta={'source_js':source.js,'w_joint_names':list(w.get('joint_names',[])),'names':list(names),'features':_strict_json_safe(features),'classes':{str(k):str(v) for k,v in classes.items()},'behavior':str(behavior),'material':str(data.get('material','')),'mesh_name':str(name)}
+        meta_path.write_text(json.dumps(meta,separators=(',',':')),encoding='utf-8')
+        env=os.environ.copy();env.update({'OMP_NUM_THREADS':'1','MKL_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1','NUMEXPR_NUM_THREADS':'1'})
+        creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0) if sys.platform.startswith('win') else 0
+        proc=subprocess.run([sys.executable,str(worker),str(input_path),str(meta_path),str(output_path),str(stage_path)],capture_output=True,text=True,timeout=240,creationflags=creationflags,env=env)
+        if proc.returncode!=0 or not output_path.exists():raise RuntimeError(f"strict frozen B14 worker exited {proc.returncode}: {(proc.stderr or proc.stdout)[-3000:]}")
+        with np.load(output_path,allow_pickle=False) as out:
+            U=np.asarray(out['U'],dtype=np.float64).copy();ids=np.asarray(out['ids'],dtype=np.int64).copy();F=np.asarray(out['F'],dtype=np.int64).copy()
+        payload=json.loads(stage_path.read_text(encoding='utf-8')) if stage_path.exists() else {};stage=payload.get('stage',{});stage={'mode':'strict_frozen_b14','solve':stage,'worker':{'wall_sec':time.perf_counter()-started,'worker_sec':payload.get('elapsed_sec'),'pid':payload.get('pid')}}
+        return U,ids,F,stage
+    finally:
+        shutil.rmtree(work_dir,ignore_errors=True)
+
+
 def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: set[str], mesh_filter: set[str] | None = None, _skip_final_assembly: bool = False):
     _warm_tri=np.asarray([[[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,1.0,0.0]]],dtype=np.float64)
     _b14_nearest_surface(np.asarray([[0.1,0.1,0.1]],dtype=np.float64),_warm_tri,k=1)
@@ -3280,8 +5729,9 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
     NS = cache["NS"]
     NT = cache["NT"]
     names = list(cache["names"])
+    strict_b14_contract=bool(cache.get("_ravafit_strict_b14_contract",False))
     dense_vanilla_proxy=bool(cache.get("dense_vanilla_source_proxy",False))
-    modded_coverage_finalizer=not dense_vanilla_proxy
+    modded_coverage_finalizer=not dense_vanilla_proxy and not strict_b14_contract
     local_affines=cache.get("_ravafit_local_affines")
     if local_affines is None:
         local_affines=precompute_body_local_affines(X,Y,BW);cache["_ravafit_local_affines"]=local_affines
@@ -3345,6 +5795,21 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
         _assert_finite_stage(name, "body-weight transfer", Wg)
         base_result = _finite_stage_call(name, "local body-field mapping", lambda: local_body_field_map_soft(w["V"], Wg, X, Y, BW, A, tree=tree, tau=.004))
         base, contact, _, _, relief_blend, relief_ids = base_result
+        if strict_b14_contract:
+            _assert_finite_stage(name,"strict historical local body-field mapping",base)
+            behavior,features,labels,classes,details=infer_shell_behavior(w,source_tri)
+            U,ids,F,stage=_finite_stage_call(name,"strict frozen B14 solve",lambda:_strict_frozen_b14_solve(source,name,data,w,Wg,base,contact,X,Y,BW,NS,NT,names,axes,source_tri,target_tri,labels,classes,features,behavior))
+            _assert_finite_stage(name,"strict frozen B14 solve",U)
+            raw=expand_welded(w,U)
+            if raw.shape!=data["V"].shape:raise ValueError(f"Strict B14 produced invalid geometry shape for {name}: {raw.shape} vs {data['V'].shape}")
+            _assert_finite_stage(name,"strict frozen B14 expansion",raw)
+            retargeted_weights,skinning_stage=_retarget_garment_skinning(raw,data["V"],data["W"],data["joint_names"],cache,behavior,behavior,labels,classes,w["raw_to_weld"])
+            _assert_finite_stage(name,"strict frozen B14 skinning retarget",retargeted_weights)
+            positions[name]=raw;skinning[name]={"weights":retargeted_weights,"joint_names":list(data["joint_names"]),"stage":skinning_stage}
+            layer_meshes[name]={"V":np.asarray(data["V"],dtype=np.float64),"F":np.asarray(data["F"],dtype=np.int64)}
+            retarget_contexts[name]={"data":data,"w":w,"behavior":behavior,"effective_behavior":behavior,"features":features,"labels":labels,"classes":classes}
+            records[name]={"mode":"solved","behavior":behavior,"inferred_behavior":behavior,"features":features,"component_count":len(details),"target_relief":{"enabled":False,"reason":"strict frozen B14 contract"},"surface_frame":{"enabled":False,"reason":"strict frozen B14 contract"},"stage":stage,"skinning":skinning_stage}
+            continue
         macro_result, macro_field = _finite_stage_call(name, "extreme macro body-field mapping", lambda: _extreme_macro_body_field(w["V"], Wg, cache))
         if macro_result is not None:
             base, contact, _, _, relief_blend, relief_ids = macro_result
@@ -3374,6 +5839,9 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
             U, stage = _finite_stage_call(name, "anchored free-panel solve", lambda: _solve_anchored_free_panel(w, base, cache["source_surface_V"])); effective_behavior = "anchored_free_panel"
         elif _use_rigid_component_preservation(behavior, features, details):
             U, stage = _finite_stage_call(name, "rigid-component solve", lambda: _solve_component_rigid_preservation(w, base, labels)); effective_behavior = "rigid_component_preservation"
+        elif _use_fragmented_decorated_shell_frame(behavior,features,details):
+            U, ids, F, frame_stage = _finite_stage_call(name, "fragmented decorated structural frame", lambda: solve_conservative(w,Wg,base,labels,classes,features))
+            stage={"mode":"fragmented_decorated_structural_frame","original_behavior":behavior,"component_count":int(features.get("component_count",0)),"root_vertices":int(features.get("root_vertices",0)),"solve":frame_stage};effective_behavior="fragmented_decorated_structural_frame"
         elif peer_ids and behavior in {"stand_off_structured_shell","constructed_close_shell"}:
             U, ids, stage = _finite_stage_call(name, "independent peer-shell group solve", lambda: _solve_peer_shell_group_fresh(source,w,Wg,base,contact,X,Y,BW,NS,NT,names,axes,source_tri,target_tri,labels,features,behavior,peer_ids))
             F=np.empty((0,3),dtype=np.int64)
@@ -3531,8 +5999,8 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
     if not positions:
         raise ValueError("No garment meshes were eligible for B14 fitting after removing the source body.")
     local_rms=float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0)
-    if _skip_final_assembly:
-        return positions,skinning,records,{"preassembly_only":True,"local_affine_quality_rms_mm":local_rms,"garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning)}
+    if strict_b14_contract or _skip_final_assembly:
+        return positions,skinning,records,{"preassembly_only":bool(_skip_final_assembly),"strict_frozen_b14":bool(strict_b14_contract),"strict_contract_report":cache.get("_ravafit_strict_b14_report"),"local_affine_quality_rms_mm":local_rms,"garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning),"post_b14_geometry_mutation":False}
     return _finalize_garment_solution(source,cache,positions,skinning,records,local_rms)
 
 
@@ -4613,6 +7081,53 @@ def _strict_json_safe(value: Any) -> Any:
     return value
 
 
+def _support_equivalent_source_preserve_decision(cache: dict[str,Any], *, max_rms_mm: float=3.25, max_spatial_p95_mm: float=6.50) -> dict[str,Any]:
+    """Decide whether every selected source->target support region is close enough to preserve garment geometry exactly.
+
+    This is deliberately slot-agnostic.  If *all* selected body regions move only a few millimetres and
+    their correspondence remains locally coherent, solving can do more harm than good to authored
+    structures such as heels, rigid footwear, cuffs and accessories.  In that case the garment itself
+    remains untouched while normal body detach/transplant still proceeds.
+    """
+    rows=list(cache.get("slot_stats") or [])
+    if not rows:
+        return {"eligible":False,"reason":"no slot support statistics","slots":[]}
+    if bool(cache.get("dense_cross_sex_source_proxy",False)):
+        return {"eligible":False,"reason":"cross-sex dense support requires a real refit","slots":rows}
+    reports=[]
+    eligible=True
+    for row in rows:
+        rms=float(row.get("displacement_rms_mm",float("inf")))
+        raw_rms=float(row.get("raw_displacement_rms_mm",rms))
+        spatial_p95=float(row.get("chosen_spatial_p95_mm",float("inf")))
+        finite=bool(np.isfinite(rms) and np.isfinite(raw_rms) and np.isfinite(spatial_p95))
+        slot_ok=finite and rms<=float(max_rms_mm) and raw_rms<=float(max_rms_mm) and spatial_p95<=float(max_spatial_p95_mm)
+        reports.append({"slot":str(row.get("slot") or "Body"),"eligible":bool(slot_ok),"displacement_rms_mm":rms,"raw_displacement_rms_mm":raw_rms,"chosen_spatial_p95_mm":spatial_p95})
+        eligible=eligible and slot_ok
+    return {"eligible":bool(eligible),"reason":"all selected body supports are materially equivalent" if eligible else "at least one selected body support changes materially","max_rms_mm":float(max_rms_mm),"max_spatial_p95_mm":float(max_spatial_p95_mm),"slots":reports}
+
+
+def _source_preserved_garment_solution(source: Any, body_mesh_names: set[str], mesh_filter: set[str] | None=None):
+    positions={};skinning={};records={}
+    for name in source.mesh_names():
+        if name in body_mesh_names or (mesh_filter is not None and name not in mesh_filter):
+            continue
+        data=source.data(name)
+        V=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64);W=np.asarray(data.get("W",[]),dtype=np.float64)
+        if len(V)==0 or len(F)==0:
+            continue
+        if W.ndim!=2 or W.shape[0]!=len(V):
+            raise ValueError(f"{name}: source-preserve lane requires valid authored skinning weights.")
+        positions[name]=V.copy()
+        stage={"mode":"source_preserved_support_equivalent","policy":"source and target support regions are materially equivalent; preserve authored garment geometry and skinning exactly"}
+        skinning[name]={"weights":W.copy(),"joint_names":list(data.get("joint_names") or []),"stage":stage}
+        records[name]={"mode":"source_preserved_support_equivalent","behavior":"source_preserved","stage":stage,"skinning":stage}
+    if not positions:
+        raise ValueError("No garment meshes were eligible for source-preserve conversion after removing the source body.")
+    stats={"support_equivalent_source_preserve":{"enabled":True,"mesh_count":len(positions),"meshes":sorted(positions),"policy":"skip geometric refit when every selected source->target body support is materially equivalent; body detach/transplant remains authoritative"},"garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning),"post_b14_geometry_mutation":False}
+    return positions,skinning,records,stats
+
+
 def convert(spec: dict[str, Any]) -> dict[str, Any]:
     source_glb = Path(spec["source_glb"]).resolve()
     output_glb = Path(spec["output_glb"]).resolve()
@@ -4639,6 +7154,8 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
     race_retarget_context=_race_retarget_context(spec,names_for_rig)
     race_retarget_report=_retarget_loaded_source_glb(source,race_retarget_context) if race_retarget_context is not None else {"enabled":False}
     names, cache, source_materials, source_materials_by_slot, target_materials_by_slot, target_mesh_materials_by_slot, payload_details = _load_pairs(spec, names_for_rig, source)
+    cache=dict(cache)
+    _attach_target_auxiliary_obstacles(cache,target_glbs_by_slot,payload_details)
     if model_slot not in target_materials_by_slot:
         raise ValueError(f"The selected model is a {model_slot} model, but no {model_slot} body target was selected.")
 
@@ -4657,11 +7174,24 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
     suppression_plan=_complete_vanilla_target_body_plan(cache,present_source_slots) if dense_vanilla else _source_body_suppression_plan(source,cache,source_by_slot,present_source_slots,body_mesh_names,mesh_filter)
     cache["_ravafit_source_body_suppression"]=suppression_plan
     cache.pop("_ravafit_target_collision_triangles",None)
-    solve_source=_DenseVanillaGarmentSource(source,body_mesh_names) if dense_vanilla else source
+    strict_b14_contract=bool(cache.get("_ravafit_strict_b14_contract",False))
+    if dense_vanilla:
+        solve_source=_DenseVanillaGarmentSource(source,body_mesh_names)
+    elif strict_b14_contract:
+        solve_source=_IndexedRenderGarmentSource(source,body_mesh_names)
+    else:
+        solve_source=source
     dense_garment_report=solve_source.report if dense_vanilla else {}
+    indexed_garment_report=solve_source.report if strict_b14_contract else {}
+    support_equivalent_preserve=_support_equivalent_source_preserve_decision(cache)
     reference_retry = None
     try:
-        if not dense_vanilla and mesh_filter is None:
+        if support_equivalent_preserve.get("eligible",False):
+            positions,skinning,mesh_records,solve_stats=_source_preserved_garment_solution(source,body_mesh_names,mesh_filter)
+            solve_stats["support_equivalent_source_preserve"]["decision"]=support_equivalent_preserve
+        elif strict_b14_contract:
+            positions,skinning,mesh_records,solve_stats=_solve_strict_b14_layers(solve_source,cache,body_mesh_names,mesh_filter)
+        elif not dense_vanilla and mesh_filter is None:
             try:
                 positions,skinning,mesh_records,solve_stats=_solve_modded_garment_meshes_isolated(solve_source,cache,body_mesh_names,mesh_filter)
             except Exception as worker_error:
@@ -4670,7 +7200,10 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
                 solve_stats["garment_mesh_workers"]={"enabled":False,"fallback":"exact-in-process","error":str(worker_error)}
         else:
             positions, skinning, mesh_records, solve_stats = _solve_garment_meshes(solve_source, cache, body_mesh_names, mesh_filter)
-        if dense_vanilla:
+        if strict_b14_contract:
+            positions,skinning=_collapse_indexed_render_garment_solution(solve_source,positions,skinning)
+            solve_stats["indexed_render_garment_proxy"]={"enabled":True,"meshes":indexed_garment_report,"policy":"solve only triangle-referenced rendered vertices; restore exact authored raw storage afterward"}
+        elif dense_vanilla:
             positions,skinning=_collapse_dense_vanilla_garment_solution(solve_source,positions,skinning)
             original_contexts={name:{"data":source.data(name)} for name in positions if name in source.mesh_names()}
             positions,post_collapse_meshes,post_collapse_clearance=_dense_vanilla_expansion_clearance_guard(positions,original_contexts,cache)
@@ -4686,6 +7219,8 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
         race_retarget_context=_race_retarget_context(spec,names_for_rig)
         race_retarget_report=_retarget_loaded_source_glb(source,race_retarget_context) if race_retarget_context is not None else {"enabled":False}
         names, cache, source_materials, source_materials_by_slot, target_materials_by_slot, target_mesh_materials_by_slot, payload_details = _load_pairs(spec, names_for_rig, source)
+        cache=dict(cache)
+        _attach_target_auxiliary_obstacles(cache,target_glbs_by_slot,payload_details)
         body_mesh_names = set(_find_body_meshes(source, source_materials)) if source_contains_body else set()
         source_entries=_source_body_info(source,source_materials) if source_contains_body else []
         if source_entries:
@@ -4696,11 +7231,28 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
         suppression_plan=_complete_vanilla_target_body_plan(cache,present_source_slots) if dense_vanilla else _source_body_suppression_plan(source,cache,source_by_slot,present_source_slots,body_mesh_names,mesh_filter)
         cache["_ravafit_source_body_suppression"]=suppression_plan
         cache.pop("_ravafit_target_collision_triangles",None)
-        solve_source=_DenseVanillaGarmentSource(source,body_mesh_names) if dense_vanilla else source
+        strict_b14_contract=bool(cache.get("_ravafit_strict_b14_contract",False))
+        if dense_vanilla:
+            solve_source=_DenseVanillaGarmentSource(source,body_mesh_names)
+        elif strict_b14_contract:
+            solve_source=_IndexedRenderGarmentSource(source,body_mesh_names)
+        else:
+            solve_source=source
         dense_garment_report=solve_source.report if dense_vanilla else {}
+        indexed_garment_report=solve_source.report if strict_b14_contract else {}
+        support_equivalent_preserve=_support_equivalent_source_preserve_decision(cache)
         try:
-            positions, skinning, mesh_records, solve_stats = _solve_garment_meshes(solve_source, cache, body_mesh_names, mesh_filter)
-            if dense_vanilla:
+            if support_equivalent_preserve.get("eligible",False):
+                positions,skinning,mesh_records,solve_stats=_source_preserved_garment_solution(source,body_mesh_names,mesh_filter)
+                solve_stats["support_equivalent_source_preserve"]["decision"]=support_equivalent_preserve
+            elif strict_b14_contract:
+                positions, skinning, mesh_records, solve_stats = _solve_strict_b14_layers(solve_source, cache, body_mesh_names, mesh_filter)
+            else:
+                positions, skinning, mesh_records, solve_stats = _solve_garment_meshes(solve_source, cache, body_mesh_names, mesh_filter)
+            if strict_b14_contract:
+                positions,skinning=_collapse_indexed_render_garment_solution(solve_source,positions,skinning)
+                solve_stats["indexed_render_garment_proxy"]={"enabled":True,"meshes":indexed_garment_report,"policy":"solve only triangle-referenced rendered vertices; restore exact authored raw storage afterward"}
+            elif dense_vanilla:
                 positions,skinning=_collapse_dense_vanilla_garment_solution(solve_source,positions,skinning)
                 original_contexts={name:{"data":source.data(name)} for name in positions if name in source.mesh_names()}
                 positions,post_collapse_meshes,post_collapse_clearance=_dense_vanilla_expansion_clearance_guard(positions,original_contexts,cache)

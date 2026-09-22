@@ -63,12 +63,25 @@ def test_no_body_name_does_not_force_a_family():
     assert report.get("used") is False
 
 
+
+def test_generic_small_size_does_not_choose_bibo_leg_type_letter():
+    rows = [
+        _row("Bibo+", "Small Type A", "bibo-plus"),
+        _row("Bibo+", "Small Type B", "bibo-plus"),
+        _row("Bibo+", "Small Type C", "bibo-plus"),
+    ]
+    narrowed, report, authoritative = coverage._source_hint_candidates(rows, {"option": "Small", "group": "Bottom Size", "mod": "Dragon"})
+    assert {x["variant"] for x in narrowed} == {"Small Type A", "Small Type B", "Small Type C"}
+    assert authoritative is None
+    assert report.get("authoritative") is False
+
 def main():
     test_selected_option_body_family_is_authoritative_before_geometry()
     test_body_family_name_without_variant_keeps_only_that_family_for_geometry()
     test_group_body_name_is_used_when_option_has_no_family()
     test_mod_name_is_only_a_fallback()
     test_no_body_name_does_not_force_a_family()
+    test_generic_small_size_does_not_choose_bibo_leg_type_letter()
     print("source body name hint tests: PASS")
 
 

@@ -6,7 +6,7 @@ namespace RavaFit.Services;
 
 internal sealed class SolverHostService : IDisposable
 {
-    internal const string DefaultProductionRevision = "1.1.0-runtime-3";
+    internal const string DefaultProductionRevision = "1.1.1-multi-region-support-source-preserve";
     private static readonly string[] RequiredCapabilities =
     [
         "convert",

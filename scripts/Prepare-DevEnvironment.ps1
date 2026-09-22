@@ -9,8 +9,8 @@ $DevAssets = Join-Path $RepoRoot "DevAssets"
 $BodiesDir = Join-Path $DevAssets "Bodies"
 $RuntimeDir = Join-Path $DevAssets "Runtime"
 $IncomingDir = Join-Path $DevAssets "Incoming"
-$ExpectedRuntimeVersion = "1.1.0"
-$ExpectedProductionRevision = "1.1.0-runtime-3"
+$ExpectedRuntimeVersion = "1.1.1"
+$ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
 
 New-Item -ItemType Directory -Force -Path $BodiesDir, $IncomingDir | Out-Null
 
@@ -62,25 +62,39 @@ function Get-HostedBodies([string]$Destination) {
 }
 
 function Sync-RavaFitRuntimeCode([string]$Target) {
+    $solverSource = Join-Path $RepoRoot "runtime\solver"
     $solverTarget = Join-Path $Target "solver"
     $rbodyTarget = Join-Path $Target "rbody"
     $b14Target = Join-Path $Target "b14_frozen\scripts"
+
     New-Item -ItemType Directory -Force -Path $solverTarget, $rbodyTarget, $b14Target | Out-Null
 
-    foreach ($name in @(
-        'server.py','production_b14.py','b14_compat.py','coverage_analysis.py','native_body_graft.py','customise_mod.py',
-        'peer_shell_worker.py','peer_group_supervisor.py','shell_solve_worker.py','assembly_worker.py','coverage_clearance_worker.py',
-        'garment_mesh_worker.py','garment_finalize_worker.py','garment_group_supervisor.py'
-    )) {
-        Copy-Item -LiteralPath (Join-Path $RepoRoot "runtime\solver\$name") -Destination (Join-Path $solverTarget $name) -Force
+    Get-ChildItem -LiteralPath $solverSource -File -Filter "*.py" | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $solverTarget $_.Name) -Force
     }
-    foreach ($name in @('rbody_v3_loader.py','rbody_b14_adapter.py','prepare_b14_rbody_cache.py','rbody_v3_core.py')) {
+
+    foreach ($name in @(
+        'rbody_v3_loader.py',
+        'rbody_b14_adapter.py',
+        'prepare_b14_rbody_cache.py',
+        'rbody_v3_core.py'
+    )) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot "runtime\rbody\$name") -Destination (Join-Path $rbodyTarget $name) -Force
     }
-    foreach ($name in @('ffxiv_lobofit.py','b14_mesh_worker.py','structural_refine.py','construction_fields.py','collision_eval.py','lobofit_official_refine.py','glb_patch_legacy.py')) {
+
+    foreach ($name in @(
+        'ffxiv_lobofit.py',
+        'b14_mesh_worker.py',
+        'structural_refine.py',
+        'construction_fields.py',
+        'collision_eval.py',
+        'lobofit_official_refine.py',
+        'glb_patch_legacy.py'
+    )) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot "runtime\b14_frozen\scripts\$name") -Destination (Join-Path $b14Target $name) -Force
     }
 }
+
 
 function Update-RuntimeMarker([string]$Path) {
     try {

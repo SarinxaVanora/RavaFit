@@ -183,40 +183,331 @@ def _index_block(model: dict[str, Any], mesh_index: int) -> bytes:
     return bytes(model['data'][start:start + int(info['icount']) * 2])
 
 
-def _suppressed_index_block(model: dict[str, Any], mesh_index: int, triangles: list[int] | tuple[int, ...] | set[int]) -> bytes:
-    block=bytearray(_index_block(model,mesh_index));triangle_count=len(block)//6
+def _suppress_index_block(block: bytes, mesh_index: int, triangles: list[int] | tuple[int, ...] | set[int]) -> bytes:
+    block = bytearray(block)
+    triangle_count = len(block) // 6
     for triangle in sorted({int(value) for value in triangles}):
-        if triangle<0 or triangle>=triangle_count:raise ValueError(f'Suppressed native triangle {triangle} is outside mesh {mesh_index} ({triangle_count} triangles).')
-        offset=triangle*6;first=struct.unpack_from('<H',block,offset)[0];struct.pack_into('<HHH',block,offset,first,first,first)
+        if triangle < 0 or triangle >= triangle_count:
+            raise ValueError(f'Suppressed native triangle {triangle} is outside mesh {mesh_index} ({triangle_count} triangles).')
+        offset = triangle * 6
+        first = struct.unpack_from('<H', block, offset)[0]
+        struct.pack_into('<HHH', block, offset, first, first, first)
     return bytes(block)
+
+
+def _suppressed_index_block(model: dict[str, Any], mesh_index: int, triangles: list[int] | tuple[int, ...] | set[int]) -> bytes:
+    return _suppress_index_block(_index_block(model, mesh_index), mesh_index, triangles)
+
+
+def _position_array(model: dict[str, Any], mesh_index: int):
+    import numpy as np
+    info = model['infos'][0][mesh_index]
+    declarations = _parse_decl_elements(model['declarations'][mesh_index])
+    positions = next((item for item in declarations if item[3] == 0), None)
+    if positions is None:
+        raise ValueError(f'Native mesh {mesh_index} has no POSITION declaration in {model["path"]}.')
+    block, doff, typ, _, _ = positions
+    if block > 2 or int(info['stride'][block]) <= 0:
+        raise ValueError(f'Native mesh {mesh_index} has an invalid POSITION stream in {model["path"]}.')
+    base = model['lods'][0]['voff'] + int(info['vdo'][block])
+    values = np.asarray(_decode_attribute(model['data'], base, int(info['stride'][block]), doff, typ, int(info['vcount'])), dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] != int(info['vcount']) or values.shape[1] < 3:
+        raise ValueError(f'Native mesh {mesh_index} POSITION data is malformed in {model["path"]}.')
+    return values[:, :3]
+
+
+def _penumbra_normalised_index_topology(model: dict[str, Any], mesh_index: int) -> dict[str, Any]:
+    """Mirror the one topology normalisation Penumbra's glTF exporter performs that matters here.
+
+    SharpGLTF/Penumbra omits triangles whose vertices collapse to the exact same POSITION. XIV MDLs
+    can legitimately contain those zero-area triangles. They render nothing, but their omission changes
+    MeshPart/index counts on an MDL -> glTF -> MDL round trip. Build the canonical native index payload
+    after only those exporter-degenerate triangles are removed; any other topology difference remains fatal.
+    """
+    import numpy as np
+    info = model['infos'][0][mesh_index]
+    positions = _position_array(model, mesh_index)
+    raw = np.frombuffer(_index_block(model, mesh_index), dtype='<u2')
+    chunks: list[bytes] = []
+    part_counts: list[int] = []
+    part_offsets: list[int] = []
+    dropped: list[dict[str, int]] = []
+    running = 0
+    mesh_triangle_base = 0
+    for part_ordinal, part in enumerate(info.get('parts') or []):
+        relative = int(part['index_offset']) - int(info['idxoff'])
+        count = int(part['index_count'])
+        if relative < 0 or count < 0 or relative + count > len(raw) or count % 3:
+            raise ValueError(
+                f'Native mesh {mesh_index} part {part_ordinal} has invalid triangle range {relative}/{count} '
+                f'within {len(raw)} indices in {model["path"]}.'
+            )
+        triangles = raw[relative:relative + count].reshape((-1, 3))
+        keep = np.ones(len(triangles), dtype=bool)
+        for triangle_ordinal, triangle in enumerate(triangles):
+            if np.any(triangle >= len(positions)):
+                raise ValueError(f'Native mesh {mesh_index} part {part_ordinal} references a vertex outside {len(positions)} vertices.')
+            a, b, c = positions[triangle]
+            if np.array_equal(a, b) or np.array_equal(b, c) or np.array_equal(a, c):
+                keep[triangle_ordinal] = False
+                dropped.append({
+                    'part': part_ordinal,
+                    'part_triangle': triangle_ordinal,
+                    'mesh_triangle': mesh_triangle_base + triangle_ordinal,
+                })
+        filtered = np.asarray(triangles[keep], dtype='<u2').reshape(-1)
+        part_offsets.append(running)
+        part_counts.append(int(filtered.size))
+        running += int(filtered.size)
+        chunks.append(filtered.tobytes())
+        mesh_triangle_base += len(triangles)
+    return {
+        'block': b''.join(chunks),
+        'part_offsets': part_offsets,
+        'part_counts': part_counts,
+        'dropped': dropped,
+    }
 
 
 def _mapping_from_report(report: dict[str, Any], target_body_mdls: dict[str, str]) -> list[dict[str, Any]]:
     inserted = list(((report.get('transplant') or {}).get('inserted') or []))
     if not inserted:
         raise ValueError('Conversion report contains no transplanted body meshes to graft.')
+
     by_output: dict[int, dict[str, Any]] = {}
     for row in inserted:
         parsed = _parse_mesh_name(row.get('name', ''))
         if parsed is None:
             raise ValueError(f'Conversion report contains an invalid output mesh name: {row.get("name")!r}')
-        output_mesh, _ = parsed
+
+        reported_output_mesh, _ = parsed
         slot = str(row.get('slot') or '')
         if slot not in target_body_mdls:
             raise ValueError(f'No native target MDL was supplied for transplanted slot {slot!r}.')
+
         native_mesh = int(row['target_xiv_mesh_index'])
         candidate = {
             'slot': slot,
-            'output_mesh': output_mesh,
+            'reported_output_mesh': reported_output_mesh,
+            'output_mesh': reported_output_mesh,
             'native_mesh': native_mesh,
             'native_mdl': str(Path(target_body_mdls[slot]).resolve()),
         }
-        existing = by_output.get(output_mesh)
+
+        existing = by_output.get(reported_output_mesh)
         if existing is not None and existing != candidate:
-            raise ValueError(f'Output XIV mesh {output_mesh} maps to conflicting native target meshes: {existing} vs {candidate}')
-        by_output[output_mesh] = candidate
+            raise ValueError(
+                f'Reported XIV mesh {reported_output_mesh} maps to conflicting native target meshes: '
+                f'{existing} vs {candidate}'
+            )
+
+        by_output[reported_output_mesh] = candidate
+
     return [by_output[key] for key in sorted(by_output)]
 
+
+def _mesh_part_layout(model: dict[str, Any], mesh_index: int) -> tuple[tuple[int, int], ...]:
+    info = model['infos'][0][mesh_index]
+    base = int(info['idxoff'])
+    return tuple(
+        (
+            int(part['index_offset']) - base,
+            int(part['index_count']),
+        )
+        for part in (info.get('parts') or [])
+    )
+
+
+def _mesh_material_key(model: dict[str, Any], mesh_index: int) -> str:
+    info = model['infos'][0][mesh_index]
+    material_index = int(info['mat'])
+    if material_index < 0 or material_index >= len(model['materials']):
+        return ''
+
+    value = str(model['materials'][material_index] or '').replace('\\', '/')
+    return value.rsplit('/', 1)[-1].casefold()
+
+
+def _body_topology_candidate(
+    output: dict[str, Any],
+    output_mesh: int,
+    native: dict[str, Any],
+    native_mesh: int,
+) -> bool:
+    if output_mesh < 0 or output_mesh >= len(output['infos'][0]):
+        return False
+    if native_mesh < 0 or native_mesh >= len(native['infos'][0]):
+        return False
+
+    oi = output['infos'][0][output_mesh]
+    ni = native['infos'][0][native_mesh]
+
+    if int(oi['vcount']) != int(ni['vcount']):
+        return False
+    if int(oi['part_count']) != int(ni['part_count']):
+        return False
+
+    output_layout = _mesh_part_layout(output, output_mesh)
+    native_layout = _mesh_part_layout(native, native_mesh)
+
+    if int(oi['icount']) == int(ni['icount']) and output_layout == native_layout:
+        return True
+
+    normalised = _penumbra_normalised_index_topology(native, native_mesh)
+    normalised_layout = tuple(zip(normalised['part_offsets'], normalised['part_counts']))
+
+    return (
+        bool(normalised['dropped'])
+        and int(oi['icount']) == len(normalised['block']) // 2
+        and output_layout == normalised_layout
+    )
+
+
+def _body_candidate_score(
+    output: dict[str, Any],
+    output_mesh: int,
+    row: dict[str, Any],
+    native: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    native_mesh = int(row['native_mesh'])
+    reported = int(row['reported_output_mesh'])
+
+    material_match = int(
+        bool(_mesh_material_key(output, output_mesh))
+        and _mesh_material_key(output, output_mesh) == _mesh_material_key(native, native_mesh)
+    )
+
+    bone_match = 0
+    try:
+        output_bones = _weighted_bone_names_for_mesh(output, output_mesh)
+        native_bones = _weighted_bone_names_for_mesh(native, native_mesh)
+        bone_match = int(bool(native_bones) and output_bones == native_bones)
+    except Exception:
+        # Bone identity is additional disambiguation only. The full graft audit
+        # below remains authoritative.
+        pass
+
+    exact_reported_index = int(output_mesh == reported)
+
+    # Final tie-breaker only. Penumbra preserves mesh ordering while compacting
+    # sparse glTF mesh identities, so the nearest order-preserving position is
+    # preferable when otherwise identical native body pieces exist.
+    displacement = -abs(output_mesh - reported)
+
+    return material_match, bone_match, exact_reported_index, displacement
+
+
+def _resolve_reconstructed_body_mapping(
+    output: dict[str, Any],
+    mapping: list[dict[str, Any]],
+    native_models: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not mapping:
+        return mapping, []
+
+    ordered = sorted(
+        mapping,
+        key=lambda row: (
+            int(row['reported_output_mesh']),
+            str(row['slot']),
+            int(row['native_mesh']),
+        ),
+    )
+
+    candidates: list[list[int]] = []
+    for row in ordered:
+        native = native_models[row['native_mdl']]
+        native_mesh = int(row['native_mesh'])
+
+        matches = [
+            output_mesh
+            for output_mesh in range(len(output['infos'][0]))
+            if _body_topology_candidate(output, output_mesh, native, native_mesh)
+        ]
+
+        if not matches:
+            raise ValueError(
+                f'Native body graft could not locate reconstructed counterpart for reported mesh '
+                f'{row["reported_output_mesh"]} ({row["slot"]} native mesh {native_mesh}). '
+                f'The imported model contains {len(output["infos"][0])} mesh(es), but none has the '
+                'required target-body topology.'
+            )
+
+        candidates.append(matches)
+
+    solutions: list[tuple[tuple[int, int, int, int], list[int]]] = []
+
+    def search(position: int, used: set[int], previous: int, chosen: list[int],
+               score: tuple[int, int, int, int]) -> None:
+        if position == len(ordered):
+            solutions.append((score, list(chosen)))
+            return
+
+        row = ordered[position]
+        native = native_models[row['native_mdl']]
+
+        for output_mesh in candidates[position]:
+            if output_mesh in used:
+                continue
+
+            # Penumbra may compact sparse mesh identities, but it preserves their
+            # relative order. Never solve an ambiguity by swapping body pieces.
+            if output_mesh <= previous:
+                continue
+
+            part_score = _body_candidate_score(output, output_mesh, row, native)
+            next_score = tuple(score[i] + part_score[i] for i in range(4))
+
+            used.add(output_mesh)
+            chosen.append(output_mesh)
+            search(position + 1, used, output_mesh, chosen, next_score)
+            chosen.pop()
+            used.remove(output_mesh)
+
+    search(0, set(), -1, [], (0, 0, 0, 0))
+
+    if not solutions:
+        detail = '; '.join(
+            f'{row["reported_output_mesh"]}->{matches}'
+            for row, matches in zip(ordered, candidates)
+        )
+        raise ValueError(
+            'Native body graft found compatible body meshes but could not produce a unique '
+            f'order-preserving reconstructed mapping. Candidates: {detail}'
+        )
+
+    solutions.sort(key=lambda item: item[0], reverse=True)
+    best_score = solutions[0][0]
+    best = [item for item in solutions if item[0] == best_score]
+
+    if len(best) != 1:
+        detail = '; '.join(
+            f'{row["reported_output_mesh"]}->{matches}'
+            for row, matches in zip(ordered, candidates)
+        )
+        raise ValueError(
+            'Native body graft reconstructed mesh mapping is ambiguous even after topology, '
+            f'material, weighted-bone and ordering checks. Candidates: {detail}'
+        )
+
+    resolved_indices = best[0][1]
+    resolved: list[dict[str, Any]] = []
+    remap_details: list[dict[str, Any]] = []
+
+    for row, output_mesh in zip(ordered, resolved_indices):
+        updated = dict(row)
+        updated['output_mesh'] = int(output_mesh)
+        resolved.append(updated)
+
+        remap_details.append({
+            'slot': row['slot'],
+            'native_mesh': int(row['native_mesh']),
+            'reported_output_mesh': int(row['reported_output_mesh']),
+            'resolved_output_mesh': int(output_mesh),
+            'compacted': int(row['reported_output_mesh']) != int(output_mesh),
+        })
+
+    return resolved, remap_details
 
 
 
@@ -328,12 +619,24 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
     for row in mapping:
         native_models.setdefault(row['native_mdl'], _parse(row['native_mdl']))
 
+    # The solver report retains the original sparse glTF/XIV mesh identity
+    # (for example mesh 0, mesh 5, mesh 6). Penumbra's glTF -> MDL importer
+    # compacts those identities into a dense MDL mesh array. Resolve the body
+    # rows against the actually reconstructed topology instead of assuming the
+    # reported mesh number is still a direct MDL array index.
+    mapping, output_mesh_remap = _resolve_reconstructed_body_mapping(
+        output,
+        mapping,
+        native_models,
+    )
+
     mapped_output_meshes = {row['output_mesh'] for row in mapping}
-    if any(index < 0 or index >= len(output['infos'][0]) for index in mapped_output_meshes):
-        raise ValueError(f'Conversion report references output mesh outside reconstructed model: {sorted(mapped_output_meshes)}')
 
     # Check topology and counts before touching the MDL.
     pair_details = []
+    expected_index_blocks: dict[int, bytes] = {}
+    topology_modes: dict[int, str] = {}
+    exporter_dropped_by_output: dict[int, list[dict[str, int]]] = {}
     part_attribute_masks: dict[int, list[int]] = {}
     bone_set_requirements: dict[int, list[str]] = {}
     bone_set_owners: dict[int, set[int]] = {}
@@ -345,10 +648,10 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
         if nm < 0 or nm >= len(native['infos'][0]):
             raise ValueError(f'Native target mesh {nm} is outside {row["native_mdl"]}.')
         oi = output['infos'][0][om]; ni = native['infos'][0][nm]
-        if int(oi['vcount']) != int(ni['vcount']) or int(oi['icount']) != int(ni['icount']):
+        if int(oi['vcount']) != int(ni['vcount']):
             raise ValueError(
                 f'Native body graft topology mismatch for output mesh {om} <- {row["slot"]} native mesh {nm}: '
-                f'vertices {oi["vcount"]}/{ni["vcount"]}, indices {oi["icount"]}/{ni["icount"]}.'
+                f'vertices {oi["vcount"]}/{ni["vcount"]}.'
             )
         if int(oi['part_count']) != int(ni['part_count']):
             raise ValueError(
@@ -356,17 +659,52 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                 f'{oi["part_count"]}/{ni["part_count"]}. Refusing to mix native topology with incompatible reconstructed submesh parts.'
             )
 
-        # Preserve the native submesh split, offsets and bone spans.
         output_parts = oi.get('parts') or []
         native_parts = ni.get('parts') or []
-        # MeshPart.IndexOffset is LOD-buffer absolute, not mesh-relative.
         output_mesh_index_base = int(oi['idxoff'])
         native_mesh_index_base = int(ni['idxoff'])
+        raw_part_offsets = [int(part['index_offset']) - native_mesh_index_base for part in native_parts]
+        raw_part_counts = [int(part['index_count']) for part in native_parts]
+        output_part_offsets = [int(part['index_offset']) - output_mesh_index_base for part in output_parts]
+        output_part_counts = [int(part['index_count']) for part in output_parts]
+
+        topology_mode = 'native'
+        topology_block = _index_block(native, nm)
+        topology_part_offsets = raw_part_offsets
+        topology_part_counts = raw_part_counts
+        exporter_dropped: list[dict[str, int]] = []
+        raw_matches = (
+            int(oi['icount']) == int(ni['icount'])
+            and output_part_offsets == raw_part_offsets
+            and output_part_counts == raw_part_counts
+        )
+        if not raw_matches:
+            normalised = _penumbra_normalised_index_topology(native, nm)
+            normalised_count = len(normalised['block']) // 2
+            normalised_matches = (
+                int(oi['icount']) == normalised_count
+                and output_part_offsets == normalised['part_offsets']
+                and output_part_counts == normalised['part_counts']
+                and bool(normalised['dropped'])
+            )
+            if not normalised_matches:
+                raise ValueError(
+                    f'Native body graft topology mismatch for output mesh {om} <- {row["slot"]} native mesh {nm}: '
+                    f'vertices {oi["vcount"]}/{ni["vcount"]}, indices {oi["icount"]}/{ni["icount"]}; '
+                    f'Penumbra-normalised native indices={normalised_count}. The difference is not explained solely by '
+                    'zero-area native triangles omitted by the Penumbra glTF exporter.'
+                )
+            topology_mode = 'penumbra-zero-area-normalised'
+            topology_block = normalised['block']
+            topology_part_offsets = normalised['part_offsets']
+            topology_part_counts = normalised['part_counts']
+            exporter_dropped = list(normalised['dropped'])
+
         for part_ordinal, (output_part, native_part) in enumerate(zip(output_parts, native_parts)):
-            output_relative = int(output_part['index_offset']) - output_mesh_index_base
-            native_relative = int(native_part['index_offset']) - native_mesh_index_base
-            output_count = int(output_part['index_count'])
-            native_count = int(native_part['index_count'])
+            output_relative = output_part_offsets[part_ordinal]
+            output_count = output_part_counts[part_ordinal]
+            native_relative = raw_part_offsets[part_ordinal]
+            native_count = raw_part_counts[part_ordinal]
             if output_relative < 0 or output_relative + output_count > int(oi['icount']):
                 raise ValueError(
                     f'Reconstructed MeshPart range is outside output mesh {om}, part {part_ordinal}: '
@@ -377,13 +715,22 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                     f'Native MeshPart range is outside target mesh {nm}, part {part_ordinal}: '
                     f'relative offset/count {native_relative}/{native_count} within {ni["icount"]} indices.'
                 )
-            if output_relative != native_relative or output_count != native_count:
+            if output_relative != topology_part_offsets[part_ordinal] or output_count != topology_part_counts[part_ordinal]:
                 raise ValueError(
                     f'Native body graft MeshPart topology mismatch for output mesh {om}, part {part_ordinal}: '
                     f'relative offset/count {output_relative}/{output_count} reconstructed vs '
-                    f'{native_relative}/{native_count} native '
-                    f'(absolute {output_part["index_offset"]} vs {native_part["index_offset"]}).'
+                    f'{topology_part_offsets[part_ordinal]}/{topology_part_counts[part_ordinal]} canonical native.'
                 )
+        suppressed = suppression_by_native.get((row['slot'], nm), set())
+        expected_index_block = _suppress_index_block(topology_block, nm, suppressed) if suppressed else topology_block
+        if len(expected_index_block) != int(oi['icount']) * 2:
+            raise ValueError(
+                f'Canonical native index payload size mismatch for output mesh {om}: '
+                f'{len(expected_index_block) // 2}/{oi["icount"]} indices.'
+            )
+        expected_index_blocks[om] = expected_index_block
+        topology_modes[om] = topology_mode
+        exporter_dropped_by_output[om] = exporter_dropped
         output_attr = {name: index for index, name in enumerate(output['attributes'])}
         remapped_masks: list[int] = []
         for native_part in native_parts:
@@ -427,6 +774,8 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             'restored_attribute_masks': remapped_masks,
             'native_bones': native_bones,
             'suppressed_triangles': len(suppression_by_native.get((row['slot'],nm),set())),
+            'topology_mode': topology_modes[om],
+            'exporter_zero_area_triangles_omitted': len(exporter_dropped_by_output[om]),
         })
 
     old = bytes(output['data'])
@@ -439,8 +788,7 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
     for om, row in mapping_by_output.items():
         native = native_models[row['native_mdl']]; nm = row['native_mesh']
         oi = output['infos'][0][om]
-        suppressed=suppression_by_native.get((row['slot'],nm),set())
-        block = _suppressed_index_block(native,nm,suppressed) if suppressed else _index_block(native,nm)
+        block = expected_index_blocks[om]
         start = int(oi['idxoff']) * 2
         old_index_buffer[start:start + len(block)] = block
 
@@ -567,7 +915,7 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                 'native_sha256': _sha(native_block), 'output_sha256': _sha(final_block),
             })
         suppressed=suppression_by_native.get((row['slot'],nm),set())
-        expected_index=_suppressed_index_block(native,nm,suppressed) if suppressed else _index_block(native,nm)
+        expected_index = expected_index_blocks[om]
         index_exact = _index_block(final, om) == expected_index
         final_bones = _bone_names(final, om)
         native_bones = _bone_names(native, nm)
@@ -595,6 +943,8 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             'declaration_exact': declaration_exact,
             'attribute_masks_exact': attribute_masks_exact, 'attribute_masks': final_masks,
             'suppressed_triangles': len(suppressed),
+            'topology_mode': topology_modes[om],
+            'exporter_zero_area_triangles_omitted': len(exporter_dropped_by_output[om]),
         }
 
     garment_checks = {}
@@ -620,5 +970,6 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
         'input_sha256': _sha(imported_mdl.read_bytes()), 'output_sha256': _sha(result),
         'old_vertex_buffer_size': int(lod0['vsize']), 'new_vertex_buffer_size': int(new_vertex_size),
         'body_meshes': pair_details, 'body_checks': body_checks, 'non_body_checks': garment_checks,
+        'output_mesh_remap': output_mesh_remap,
         'preserved_model_flags': preserved_flags,
     }

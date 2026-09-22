@@ -3,8 +3,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RuntimeVersion = "1.1.0"
-$ExpectedProductionRevision = "1.1.0-runtime-3"
+$RuntimeVersion = "1.1.1"
+$ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
 $PythonVersion = "3.13.5"
 $PipZipappVersion = "26.2.1"
 $PythonEmbedUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
@@ -118,27 +118,71 @@ function Try-PruneValidatedTree([string]$Path, [string]$PythonExe, [string]$Serv
 }
 
 function Copy-RavaFitRuntimeCode([string]$Target) {
+    $solverSource = Join-Path $RepoRoot 'runtime\solver'
     $solverTarget = Join-Path $Target 'solver'
     $rbodyTarget = Join-Path $Target 'rbody'
     $b14Target = Join-Path $Target 'b14_frozen\scripts'
+
     New-Item -ItemType Directory -Force -Path $solverTarget, $rbodyTarget, $b14Target | Out-Null
 
-    foreach ($name in @('server.py','production_b14.py','b14_compat.py','coverage_analysis.py','native_body_graft.py','customise_mod.py','peer_shell_worker.py','peer_group_supervisor.py','shell_solve_worker.py','assembly_worker.py','coverage_clearance_worker.py','garment_mesh_worker.py','garment_finalize_worker.py','garment_group_supervisor.py')) {
-        $source = Join-Path $RepoRoot "runtime\solver\$name"
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required SolverHost source is missing: $source" }
-        Copy-Item -LiteralPath $source -Force -Destination (Join-Path $solverTarget $name)
+    # SolverHost is an internally-coupled Python module set.
+    # Copy every Python source file while preserving any package subdirectories.
+    # Do not maintain a brittle per-file allowlist here.
+    if (-not (Test-Path -LiteralPath $solverSource -PathType Container)) {
+        throw "SolverHost source directory is missing: $solverSource"
     }
-    foreach ($name in @('rbody_v3_loader.py','rbody_b14_adapter.py','prepare_b14_rbody_cache.py','rbody_v3_core.py')) {
+
+    $solverFiles = @(
+        Get-ChildItem -LiteralPath $solverSource -Recurse -Force -File -Filter '*.py' |
+            Where-Object {
+                $_.FullName -notmatch '[\\/](?:__pycache__|tests?)[\\/]'
+            } |
+            Sort-Object FullName
+    )
+
+    if ($solverFiles.Count -eq 0) {
+        throw "SolverHost source directory contains no Python files: $solverSource"
+    }
+
+    foreach ($source in $solverFiles) {
+        $relative = $source.FullName.Substring($solverSource.Length).TrimStart('\', '/')
+        $destination = Join-Path $solverTarget $relative
+        $destinationDirectory = Split-Path -Parent $destination
+
+        New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+        Copy-Item -LiteralPath $source.FullName -Force -Destination $destination
+    }
+
+    foreach ($name in @(
+        'rbody_v3_loader.py',
+        'rbody_b14_adapter.py',
+        'prepare_b14_rbody_cache.py',
+        'rbody_v3_core.py'
+    )) {
         $source = Join-Path $RepoRoot "runtime\rbody\$name"
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required RBODY runtime source is missing: $source" }
+
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required RBODY runtime source is missing: $source"
+        }
+
         Copy-Item -LiteralPath $source -Force -Destination (Join-Path $rbodyTarget $name)
     }
+
     foreach ($name in @(
-        'ffxiv_lobofit.py','b14_mesh_worker.py','structural_refine.py','construction_fields.py',
-        'collision_eval.py','lobofit_official_refine.py','glb_patch_legacy.py'
+        'ffxiv_lobofit.py',
+        'b14_mesh_worker.py',
+        'structural_refine.py',
+        'construction_fields.py',
+        'collision_eval.py',
+        'lobofit_official_refine.py',
+        'glb_patch_legacy.py'
     )) {
         $source = Join-Path $RepoRoot "runtime\b14_frozen\scripts\$name"
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required B14 production source is missing: $source" }
+
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required B14 production source is missing: $source"
+        }
+
         Copy-Item -LiteralPath $source -Force -Destination (Join-Path $b14Target $name)
     }
 }
@@ -395,7 +439,7 @@ try {
         Trimesh = '4.11.1'
         Torch = '2.10.0+cpu'
         Layout = 'private-python-wheel-install+validated-runtime-diet+final-bytecode-prune'
-        SolverSource = 'RavaFit 1.1.0-runtime-3'
+        SolverSource = 'RavaFit 1.1.1-multi-region-support-source-preserve'
         ProductionRevision = $ExpectedProductionRevision
         PrunedBytes = $prunedBytes
         Components = $components

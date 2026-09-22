@@ -1,0 +1,213 @@
+{
+  "mesh": "mesh 1.0",
+  "fresh_from_original": true,
+  "generation_uses_validation": false,
+  "behavior": "stand_off_structured_shell",
+  "features": {
+    "root_component": 0,
+    "root_vertices": 1378,
+    "root_fraction": 0.1834154132836417,
+    "boundary_fraction": 0.1799709724238026,
+    "source_clearance_median_mm": 9.355546908172427,
+    "component_count": 11,
+    "boundary_loops": 4
+  },
+  "metrics": null,
+  "quality": {
+    "edge_p": [
+      0.4739380108851082,
+      0.5467861728088873,
+      0.8774782319944587,
+      1.1129832217515438,
+      1.1629467921690062
+    ],
+    "area_p": [
+      0.26531846928203223,
+      0.33362891475782985,
+      0.7328487716073029,
+      1.1821895072210953,
+      1.3121678874446712
+    ],
+    "tiny_area_frac": 0.0
+  },
+  "orientation": {
+    "opposed": 0,
+    "orient_min": 0.13714338375503834,
+    "orient_p1": 0.5747310599550706,
+    "area_min": 0.10248265625701185,
+    "area_p1": 0.26531846928203223
+  },
+  "stage": {
+    "mode": "stand_off_structured_shell",
+    "tangent_diffusion": {
+      "strength": 0.28,
+      "iterations": 20,
+      "blend": 0.5,
+      "tangent_rms_before_mm": 31.14452067576535,
+      "tangent_rms_after_mm": 27.6541186457786
+    },
+    "boundary_similarity_cage": {
+      "strength": 0.5,
+      "decay_rings": 3.0,
+      "loops": [
+        {
+          "n": 96,
+          "scale": 0.7423724204734784,
+          "correction_rms_mm": 21.6863058710909
+        },
+        {
+          "n": 34,
+          "scale": 0.9802476559534653,
+          "correction_rms_mm": 3.1931639731524513
+        },
+        {
+          "n": 84,
+          "scale": 0.8108686278289806,
+          "correction_rms_mm": 20.768956416683345
+        },
+        {
+          "n": 34,
+          "scale": 1.0067356938365897,
+          "correction_rms_mm": 4.9219958036001366
+        }
+      ],
+      "correction_rms_mm": 4.836556823805707
+    },
+    "loop_regrade_scale": 0.65,
+    "loop_motions_mm": [
+      67.76633878193682,
+      -0.335272177256855,
+      0.5991846537510312,
+      1.2855903236903419
+    ],
+    "triangle_guard": {
+      "area_floor": 0.075,
+      "orientation_floor": 0.075,
+      "weight": 1.0,
+      "start": 480
+    },
+    "structural_last": {
+      "iter": 500,
+      "loss": 1.7730284284997395,
+      "lap": 0.10346408351792316,
+      "bend": 0.0028129195680491863,
+      "curv": 0.00027125708278065614,
+      "shape": 0.09878770004644978,
+      "normal": 0.20914543174910638,
+      "reg": 0.05918126684985838,
+      "smooth": 0.2681150863347916,
+      "plane": 10.283179376208786,
+      "triangle_guard": 0.0007178775132529192,
+      "guard_area_min": 0.11060677199136892,
+      "guard_orient_min": 0.048715623994757186,
+      "disp_rms_mm": 8.427189342825402
+    },
+    "tightness": {
+      "source_signed_median_mm": 9.355546908172427,
+      "desired_signed_median_mm": 9.355546908172427,
+      "before_signed_median_mm": 9.212671517032405,
+      "desired_median_mm": 0.8074200925195438,
+      "applied_rms_mm": 0.7813052495488216,
+      "applied_p95_mm": 1.5523789498996197
+    },
+    "collision": {
+      "before_pen_frac": 0.034107402031930335,
+      "before_min_mm": -4.205344202026256,
+      "push_rms_mm": 0.5168045255398015,
+      "push_max_mm": 4.5,
+      "affected": 323
+    },
+    "assembly_last": {
+      "iter": 450,
+      "loss": 9.343553251937351,
+      "attach": 0.7611560550292037,
+      "frame": 0.6456931915907325,
+      "shape": 0.0,
+      "reg": 0.5167770750011761,
+      "gaps": [
+        {
+          "a": 0,
+          "b": 1,
+          "source_min_mm": 2.341160670589453,
+          "cand_pair_med_mm": 2.9325081684526264,
+          "cand_pair_p95_mm": 5.176856306412829
+        },
+        {
+          "a": 0,
+          "b": 2,
+          "source_min_mm": 2.5044887803467324,
+          "cand_pair_med_mm": 3.8364404724321144,
+          "cand_pair_p95_mm": 5.13119017626822
+        },
+        {
+          "a": 0,
+          "b": 5,
+          "source_min_mm": 1.6387125705972752,
+          "cand_pair_med_mm": 1.7548585129028935,
+          "cand_pair_p95_mm": 3.186838255177104
+        },
+        {
+          "a": 0,
+          "b": 6,
+          "source_min_mm": 0.8130136589258874,
+          "cand_pair_med_mm": 1.4371799404561905,
+          "cand_pair_p95_mm": 1.763191911464665
+        },
+        {
+          "a": 0,
+          "b": 7,
+          "source_min_mm": 1.17877709834888,
+          "cand_pair_med_mm": 4.268637987323157,
+          "cand_pair_p95_mm": 7.920717501651355
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "source_min_mm": 3.241668911487302,
+          "cand_pair_med_mm": 4.1578727818269545,
+          "cand_pair_p95_mm": 4.575097932626299
+        },
+        {
+          "a": 1,
+          "b": 3,
+          "source_min_mm": 0.16304027709110713,
+          "cand_pair_med_mm": 0.564286110392726,
+          "cand_pair_p95_mm": 0.6548497003099053
+        },
+        {
+          "a": 2,
+          "b": 4,
+          "source_min_mm": 0.16424433896670987,
+          "cand_pair_med_mm": 0.886617350779195,
+          "cand_pair_p95_mm": 1.0071945384149539
+        },
+        {
+          "a": 5,
+          "b": 8,
+          "source_min_mm": 0.26996463026018996,
+          "cand_pair_med_mm": 0.5672212453832088,
+          "cand_pair_p95_mm": 1.3084183664477054
+        },
+        {
+          "a": 6,
+          "b": 10,
+          "source_min_mm": 0.1688229995401262,
+          "cand_pair_med_mm": 0.458432134505081,
+          "cand_pair_p95_mm": 0.7989909097939348
+        },
+        {
+          "a": 7,
+          "b": 9,
+          "source_min_mm": 0.1763316353679044,
+          "cand_pair_med_mm": 1.8382450808410513,
+          "cand_pair_p95_mm": 2.0406950182357826
+        }
+      ]
+    }
+  },
+  "elapsed_sec": 13.886241674423218,
+  "source_hash": "3a506c513c7976480299c41237cc4f256a3a329331d702ae7b1dbfefccce9fdc",
+  "target_hash_before": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_hash_after": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_unchanged": true
+}

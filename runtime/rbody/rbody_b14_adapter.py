@@ -308,6 +308,99 @@ def build_dense_source_proxy(source_ref,target_ref,k=32):
     return proxy
 
 
+
+def apply_embedded_source_authority(canonical_ref,embedded_ref):
+    """Use the body surface exported with a mod as local source-fit geometry.
+
+    The RBODY selection remains semantic/completion authority: topology, UVs, rig space and any
+    source regions deleted by the outfit still come from the catalogue.  Where the outfit really
+    contains body geometry, that literal surface wins geometrically so authored garment clearance
+    is measured against the body the modder actually fitted to, not a nearby catalogue revision.
+    """
+    if list(canonical_ref.get('joint_names',[]))!=list(embedded_ref.get('joint_names',[])):
+        raise ValueError('Embedded and catalogue source bodies are not in the same rig joint space')
+    X=np.asarray(canonical_ref['V'],dtype=np.float64);F=np.asarray(canonical_ref['F'],dtype=np.int64)
+    E=np.asarray(embedded_ref['V'],dtype=np.float64);EF=np.asarray(embedded_ref['F'],dtype=np.int64)
+    if len(X)<8 or len(F)==0 or len(E)<8 or len(EF)==0:
+        return canonical_ref,{'enabled':False,'reason':'insufficient embedded/catalogue body geometry'}
+
+    out=dict(canonical_ref)
+    out['V']=X.copy();out['F']=F.copy();out['UV']=np.asarray(canonical_ref['UV'],dtype=np.float64).copy();out['W']=np.asarray(canonical_ref['W'],dtype=np.float64).copy()
+    canonical_N=_unit(np.asarray(canonical_ref['N'],dtype=np.float64));embedded_N=_unit(np.asarray(embedded_ref['N'],dtype=np.float64))
+    out['N']=canonical_N.copy()
+    original_payload=str(canonical_ref.get('payload_id') or 'catalogue-source')
+
+    exact_topology=len(X)==len(E) and F.shape==EF.shape and np.array_equal(F,EF)
+    if exact_topology:
+        delta=np.linalg.norm(E-X,axis=1)
+        out['V']=E.copy();out['N']=embedded_N.copy()
+        alpha=np.ones(len(X),dtype=np.float64)
+        mode='exact-embedded-topology'
+        diag={'chosen_spatial':delta,'chosen_alignment':np.ones(len(X),dtype=np.float64),'uv_nearest':np.zeros(len(X),dtype=np.float64)}
+    else:
+        mapped,mapped_normals,diag=uv_correspondence(canonical_ref,embedded_ref,k=48)
+        mapped=np.asarray(mapped,dtype=np.float64);mapped_normals=_unit(np.asarray(mapped_normals,dtype=np.float64))
+        spatial=np.asarray(diag.get('chosen_spatial',np.full(len(X),np.inf)),dtype=np.float64)
+        alignment=np.asarray(diag.get('chosen_alignment',np.zeros(len(X))),dtype=np.float64)
+        uv=np.asarray(diag.get('uv_nearest',np.full(len(X),np.nan)),dtype=np.float64)
+        body_diagonal=max(float(np.linalg.norm(np.ptp(X,axis=0))),1e-6)
+        full_distance=float(np.clip(body_diagonal*0.0035,0.0015,0.0030))
+        reject_distance=float(np.clip(body_diagonal*0.014,0.0080,0.0140))
+        max_displacement=float(np.clip(body_diagonal*0.035,0.018,0.032))
+
+        # RBODY variants commonly share most source vertices exactly even when the outfit deleted
+        # a few hidden regions.  Preserve those literal vertices exactly rather than averaging a
+        # correspondence neighbourhood (which can falsely soften anatomy by 1-2 mm).
+        embedded_W=np.asarray(embedded_ref['W'],dtype=np.float64);tree=cKDTree(E);nearest_distance,nearest_index=tree.query(X,k=1)
+        nearest_index=np.asarray(nearest_index,dtype=np.int64);nearest_distance=np.asarray(nearest_distance,dtype=np.float64)
+        nearest_alignment=np.einsum('ij,ij->i',embedded_W[nearest_index],np.asarray(canonical_ref['W'],dtype=np.float64),optimize=True)
+        literal_distance=float(np.clip(body_diagonal*0.0010,0.00045,0.00080))
+        literal=(nearest_distance<=literal_distance)&(nearest_alignment>=0.42)
+        mapped[literal]=E[nearest_index[literal]];mapped_normals[literal]=embedded_N[nearest_index[literal]]
+
+        displacement=np.linalg.norm(mapped-X,axis=1)
+        alpha=np.clip((reject_distance-spatial)/max(reject_distance-full_distance,1e-9),0.0,1.0)
+        rig_alpha=np.clip((alignment-0.28)/0.52,0.0,1.0);alpha*=rig_alpha
+        # Non-literal correspondence is deliberately only a bridge into the missing-region
+        # completion.  Literal source samples are the authority; uncertain holes remain RBODY.
+        alpha[~literal]*=0.35;alpha[literal]=1.0
+        bad_uv=np.isfinite(uv)&(uv>0.075)&(spatial>full_distance);alpha[bad_uv&~literal]*=0.20
+        alpha[(spatial>reject_distance)|(alignment<0.28)|(displacement>max_displacement)]=0.0
+        alpha[literal]=1.0
+        coverage=float(np.mean(alpha>=0.20))
+        if coverage<0.12:
+            return canonical_ref,{
+                'enabled':False,'reason':'embedded body does not cover enough of this selected slot','mode':'catalogue-fallback',
+                'coverage_fraction':coverage,'embedded_vertices':int(len(E)),'catalogue_vertices':int(len(X)),
+            }
+        out['V']=X+(mapped-X)*alpha[:,None]
+        blended=(canonical_N*(1.0-alpha[:,None]))+(mapped_normals*alpha[:,None]);out['N']=_unit(blended)
+        delta=np.linalg.norm(out['V']-X,axis=1)
+        mode='hybrid-embedded-with-rbody-completion'
+
+    # Once literal embedded geometry changes X this must not be mistaken for an identity RBODY map.
+    out['_canonical_payload_id']=original_payload
+    out['payload_id']=f'embedded-local:{original_payload}'
+    out['_literal_source_V']=np.asarray(out['V'],dtype=np.float64).copy()
+    out['_literal_source_F']=F.copy()
+    out['_literal_source_W']=np.asarray(out['W'],dtype=np.float64).copy()
+    out['_literal_source_mesh_records']=[dict(row) for row in canonical_ref.get('mesh_records',[])]
+    report={
+        'enabled':True,'mode':mode,'catalogue_payload':original_payload,'catalogue_vertices':int(len(X)),'embedded_vertices':int(len(E)),
+        'authority_fraction':float(np.mean(alpha>=0.20)),'full_authority_fraction':float(np.mean(alpha>=0.95)),
+        'moved_vertices':int(np.count_nonzero(delta>1e-6)),'move_p50_mm':float(np.percentile(delta,50)*1000.0),
+        'move_p95_mm':float(np.percentile(delta,95)*1000.0),'move_max_mm':float(np.max(delta)*1000.0),
+        'policy':'embedded source body is local geometric authority; RBODY supplies semantics/topology and missing-region completion',
+    }
+    if not exact_topology:
+        spatial=np.asarray(diag.get('chosen_spatial',np.zeros(len(X))),dtype=np.float64);alignment=np.asarray(diag.get('chosen_alignment',np.ones(len(X))),dtype=np.float64)
+        report.update({
+            'correspondence_mode':str(diag.get('mode','unknown')),'chosen_spatial_p95_mm':float(np.percentile(spatial,95)*1000.0),
+            'chosen_alignment_p50':float(np.median(alignment)),'literal_vertex_authority_fraction':float(np.mean(literal)),'completion_fraction':float(np.mean(alpha<0.20)),
+        })
+    out['_embedded_source_authority']=dict(report)
+    return out,report
+
 def collect_slot_pair(source_ref,target_ref):
     if source_ref['joint_names']!=target_ref['joint_names']:raise ValueError('Source and target references are not remapped to the same rig joint list')
     dense_exact=bool(source_ref.get('_dense_exact_target_topology',False))
