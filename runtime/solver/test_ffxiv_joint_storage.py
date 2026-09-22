@@ -87,12 +87,47 @@ def test_unused_native_bone_slots_are_not_treated_as_weighted():
     assert graft._weighted_bone_names_for_mesh(model, 0) == {"j_kosi"}
 
 
+def test_native_body_mapping_accepts_penumbra_index_rebuild_by_material_lineage():
+    original = graft._penumbra_normalised_index_topology
+    graft._penumbra_normalised_index_topology = lambda model, mesh: {
+        "block": b"", "part_offsets": [0], "part_counts": [0], "dropped": []
+    }
+    try:
+        def info(vcount, icount, mat):
+            return {"vcount": vcount, "icount": icount, "mat": mat, "part_count": 1, "idxoff": 0,
+                    "parts": [{"index_offset": 0, "index_count": icount}]}
+
+        output = {
+            "infos": [[info(99, 12, 0), info(10, 6, 1), info(20, 9, 1), info(30, 12, 1)]],
+            "materials": ["/garment.mtrl", "/body.mtrl"],
+        }
+        native = {
+            "infos": [[info(10, 9, 0), info(1, 3, 0), info(1, 3, 0), info(1, 3, 0), info(1, 3, 0), info(20, 12, 0), info(30, 15, 0)]],
+            "materials": ["/body.mtrl"],
+        }
+        native_models = {"native.mdl": native}
+        mapping = [
+            {"slot": "Legs", "reported_output_mesh": 0, "output_mesh": 0, "native_mesh": 0, "native_mdl": "native.mdl"},
+            {"slot": "Legs", "reported_output_mesh": 5, "output_mesh": 5, "native_mesh": 5, "native_mdl": "native.mdl"},
+            {"slot": "Legs", "reported_output_mesh": 6, "output_mesh": 6, "native_mesh": 6, "native_mdl": "native.mdl"},
+        ]
+        resolved, details = graft._resolve_reconstructed_body_mapping(output, mapping, native_models)
+        assert [row["output_mesh"] for row in resolved] == [1, 2, 3]
+        assert [row["reported_output_mesh"] for row in resolved] == [0, 5, 6]
+        assert all(item["compacted"] for item in details)
+        assert graft._body_topology_candidate(output, 0, native, 0) is False
+    finally:
+        graft._penumbra_normalised_index_topology = original
+
+
 def main():
     test_gltf_joint_widening_updates_payload_and_accessor_type()
     test_xiv_mesh_bone_budget_accepts_64_and_rejects_65()
     test_unused_native_bone_slots_are_not_treated_as_weighted()
+    test_native_body_mapping_accepts_penumbra_index_rebuild_by_material_lineage()
     print("FFXIV joint storage tests: PASS")
 
 
 if __name__ == "__main__":
     main()
+
