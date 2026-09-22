@@ -94,6 +94,7 @@ def _parse(path: str | Path) -> dict[str, Any]:
     off += lods[0]['terrain'][1] * 20
 
     # Preserve MeshPart.AttributeMask; piercing/visibility IMC depends on it.
+    mesh_parts_start = off
     mesh_parts = []
     for part_index in range(model_data['MeshPartCount']):
         struct_offset = off
@@ -109,6 +110,7 @@ def _parse(path: str | Path) -> dict[str, Any]:
             if start < 0 or count < 0 or start + count > len(mesh_parts):
                 raise ValueError(f'Invalid MeshPart range {start}+{count} in {path}.')
             info['parts'] = mesh_parts[start:start + count]
+    mesh_parts_end = off
     off += model_data['TerrainShadowPartCount'] * 12
     off += model_data['MaterialCount'] * 4
     off += model_data['BoneCount'] * 4
@@ -148,6 +150,7 @@ def _parse(path: str | Path) -> dict[str, Any]:
         'path': str(path), 'data': data, 'mdl_version': mdl_version, 'model_data': model_data,
         'model_data_offset': model_data_offset, 'lods': lods, 'infos': infos, 'declarations': declarations,
         'attributes': attribute_names, 'mesh_parts': mesh_parts,
+        'mesh_parts_start': mesh_parts_start, 'mesh_parts_end': mesh_parts_end,
         'joint_names': joint_names, 'materials': material_names, 'bone_sets': bone_sets, 'bone_set_meta': bone_set_meta,
     }
 
@@ -342,9 +345,12 @@ def _body_topology_candidate(
     authoritative RBODY/native MDL data, so index-layout equality must not be a
     prerequisite for finding it.
 
-    Vertex count and MeshPart count remain hard structural guards.  Exact topology
-    is preferred implicitly by the candidate score; when it differs, the native body
-    material identity is the stable lineage used to admit the placeholder.
+    Vertex count remains the hard geometry guard. Penumbra/SharpGLTF may also
+    consolidate MeshParts during import (for example seven native parts becoming
+    three reconstructed primitives), so MeshPart count is not an identity guard.
+    When topology or part layout differs, exact native-body material identity is the
+    stable lineage used to admit the placeholder; the graft later restores the full
+    authoritative native MeshPart table.
     """
     if output_mesh < 0 or output_mesh >= len(output['infos'][0]):
         return False
@@ -355,8 +361,6 @@ def _body_topology_candidate(
     ni = native['infos'][0][native_mesh]
 
     if int(oi['vcount']) != int(ni['vcount']):
-        return False
-    if int(oi['part_count']) != int(ni['part_count']):
         return False
 
     output_layout = _mesh_part_layout(output, output_mesh)
@@ -376,6 +380,10 @@ def _body_topology_candidate(
 
     output_material = _mesh_material_key(output, output_mesh)
     native_material = _mesh_material_key(native, native_mesh)
+    # Exact target-body material + exact vertex count is the stable lineage.
+    # Index count/layout and MeshPart segmentation are intentionally not identity
+    # guards here: those are the two structures Penumbra is allowed to rewrite
+    # and that this native-body graft exists to restore.
     return bool(output_material) and output_material == native_material
 
 
@@ -681,12 +689,6 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                 f'Native body graft topology mismatch for output mesh {om} <- {row["slot"]} native mesh {nm}: '
                 f'vertices {oi["vcount"]}/{ni["vcount"]}.'
             )
-        if int(oi['part_count']) != int(ni['part_count']):
-            raise ValueError(
-                f'Native body graft part-count mismatch for output mesh {om} <- native mesh {nm}: '
-                f'{oi["part_count"]}/{ni["part_count"]}. Refusing to mix native topology with incompatible reconstructed submesh parts.'
-            )
-
         output_parts = oi.get('parts') or []
         native_parts = ni.get('parts') or []
         output_mesh_index_base = int(oi['idxoff'])
@@ -724,7 +726,7 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             else:
                 # Penumbra/SharpGLTF may legally rebuild the imported index topology.
                 # At this point the mesh has already been identified by native body
-                # material + vertex/MeshPart structure.  Restore the canonical native
+                # exact body material + vertex lineage. Restore the canonical native
                 # index payload instead of rejecting the very round-trip this graft is
                 # designed to repair.
                 output_material = _mesh_material_key(output, om)
@@ -742,30 +744,38 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                 topology_part_offsets = raw_part_offsets
                 topology_part_counts = raw_part_counts
 
-        for part_ordinal, (output_part, native_part) in enumerate(zip(output_parts, native_parts)):
+        for part_ordinal, output_part in enumerate(output_parts):
             output_relative = output_part_offsets[part_ordinal]
             output_count = output_part_counts[part_ordinal]
-            native_relative = raw_part_offsets[part_ordinal]
-            native_count = raw_part_counts[part_ordinal]
             if output_relative < 0 or output_relative + output_count > int(oi['icount']):
                 raise ValueError(
                     f'Reconstructed MeshPart range is outside output mesh {om}, part {part_ordinal}: '
                     f'relative offset/count {output_relative}/{output_count} within {oi["icount"]} indices.'
                 )
+        for part_ordinal, native_part in enumerate(native_parts):
+            native_relative = raw_part_offsets[part_ordinal]
+            native_count = raw_part_counts[part_ordinal]
             if native_relative < 0 or native_relative + native_count > int(ni['icount']):
                 raise ValueError(
                     f'Native MeshPart range is outside target mesh {nm}, part {part_ordinal}: '
                     f'relative offset/count {native_relative}/{native_count} within {ni["icount"]} indices.'
                 )
-            if topology_mode != 'native-index-rebuild' and (
-                output_relative != topology_part_offsets[part_ordinal]
-                or output_count != topology_part_counts[part_ordinal]
-            ):
+        if topology_mode != 'native-index-rebuild':
+            if len(output_parts) != len(topology_part_offsets):
                 raise ValueError(
-                    f'Native body graft MeshPart topology mismatch for output mesh {om}, part {part_ordinal}: '
-                    f'relative offset/count {output_relative}/{output_count} reconstructed vs '
-                    f'{topology_part_offsets[part_ordinal]}/{topology_part_counts[part_ordinal]} canonical native.'
+                    f'Native body graft MeshPart count mismatch for output mesh {om}: '
+                    f'{len(output_parts)} reconstructed vs {len(topology_part_offsets)} canonical.'
                 )
+            for part_ordinal, (output_relative, output_count) in enumerate(zip(output_part_offsets, output_part_counts)):
+                if (
+                    output_relative != topology_part_offsets[part_ordinal]
+                    or output_count != topology_part_counts[part_ordinal]
+                ):
+                    raise ValueError(
+                        f'Native body graft MeshPart topology mismatch for output mesh {om}, part {part_ordinal}: '
+                        f'relative offset/count {output_relative}/{output_count} reconstructed vs '
+                        f'{topology_part_offsets[part_ordinal]}/{topology_part_counts[part_ordinal]} canonical native.'
+                    )
         suppressed = suppression_by_native.get((row['slot'], nm), set())
         expected_index_block = _suppress_index_block(topology_block, nm, suppressed) if suppressed else topology_block
         expected_index_blocks[om] = expected_index_block
@@ -810,7 +820,8 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
         bone_set_requirements[output_bone_set] = native_bones
         pair_details.append({
             **row,
-            'vertices': int(oi['vcount']), 'indices': int(oi['icount']), 'parts': int(oi['part_count']),
+            'vertices': int(oi['vcount']), 'indices': int(oi['icount']),
+            'reconstructed_parts': int(oi['part_count']), 'native_parts': int(ni['part_count']),
             'native_strides': list(ni['stride']), 'reconstructed_strides': list(oi['stride']),
             'native_attribute_masks': [int(p['attribute_mask']) for p in native_parts],
             'restored_attribute_masks': remapped_masks,
@@ -860,18 +871,31 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
         src = 68 + row['native_mesh'] * 136
         prefix[dst:dst + 136] = bytes(native['data'][src:src + 136])
 
-    # Rebuild the complete LOD0 index buffer. Penumbra may have compacted or
-    # otherwise rewritten transplanted body index topology, so body meshes use
-    # the authoritative native/RBODY payload while every garment mesh carries
-    # its imported index bytes forward unchanged. MeshPart absolute offsets are
-    # rewritten for the new packed buffer.
+    # Rebuild the complete LOD0 index buffer and MeshPart table. Penumbra may
+    # compact both triangle topology and primitive/MeshPart segmentation during
+    # GLB -> MDL import. Body meshes therefore receive authoritative native index
+    # bytes *and* authoritative native MeshPart segmentation, while every garment
+    # mesh retains its imported part semantics with only absolute index offsets
+    # shifted to the newly packed index buffer.
+    original_lod0_part_count = sum(len(info.get('parts') or []) for info in output['infos'][0])
+    if original_lod0_part_count != int(output['model_data']['MeshPartCount']):
+        raise NotImplementedError(
+            'Native body graft currently requires every MeshPart to belong to LOD0; '
+            f'LOD0 owns {original_lod0_part_count} but the model declares '
+            f'{output["model_data"]["MeshPartCount"]} total parts.'
+        )
+
     new_index_buffer = bytearray()
     new_idxoff: dict[int, int] = {}
     new_icount: dict[int, int] = {}
+    new_mesh_parts_by_mesh: dict[int, list[tuple[int, int, int, int, int]]] = {}
+    garment_part_signatures: dict[int, list[tuple[int, int, int, int]]] = {}
+
     for mesh_index, info in enumerate(output['infos'][0]):
         idxoff = len(new_index_buffer) // 2
         new_idxoff[mesh_index] = idxoff
         row = mapping_by_output.get(mesh_index)
+        records: list[tuple[int, int, int, int, int]] = []
 
         if row is not None:
             block = expected_index_blocks[mesh_index]
@@ -879,41 +903,65 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             counts = expected_part_counts[mesh_index]
             native = native_models[row['native_mdl']]
             native_parts = native['infos'][0][row['native_mesh']].get('parts') or []
-            output_parts = info.get('parts') or []
             masks = part_attribute_masks[mesh_index]
-            if not (len(output_parts) == len(native_parts) == len(offsets) == len(counts) == len(masks)):
+            if not (len(native_parts) == len(offsets) == len(counts) == len(masks)):
                 raise ValueError(
                     f'Native body graft cannot rebuild MeshPart metadata for output mesh {mesh_index}: '
-                    f'output/native/offset/count/mask lengths are '
-                    f'{len(output_parts)}/{len(native_parts)}/{len(offsets)}/{len(counts)}/{len(masks)}.'
+                    f'native/offset/count/mask lengths are '
+                    f'{len(native_parts)}/{len(offsets)}/{len(counts)}/{len(masks)}.'
                 )
-            for output_part, native_part, relative, count, mask in zip(output_parts, native_parts, offsets, counts, masks):
-                struct.pack_into(
-                    '<IIIHH',
-                    prefix,
-                    int(output_part['struct_off']),
+            for native_part, relative, count, mask in zip(native_parts, offsets, counts, masks):
+                records.append((
                     int(idxoff + relative),
                     int(count),
                     int(mask),
                     int(native_part['bone_start']),
                     int(native_part['bone_count']),
-                )
+                ))
         else:
             block = _index_block(output, mesh_index)
             old_base = int(info['idxoff'])
+            signatures: list[tuple[int, int, int, int]] = []
             for output_part in info.get('parts') or []:
                 relative = int(output_part['index_offset']) - old_base
-                if relative < 0 or relative + int(output_part['index_count']) > int(info['icount']):
+                count = int(output_part['index_count'])
+                if relative < 0 or relative + count > int(info['icount']):
                     raise ValueError(
                         f'Garment MeshPart range is outside output mesh {mesh_index}: '
-                        f'{relative}/{output_part["index_count"]} within {info["icount"]} indices.'
+                        f'{relative}/{count} within {info["icount"]} indices.'
                     )
-                struct.pack_into('<I', prefix, int(output_part['struct_off']), int(idxoff + relative))
+                mask = int(output_part['attribute_mask'])
+                bone_start = int(output_part['bone_start'])
+                bone_count = int(output_part['bone_count'])
+                records.append((int(idxoff + relative), count, mask, bone_start, bone_count))
+                signatures.append((relative, count, mask, (bone_start << 16) | bone_count))
+            garment_part_signatures[mesh_index] = signatures
 
         if len(block) % 2:
             raise ValueError(f'Index payload for output mesh {mesh_index} is not uint16 aligned.')
         new_index_buffer.extend(block)
         new_icount[mesh_index] = len(block) // 2
+        new_mesh_parts_by_mesh[mesh_index] = records
+
+    # Rebuild the global MeshPart table in mesh order. This is the crucial step
+    # for body round-trips where Penumbra merges native parts (e.g. 7 -> 3).
+    # Merely relaxing the resolver would leave too few physical part records.
+    new_mesh_part_table = bytearray()
+    next_part_index = 0
+    for mesh_index, info in enumerate(output['infos'][0]):
+        records = new_mesh_parts_by_mesh[mesh_index]
+        if next_part_index > 32767 or len(records) > 32767:
+            raise ValueError('Native body graft MeshPart table exceeds XIV int16 mesh part indexing.')
+        struct_offset = int(info['struct_off'])
+        struct.pack_into('<h', prefix, struct_offset + 10, int(next_part_index))
+        struct.pack_into('<h', prefix, struct_offset + 12, int(len(records)))
+        for record in records:
+            new_mesh_part_table.extend(struct.pack('<IIIHH', *record))
+        next_part_index += len(records)
+
+    if next_part_index > 32767:
+        raise ValueError(f'Native body graft generated too many MeshParts: {next_part_index}.')
+    struct.pack_into('<h', prefix, output['model_data_offset'] + 4, int(next_part_index))
 
     # Keep the importer's mesh table/bone-set ownership, but point it at the
     # rebuilt vertex/index buffers and restore authoritative body index counts.
@@ -968,12 +1016,21 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
 
     new_vertex_size = len(new_vertex_buffer)
     new_index_size = len(new_index_buffer)
-    new_index_offset = lod0['ioff'] + (new_vertex_size - lod0['vsize'])
+
+    old_mesh_part_bytes = int(output['mesh_parts_end']) - int(output['mesh_parts_start'])
+    mesh_part_delta = len(new_mesh_part_table) - old_mesh_part_bytes
+    new_vertex_offset = int(lod0['voff']) + mesh_part_delta
+    new_index_offset = new_vertex_offset + new_vertex_size
+    if new_vertex_offset < 0 or new_index_offset < new_vertex_offset:
+        raise ValueError('Native body graft generated invalid vertex/index buffer offsets.')
+
+    struct.pack_into('<I', prefix, 16, new_vertex_offset) # file header vertexBufferOffsets[0]
     struct.pack_into('<I', prefix, 28, new_index_offset)  # file header indexBufferOffsets[0]
     struct.pack_into('<I', prefix, 40, new_vertex_size)   # file header vertexBufferSizes[0]
     struct.pack_into('<I', prefix, 52, new_index_size)    # file header indexBufferSizes[0]
     struct.pack_into('<i', prefix, lod0['struct_off'] + 44, new_vertex_size)
     struct.pack_into('<i', prefix, lod0['struct_off'] + 48, new_index_size)
+    struct.pack_into('<i', prefix, lod0['struct_off'] + 52, new_vertex_offset)
     struct.pack_into('<i', prefix, lod0['struct_off'] + 56, new_index_offset)
 
     # Keep the source equipment-model flags; the generic importer resets some of them.
@@ -985,6 +1042,17 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             value = int(source_model['model_data'][name])
             prefix[output['model_data_offset'] + relative] = value & 0xFF
             preserved_flags[name] = value
+
+    # All edits above used offsets from the original metadata layout. Splice the
+    # resized MeshPart table only after those writes so downstream tables (bone
+    # sets, materials, shape metadata) move together without stale write offsets.
+    mesh_parts_start = int(output['mesh_parts_start'])
+    mesh_parts_end = int(output['mesh_parts_end'])
+    prefix = prefix[:mesh_parts_start] + new_mesh_part_table + prefix[mesh_parts_end:]
+    if len(prefix) != new_vertex_offset:
+        raise ValueError(
+            f'Native body graft metadata resize mismatch: prefix={len(prefix)} expected vertex offset={new_vertex_offset}.'
+        )
 
     result = bytes(prefix) + bytes(new_vertex_buffer) + bytes(new_index_buffer) + suffix
     output_mdl.parent.mkdir(parents=True, exist_ok=True)
@@ -1015,10 +1083,15 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
         )
         full_bones_exact = final_bones == native_bones
         declaration_exact = final['declarations'][om] == native['declarations'][nm]
-        final_masks = [int(p['attribute_mask']) for p in final['infos'][0][om]['parts']]
+        final_parts = final['infos'][0][om]['parts']
+        final_base = int(final['infos'][0][om]['idxoff'])
+        final_layout = [(int(p['index_offset']) - final_base, int(p['index_count'])) for p in final_parts]
+        expected_layout = list(zip(expected_part_offsets[om], expected_part_counts[om]))
+        part_layout_exact = final_layout == expected_layout
+        final_masks = [int(p['attribute_mask']) for p in final_parts]
         expected_masks = part_attribute_masks[om]
         attribute_masks_exact = final_masks == expected_masks
-        if not all(item['exact'] for item in stream_checks) or not index_exact or not weighted_bones_exact or not declaration_exact or not attribute_masks_exact:
+        if not all(item['exact'] for item in stream_checks) or not index_exact or not weighted_bones_exact or not declaration_exact or not attribute_masks_exact or not part_layout_exact:
             raise ValueError(f'Native body graft post-write audit failed for output mesh {om}.')
         bone_set_index = int(final['infos'][0][om]['bone_set'])
         body_checks[str(om)] = {
@@ -1030,6 +1103,7 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
                 for ordinal, name in substituted_unused_slots.get(bone_set_index, [])
             ],
             'declaration_exact': declaration_exact,
+            'mesh_part_layout_exact': part_layout_exact, 'mesh_part_count': len(final_parts),
             'attribute_masks_exact': attribute_masks_exact, 'attribute_masks': final_masks,
             'suppressed_triangles': len(suppressed),
             'topology_mode': topology_modes[om],
@@ -1043,10 +1117,25 @@ def graft_native_body(imported_mdl: str | Path, output_mdl: str | Path, conversi
             if int(output['infos'][0][mesh_index]['stride'][stream]) <= 0: continue
             after_hashes.append(_sha(_stream_block(final, mesh_index, stream)))
         index_exact = _index_block(final, mesh_index) == _index_block(output, mesh_index)
-        exact = before_hashes == after_hashes and index_exact
+        final_info = final['infos'][0][mesh_index]
+        final_base = int(final_info['idxoff'])
+        final_part_signature = [
+            (
+                int(part['index_offset']) - final_base,
+                int(part['index_count']),
+                int(part['attribute_mask']),
+                (int(part['bone_start']) << 16) | int(part['bone_count']),
+            )
+            for part in (final_info.get('parts') or [])
+        ]
+        part_semantics_exact = final_part_signature == garment_part_signatures.get(mesh_index, [])
+        exact = before_hashes == after_hashes and index_exact and part_semantics_exact
         if not exact:
             raise ValueError(f'Native body graft altered non-body output mesh {mesh_index}.')
-        garment_checks[str(mesh_index)] = {'vertex_streams_exact': before_hashes == after_hashes, 'indices_exact': index_exact}
+        garment_checks[str(mesh_index)] = {
+            'vertex_streams_exact': before_hashes == after_hashes,
+            'indices_exact': index_exact, 'mesh_part_semantics_exact': part_semantics_exact,
+        }
 
     if preserved_flags is not None:
         for key, expected in preserved_flags.items():

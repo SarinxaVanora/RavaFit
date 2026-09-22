@@ -42,7 +42,7 @@ internal sealed class ConversionService
     public async Task<GarmentCoverageResult> AnalyseCoverageAsync(PenumbraModInfo mod, string groupKey, string optionKey, ModelRedirect model, CancellationToken cancellationToken = default, bool detectSourceBodies = true)
     {
         if (!_solver.Ready)
-            throw new InvalidOperationException("Solver runtime is not ready for garment coverage analysis.");
+            throw new InvalidOperationException("RavaFit is still getting ready.");
         RequireBridgeAvailable();
 
         var metaPath = Path.Combine(mod.ModRoot, "meta.json");
@@ -83,14 +83,14 @@ internal sealed class ConversionService
             var skeletonPaths = _bridge.ResolveSkeletonPaths(exportRequest);
             await _bridge.ExportAsync(exportRequest with { SkeletonPathsOverride = skeletonPaths }, cancellationToken).ConfigureAwait(false);
             if (!File.Exists(sourceGlb) || new FileInfo(sourceGlb).Length == 0)
-                throw new InvalidDataException("Model bridge did not produce a GLB for coverage analysis.");
+                throw new InvalidDataException("RavaFit couldn't prepare the selected model for fitting.");
 
             using var reply = await _solver.CallAsync("analyze_coverage", new { glb = sourceGlb, game_path = model.GamePath }, cancellationToken).ConfigureAwait(false);
             var root = reply.RootElement;
             var physicalBodySlot = TryResolveBodyModelSlot(model.GamePath);
             var primary = root.TryGetProperty("primary_slot", out var primaryNode) && primaryNode.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(primaryNode.GetString())
                 ? primaryNode.GetString()!
-                : physicalBodySlot ?? throw new InvalidDataException($"Coverage analysis did not infer a fitting body region for accessory model {model.GamePath}.");
+                : physicalBodySlot ?? throw new InvalidDataException($"RavaFit couldn't work out which body shape {model.FileName} should fit against.");
             var slots = new Dictionary<string, GarmentCoverageSlot>(StringComparer.OrdinalIgnoreCase);
             if (root.TryGetProperty("slots", out var slotsNode) && slotsNode.ValueKind == JsonValueKind.Object)
             {

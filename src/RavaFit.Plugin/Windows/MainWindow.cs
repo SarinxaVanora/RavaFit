@@ -156,9 +156,9 @@ internal sealed class MainWindow : Window, IDisposable
     private Vector2 _customisePreviewPan = Vector2.Zero;
     private Vector3? _customisePreviewFocusCentre;
     private float? _customisePreviewFocusRadius;
-    private bool _customisePreviewDimOthers = true;
+    private bool _customisePreviewDimOthers;
     private bool _customisePreviewOnlySelected;
-    private PreviewDisplayMode _customisePreviewMode = PreviewDisplayMode.Shaded;
+    private PreviewDisplayMode _customisePreviewMode = PreviewDisplayMode.Textured;
     private string _customiseFilter = string.Empty;
     private string _customisePiercingFilter = string.Empty;
     private string _customiseCombinedToggleName = string.Empty;
@@ -332,7 +332,7 @@ internal sealed class MainWindow : Window, IDisposable
         if (!_plugin.Bodies.Ready || !_plugin.Solver.Ready || !_plugin.Solver.ConversionReady)
             return ("Setup required", WarningColour);
         if (!_plugin.ModelBridge.Status.Available)
-            return ("Bridge unavailable", ErrorColour);
+            return ("Model tools unavailable", ErrorColour);
         return ("Ready", SuccessColour);
     }
 
@@ -435,6 +435,23 @@ internal sealed class MainWindow : Window, IDisposable
         }
     }
 
+    private static bool SelectComboOption(string label, bool selected = false)
+    {
+        if (!ImGui.Selectable(label, selected)) return false;
+        ImGui.CloseCurrentPopup();
+        return true;
+    }
+
+    private static string GetPreviewModeLabel(PreviewDisplayMode mode)
+        => mode switch
+        {
+            PreviewDisplayMode.Textured => "Materials",
+            PreviewDisplayMode.Shaded => "Shaded",
+            PreviewDisplayMode.Flat => "Solid",
+            PreviewDisplayMode.Wireframe => "Wireframe",
+            _ => mode.ToString(),
+        };
+
     private void DrawConvertTab()
     {
         RavaFitUiChrome.DrawSectionTitle("Outfit", "Choose a mod or vanilla item");
@@ -505,14 +522,14 @@ internal sealed class MainWindow : Window, IDisposable
         ImGui.SetNextItemWidth(-1);
         using var combo = ImRaii.Combo("##VanillaOutfitRace", preview);
         if (!combo.Success) return;
-        if (current is not null && ImGui.Selectable($"Current character · {current.DisplayName}##vanilla-current", _vanillaOutfitRaceOverride is null))
+        if (current is not null && SelectComboOption($"Current character · {current.DisplayName}##vanilla-current", _vanillaOutfitRaceOverride is null))
         {
             _vanillaOutfitRaceOverride = null;
             _convertVanillaReady = false;
         }
         foreach (var identity in CharacterRaceCatalog.All)
         {
-            if (!ImGui.Selectable($"{identity.DisplayName}##vanilla-race-{identity.Code}", string.Equals(_vanillaOutfitRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!SelectComboOption($"{identity.DisplayName}##vanilla-race-{identity.Code}", string.Equals(_vanillaOutfitRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
             _vanillaOutfitRaceOverride = identity.Code;
             _convertVanillaReady = false;
         }
@@ -582,7 +599,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var asset in visibleAssets)
             {
-                if (!ImGui.Selectable($"{asset.DisplayName}##vanilla-outfit-{asset.ModelSetId}", Equals(asset, _vanillaOutfit))) continue;
+                if (!SelectComboOption($"{asset.DisplayName}##vanilla-outfit-{asset.ModelSetId}", Equals(asset, _vanillaOutfit))) continue;
                 _vanillaOutfit = asset;
                 _vanillaOutfitFilter = string.Empty;
                 _convertVanillaReady = false;
@@ -748,15 +765,15 @@ internal sealed class MainWindow : Window, IDisposable
     {
         EnsureCustomiseInspection();
         RavaFitUiChrome.DrawSectionTitle("Split to accessory");
-        RavaFitUiChrome.DrawMutedWrappedText("Select authored model parts and move them together onto an XIV accessory. A new option is created; the original option stays untouched.");
+        RavaFitUiChrome.DrawMutedWrappedText("Select the parts you want on an XIV accessory. RavaFit creates a separate mod and leaves the original mod untouched.");
         ImGuiHelpers.ScaledDummy(6f);
         DrawCustomiseMeshParts();
         ImGuiHelpers.ScaledDummy(8f);
         DrawCustomiseAccessoryPicker();
         ImGuiHelpers.ScaledDummy(6f);
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##CustomiseAccessoryOptionName", "New option name", ref _customiseAccessoryOptionName, 128);
-        RavaFitUiChrome.DrawMutedText("The accessory contains only the selected visible garment parts. No body model is transplanted into it.");
+        ImGui.InputTextWithHint("##CustomiseAccessoryOptionName", "New mod name", ref _customiseAccessoryOptionName, 128);
+        RavaFitUiChrome.DrawMutedWrappedText("The new mod includes its own models, materials and texture replacements, so it does not rely on the original mod. Body models are not moved onto the accessory.");
         ImGuiHelpers.ScaledDummy(7f);
         var ready = !_plugin.Customise.Busy && !_customiseInspecting && _customiseSelectedParts.Count > 0 && _customiseAccessoryTarget is not null && !string.IsNullOrWhiteSpace(_customiseAccessoryOptionName);
         using (ImRaii.Disabled(!ready))
@@ -785,9 +802,9 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var asset in visible)
             {
-                if (!ImGui.Selectable($"{asset.DisplayName}##accessory-{asset.Slot}-{asset.ModelSetId}-{asset.VariantId}-{asset.ItemId}", _customiseAccessoryTarget == asset)) continue;
+                if (!SelectComboOption($"{asset.DisplayName}##accessory-{asset.Slot}-{asset.ModelSetId}-{asset.VariantId}-{asset.ItemId}", _customiseAccessoryTarget == asset)) continue;
                 _customiseAccessoryTarget = asset;
-                if (string.IsNullOrWhiteSpace(_customiseAccessoryOptionName)) _customiseAccessoryOptionName = $"{asset.Name} split";
+                if (string.IsNullOrWhiteSpace(_customiseAccessoryOptionName)) _customiseAccessoryOptionName = $"{_selectedMod?.Name ?? "RavaFit"} - {asset.Name}";
                 _customiseAccessoryFilter = string.Empty;
             }
         });
@@ -802,20 +819,13 @@ internal sealed class MainWindow : Window, IDisposable
         try { targetGamePath = _plugin.VanillaAssets.ResolveAccessoryModelPath(_customiseAccessoryTarget, sourceRaceCode); }
         catch (Exception ex) { SetMessage(ex.Message, true); return; }
         var targetMaterialId = _plugin.VanillaAssets.ResolveAccessoryMaterialId(_customiseAccessoryTarget);
+        var requestedName = _customiseAccessoryOptionName.Trim();
         var request = new AccessorySplitRequest(_selectedMod, _customiseSelection.Group.StableKey, _customiseSelection.Option.StableKey, _customiseSelection.Model,
-            _customiseSelectedParts.OrderBy(x => x).ToArray(), targetGamePath, _customiseAccessoryTarget.VariantId, targetMaterialId, _customiseAccessoryTarget.DisplayName, _customiseAccessoryOptionName.Trim());
+            _customiseSelectedParts.OrderBy(x => x).ToArray(), targetGamePath, _customiseAccessoryTarget.VariantId, targetMaterialId, _customiseAccessoryTarget.DisplayName, requestedName);
         _ = RunUiTask(async () =>
         {
-            await _plugin.Customise.SplitToAccessoryAsync(request).ConfigureAwait(false);
-            _uiActions.Enqueue(() =>
-            {
-                if (_selectedMod is not null)
-                {
-                    _document = PenumbraV4Document.Load(Path.Combine(_selectedMod.ModRoot, "meta.json"));
-                    BuildOutfitChoices();
-                }
-                SetMessage($"Created {_customiseAccessoryOptionName} with selected parts on {_customiseAccessoryTarget?.DisplayName}.", false);
-            });
+            var created = await _plugin.Customise.SplitToAccessoryAsync(request).ConfigureAwait(false);
+            _uiActions.Enqueue(() => SetMessage($"Created new mod: {created.Name}. It is ready in Penumbra.", false));
         });
     }
 
@@ -866,7 +876,7 @@ internal sealed class MainWindow : Window, IDisposable
             foreach (var choice in visibleChoices)
             {
                 var slot = GetModelContainerSlot(choice.Model.GamePath) ?? "Model";
-                if (!ImGui.Selectable($"{slot} · {choice.Label}##custom-{choice.Identity}", string.Equals(_customiseSelection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase))) continue;
+                if (!SelectComboOption($"{slot} · {choice.Label}##custom-{choice.Identity}", string.Equals(_customiseSelection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase))) continue;
                 SelectCustomiseModel(choice);
                 _customiseFilter = string.Empty;
             }
@@ -966,7 +976,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var body in visibleBodies)
             {
-                if (!ImGui.Selectable($"{body.BodyName} / {body.VariantName}##piercing-{body.BodyId}-{body.VariantId}", body == _customisePiercingBody)) continue;
+                if (!SelectComboOption($"{body.BodyName} / {body.VariantName}##piercing-{body.BodyId}-{body.VariantId}", body == _customisePiercingBody)) continue;
                 _customisePiercingBody = body;
                 _customisePiercingFilter = string.Empty;
             }
@@ -1045,7 +1055,7 @@ internal sealed class MainWindow : Window, IDisposable
             DrawCustomisePartPreview(previewHeight);
             ImGui.EndTable();
         }
-        RavaFitUiChrome.DrawMutedText("Pick any regions you like. Colours match the list and preview. Drag to rotate, middle-drag to pan, wheel to zoom.");
+        RavaFitUiChrome.DrawMutedText("Pick any regions you like. The preview uses the mod's materials and textures. Drag to rotate, middle-drag to pan, wheel to zoom.");
     }
 
     private void DrawCustomisePartList(float height)
@@ -1125,7 +1135,7 @@ internal sealed class MainWindow : Window, IDisposable
                     if (!string.IsNullOrWhiteSpace(part.Material)) ImGui.TextWrapped(part.Material);
                     if (part.Attributes.Count > 0) ImGui.TextWrapped("Existing attributes: " + string.Join(", ", part.Attributes));
                     ImGui.TextUnformatted($"{part.VertexCount:N0} vertices · {part.IndexCount / 3:N0} triangles");
-                    if (!part.AttributeCapable) ImGui.TextWrapped("Preview only — this old mesh cannot have its own toggle.");
+                    if (!part.AttributeCapable) ImGui.TextWrapped("This part can be viewed here, but it cannot have its own toggle.");
                 }
             }
 
@@ -1140,14 +1150,14 @@ internal sealed class MainWindow : Window, IDisposable
         var scaleUi = ImGuiHelpers.GlobalScale;
         var toolbarStartY = ImGui.GetCursorPosY();
         var compactToolbar = ImGui.GetContentRegionAvail().X < 430f * scaleUi;
-        var modePreview = _customisePreviewMode.ToString();
+        var modePreview = GetPreviewModeLabel(_customisePreviewMode);
         ImGui.SetNextItemWidth(compactToolbar ? -1f : MathF.Min(130f * scaleUi, MathF.Max(90f * scaleUi, ImGui.GetContentRegionAvail().X * 0.28f)));
         using (var combo = ImRaii.Combo("##PreviewDisplayMode", modePreview))
         {
             if (combo.Success)
             {
                 foreach (var mode in Enum.GetValues<PreviewDisplayMode>())
-                    if (ImGui.Selectable(mode.ToString(), mode == _customisePreviewMode)) _customisePreviewMode = mode;
+                    if (SelectComboOption(GetPreviewModeLabel(mode), mode == _customisePreviewMode)) _customisePreviewMode = mode;
             }
         }
         if (!compactToolbar) ImGui.SameLine();
@@ -1259,7 +1269,7 @@ internal sealed class MainWindow : Window, IDisposable
             var selected = _customiseSelectedParts.Contains(item.Triangle.PartIndex);
             var hot = item.Triangle.PartIndex == _customiseHoveredPart;
             var diffuse = Math.Clamp(0.34f + (0.66f * MathF.Abs(Vector3.Dot(item.Normal, light))), 0.25f, 1f);
-            var baseAlpha = selected || hot ? 1f : (_customisePreviewDimOthers ? 0.28f : 0.82f);
+            var baseAlpha = selected || hot ? 1f : (_customisePreviewDimOthers ? 0.28f : 1f);
             var shaded = new Vector4(0.72f * diffuse, 0.74f * diffuse, 0.80f * diffuse, baseAlpha);
 
             if (_customisePreviewMode == PreviewDisplayMode.Wireframe)
@@ -1271,7 +1281,8 @@ internal sealed class MainWindow : Window, IDisposable
                 var textured = false;
                 if (_customisePreviewMode == PreviewDisplayMode.Textured && textureWraps.TryGetValue(item.Triangle.PartIndex, out var textureWrap))
                 {
-                    var tint = new Vector4(diffuse, diffuse, diffuse, baseAlpha);
+                    var materialLight = 0.78f + (0.22f * diffuse);
+                    var tint = new Vector4(materialLight, materialLight, materialLight, baseAlpha);
                     draw.AddImageQuad(textureWrap.Handle, item.A, item.B, item.C, item.C, item.Triangle.UvA, item.Triangle.UvB, item.Triangle.UvC, item.Triangle.UvC, ImGui.GetColorU32(tint));
                     textured = true;
                 }
@@ -1285,8 +1296,8 @@ internal sealed class MainWindow : Window, IDisposable
 
                 if (selected || hot)
                 {
-                    var overlay = selected ? GetCustomisePartColour(item.Triangle.PartIndex, hot ? 0.52f : 0.38f) : new Vector4(1f, 0.88f, 0.36f, 0.42f);
-                    draw.AddTriangleFilled(item.A, item.B, item.C, ImGui.GetColorU32(overlay));
+                    var outline = selected ? GetCustomisePartColour(item.Triangle.PartIndex, 1f) : new Vector4(1f, 0.88f, 0.36f, 1f);
+                    draw.AddTriangle(item.A, item.B, item.C, ImGui.GetColorU32(outline), 1.45f * scaleUi);
                 }
             }
         }
@@ -1723,7 +1734,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var asset in visibleAnimations)
             {
-                if (!ImGui.Selectable($"{asset.DisplayName}##vanilla-animation-{asset.Id}", string.Equals(asset.Id, _vanillaAnimation?.Id, StringComparison.OrdinalIgnoreCase))) continue;
+                if (!SelectComboOption($"{asset.DisplayName}##vanilla-animation-{asset.Id}", string.Equals(asset.Id, _vanillaAnimation?.Id, StringComparison.OrdinalIgnoreCase))) continue;
                 _vanillaAnimation = asset;
                 _animationSourceRaceOverride = PickDefaultVanillaAnimationSourceRace(asset)?.Code;
                 _vanillaAnimationFilter = string.Empty;
@@ -1777,7 +1788,7 @@ internal sealed class MainWindow : Window, IDisposable
             var identity = variant.SourceRace;
             if (identity is null) continue;
             var label = $"{identity.DisplayName} ({variant.GamePaths.Count} PAP{(variant.GamePaths.Count == 1 ? string.Empty : "s")})";
-            if (!ImGui.Selectable(label, string.Equals(selected?.SourceRaceCode, variant.SourceRaceCode, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!SelectComboOption(label, string.Equals(selected?.SourceRaceCode, variant.SourceRaceCode, StringComparison.OrdinalIgnoreCase))) continue;
             _animationSourceRaceOverride = variant.SourceRaceCode;
         }
     }
@@ -1808,7 +1819,7 @@ internal sealed class MainWindow : Window, IDisposable
         if (!combo.Success) return;
         foreach (var identity in available)
         {
-            if (!ImGui.Selectable(identity.DisplayName, string.Equals(current?.Code, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!SelectComboOption(identity.DisplayName, string.Equals(current?.Code, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
             _animationSourceRaceOverride = identity.Code;
         }
     }
@@ -1827,7 +1838,7 @@ internal sealed class MainWindow : Window, IDisposable
 
         if (current is not null)
         {
-            if (ImGui.Selectable($"Current character - {current.DisplayName}", _animationTargetRaceOverride is null))
+            if (SelectComboOption($"Current character - {current.DisplayName}", _animationTargetRaceOverride is null))
             {
                 _animationTargetRaceOverride = null;
                 _animationSkeletonChoiceId = AnimationSkeletonService.StandardChoiceId;
@@ -1837,7 +1848,7 @@ internal sealed class MainWindow : Window, IDisposable
 
         foreach (var identity in CharacterRaceCatalog.All)
         {
-            if (!ImGui.Selectable(identity.DisplayName, string.Equals(_animationTargetRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!SelectComboOption(identity.DisplayName, string.Equals(_animationTargetRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase))) continue;
             _animationTargetRaceOverride = identity.Code;
             _animationSkeletonChoiceId = AnimationSkeletonService.StandardChoiceId;
         }
@@ -1854,7 +1865,7 @@ internal sealed class MainWindow : Window, IDisposable
         if (!combo.Success) return;
         foreach (var choice in choices)
         {
-            if (!ImGui.Selectable(choice.DisplayName, string.Equals(current.Id, choice.Id, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!SelectComboOption(choice.DisplayName, string.Equals(current.Id, choice.Id, StringComparison.OrdinalIgnoreCase))) continue;
             _animationSkeletonChoiceId = choice.Id;
         }
     }
@@ -1983,7 +1994,7 @@ internal sealed class MainWindow : Window, IDisposable
 
         if (current is not null)
         {
-            if (ImGui.Selectable($"Current character - {current.DisplayName}", _swapTargetRaceOverride is null))
+            if (SelectComboOption($"Current character - {current.DisplayName}", _swapTargetRaceOverride is null))
             {
                 _swapTargetRaceOverride = null;
                 OnSwapTargetCharacterChanged();
@@ -1993,7 +2004,7 @@ internal sealed class MainWindow : Window, IDisposable
 
         foreach (var identity in CharacterRaceCatalog.All)
         {
-            if (!ImGui.Selectable(identity.DisplayName, string.Equals(_swapTargetRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase)))
+            if (!SelectComboOption(identity.DisplayName, string.Equals(_swapTargetRaceOverride, identity.Code, StringComparison.OrdinalIgnoreCase)))
                 continue;
             _swapTargetRaceOverride = identity.Code;
             OnSwapTargetCharacterChanged();
@@ -2097,7 +2108,7 @@ internal sealed class MainWindow : Window, IDisposable
 
         foreach (var choice in choices)
         {
-            if (!ImGui.Selectable(choice.Label + "##Swap" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
+            if (!SelectComboOption(choice.Label + "##Swap" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
                 continue;
             SetSwapSelection(row, choice);
         }
@@ -2140,7 +2151,7 @@ internal sealed class MainWindow : Window, IDisposable
             foreach (var item in visibleBodies)
             {
                 var text = $"{item.BodyName} / {item.VariantName}";
-                if (!ImGui.Selectable(text, current == item))
+                if (!SelectComboOption(text, current == item))
                     continue;
                 if (isTarget)
                 {
@@ -2217,7 +2228,7 @@ internal sealed class MainWindow : Window, IDisposable
             foreach (var mod in visibleMods)
             {
                 var selected = _selectedMod?.Directory == mod.Directory;
-                if (ImGui.Selectable(mod.Name, selected))
+                if (SelectComboOption(mod.Name, selected))
                     SelectMod(mod);
             }
         });
@@ -2229,7 +2240,7 @@ internal sealed class MainWindow : Window, IDisposable
         if (!choicesMap.Values.Any(choices => choices.Count > 0)) return;
         var rows = swap ? _swapAccessoryRows : _accessoryRows;
         ImGuiHelpers.ScaledDummy(8f);
-        RavaFitUiChrome.DrawSectionTitle("Accessory garments", "Accessories are fitted as garments only; their body support comes from coverage analysis.");
+        RavaFitUiChrome.DrawSectionTitle("Accessory garments", "Accessories use body shapes for fitting only. Choosing support bodies does not convert another outfit piece.");
         foreach (var slot in AccessoryModelSlots.All.Where(slot => choicesMap[slot].Count > 0))
         {
             var row = rows[slot];
@@ -2246,11 +2257,11 @@ internal sealed class MainWindow : Window, IDisposable
                 ImGui.TableNextColumn(); DrawAccessorySelectionCell(row, swap);
                 ImGui.EndTable();
             }
-            if (row.Analysing) RavaFitUiChrome.DrawMutedText("Checking garment coverage...");
+            if (row.Analysing) RavaFitUiChrome.DrawMutedText("Checking fit...");
             else if (row.Analysis is not null)
             {
                 var required = string.Join(" + ", row.Analysis.Slots.Values.Where(e => e.Primary || e.Recommended).OrderByDescending(e => e.Primary).Select(e => e.Slot).Distinct(StringComparer.OrdinalIgnoreCase));
-                RavaFitUiChrome.DrawMutedText($"Fits as {row.Analysis.PrimarySlot}{(string.IsNullOrWhiteSpace(required) ? string.Empty : $" · support {required}")} · garment only");
+                RavaFitUiChrome.DrawMutedText($"Fits against {row.Analysis.PrimarySlot}{(string.IsNullOrWhiteSpace(required) ? string.Empty : $" · uses {required}")}");
                 DrawAccessorySupportBodies(row, swap);
             }
             else if (!string.IsNullOrWhiteSpace(row.Status)) RavaFitUiChrome.DrawMutedWrappedText(row.Status);
@@ -2273,7 +2284,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var choice in visible)
             {
-                if (!ImGui.Selectable(choice.Label + "##" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase))) continue;
+                if (!SelectComboOption(choice.Label + "##" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase))) continue;
                 SetAccessorySelection(row, choice, swap); _selectionFilter = string.Empty;
             }
         });
@@ -2360,7 +2371,7 @@ internal sealed class MainWindow : Window, IDisposable
                 var label = $"{item.BodyName} / {item.VariantName}";
                 if (!string.Equals(item.Collection, item.BodyName, StringComparison.OrdinalIgnoreCase))
                     label += $"  [{item.Collection}]";
-                if (!ImGui.Selectable(label, current == item)) continue;
+                if (!SelectComboOption(label, current == item)) continue;
 
                 if (isTarget)
                 {
@@ -2377,6 +2388,36 @@ internal sealed class MainWindow : Window, IDisposable
 
         if (available.Length == 0)
             RavaFitUiChrome.DrawMutedText("No compatible bodies found.");
+    }
+
+    private IReadOnlyList<string> GetOutfitSupportConsumers(string supportSlot)
+    {
+        var consumers = new List<string>();
+        foreach (var row in _outfitRows.Values)
+        {
+            if (!row.Enabled || row.Selection is null || row.Analysis is null || string.Equals(row.Slot, supportSlot, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!row.Analysis.Slots.TryGetValue(supportSlot, out var evidence) || (!evidence.Primary && !evidence.Recommended)) continue;
+            consumers.Add(row.Slot);
+        }
+        return consumers.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private void DrawOutfitSupportNotices()
+    {
+        foreach (var row in _outfitRows.Values.Where(value => value.Enabled && value.Selection is not null && value.Analysis is not null))
+        {
+            var support = BodySlots.All.Where(slot => !string.Equals(slot, row.Slot, StringComparison.OrdinalIgnoreCase)
+                && row.Analysis!.Slots.TryGetValue(slot, out var evidence) && (evidence.Primary || evidence.Recommended)).ToArray();
+            if (support.Length == 0) continue;
+            ImGuiHelpers.ScaledDummy(4f);
+            var names = string.Join(" and ", support.Select(slot => slot.ToLowerInvariant()));
+            var shapeWord = support.Length == 1 ? "body shape" : "body shapes";
+            var pieceWord = support.Length == 1 ? "outfit piece" : "outfit pieces";
+            ImGui.TextColored(WarningColour, $"{row.Slot} needs the {names} {shapeWord} to fit properly.");
+            RavaFitUiChrome.DrawMutedWrappedText(_convertUseVanilla
+                ? $"Choose the {names} target body below. This is only a fitting reference. It won't convert the {names} {pieceWord}."
+                : $"Choose the {names} source and target bodies below. These are only fitting references. They won't convert the {names} {pieceWord}.");
+        }
     }
 
     private void DrawOutfitRows()
@@ -2401,7 +2442,10 @@ internal sealed class MainWindow : Window, IDisposable
         foreach (var slot in BodySlots.All)
         {
             var row = _outfitRows[slot];
+            var supportFor = GetOutfitSupportConsumers(slot);
             ImGui.TableNextRow();
+            if (supportFor.Count > 0)
+                ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(0.52f, 0.36f, 0.78f, 0.16f)));
             ImGui.TableNextColumn();
             var enabled = row.Enabled;
             using (ImRaii.Disabled(row.Selection is null))
@@ -2413,6 +2457,12 @@ internal sealed class MainWindow : Window, IDisposable
             ImGui.TableNextColumn();
             ImGui.AlignTextToFramePadding();
             ImGui.TextUnformatted(slot);
+            if (supportFor.Count > 0)
+            {
+                ImGui.TextColored(WarningColour, "Fit support");
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip($"Used to fit {string.Join(", ", supportFor)}. This does not convert the {slot} outfit piece.");
+            }
 
             ImGui.TableNextColumn();
             DrawOutfitSelectionCell(row);
@@ -2425,6 +2475,7 @@ internal sealed class MainWindow : Window, IDisposable
         }
 
         ImGui.EndTable();
+        DrawOutfitSupportNotices();
     }
 
     private void DrawOutfitRowsNarrow()
@@ -2432,6 +2483,7 @@ internal sealed class MainWindow : Window, IDisposable
         foreach (var slot in BodySlots.All)
         {
             var row = _outfitRows[slot];
+            var supportFor = GetOutfitSupportConsumers(slot);
             ImGui.PushID($"outfit-narrow-{slot}");
             ImGui.Separator();
             var enabled = row.Enabled;
@@ -2441,6 +2493,11 @@ internal sealed class MainWindow : Window, IDisposable
             }
             ImGui.SameLine();
             ImGui.TextUnformatted(slot);
+            if (supportFor.Count > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(WarningColour, $"Fit support for {string.Join(", ", supportFor)}");
+            }
             if (ImGui.BeginTable("##fields", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.NoSavedSettings))
             {
                 ImGui.TableSetupColumn("##label", ImGuiTableColumnFlags.WidthFixed, GetFieldColumnWidth());
@@ -2454,6 +2511,7 @@ internal sealed class MainWindow : Window, IDisposable
             ImGuiHelpers.ScaledDummy(4f);
         }
         ImGui.Separator();
+        DrawOutfitSupportNotices();
     }
 
     private void DrawOutfitSelectionCell(OutfitRowState row)
@@ -2482,7 +2540,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var choice in visibleChoices)
             {
-                if (!ImGui.Selectable(choice.Label + "##" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
+                if (!SelectComboOption(choice.Label + "##" + choice.Identity, string.Equals(row.Selection?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
                     continue;
                 SetOutfitSelection(row, choice);
                 _selectionFilter = string.Empty;
@@ -2532,7 +2590,7 @@ internal sealed class MainWindow : Window, IDisposable
                 var text = $"{item.BodyName} / {item.VariantName}";
                 if (!string.Equals(item.Collection, item.BodyName, StringComparison.OrdinalIgnoreCase))
                     text += $"  [{item.Collection}]";
-                if (!ImGui.Selectable(text, current == item))
+                if (!SelectComboOption(text, current == item))
                     continue;
 
                 if (isTarget)
@@ -2832,12 +2890,12 @@ internal sealed class MainWindow : Window, IDisposable
         row.SourceUserOverrides.Clear();
         if (_selectedMod is null || !_plugin.ModelBridge.Status.Available || !_plugin.Solver.Ready)
         {
-            row.Status = "Coverage analysis is not ready.";
+            row.Status = "Fit check is not ready yet.";
             return;
         }
         row.Cancellation = new CancellationTokenSource();
         var token = row.Cancellation.Token; var revision = ++row.Revision; var identity = choice.Identity; var mod = _selectedMod;
-        row.Analysing = true; row.Status = "Checking garment coverage...";
+        row.Analysing = true; row.Status = "Checking fit...";
         _ = AnalyseAccessoryRowAsync(row.Slot, revision, identity, mod, choice, swap, token);
     }
 
@@ -2865,7 +2923,7 @@ internal sealed class MainWindow : Window, IDisposable
             {
                 var row = (swap ? _swapAccessoryRows : _accessoryRows)[accessorySlot];
                 if (revision != row.Revision || !string.Equals(row.Selection?.Identity, identity, StringComparison.OrdinalIgnoreCase)) return;
-                row.Analysing = false; row.Status = "Accessory coverage failed: " + ex.Message;
+                row.Analysing = false; row.Status = "Couldn't check this accessory: " + ex.Message;
             });
         }
     }
@@ -2873,7 +2931,7 @@ internal sealed class MainWindow : Window, IDisposable
     private bool TryBuildAccessorySlotSelections(AccessoryOutfitRowState row, bool swap, out IReadOnlyList<SlotConversionSelection> selections, out string reason)
     {
         selections = Array.Empty<SlotConversionSelection>(); reason = string.Empty;
-        if (row.Selection is null || row.Analysis is null) { reason = $"Wait for {row.Slot} coverage analysis."; return false; }
+        if (row.Selection is null || row.Analysis is null) { reason = $"Wait for the {row.Slot} fit check to finish."; return false; }
         var raceCode = GetModelRaceCode(row.Selection.Model.GamePath);
         var sourceIdentity = CharacterRaceCatalog.FromCode(raceCode);
         if (sourceIdentity is null) { reason = $"{row.Slot} selection does not expose a supported human race."; return false; }
@@ -3051,7 +3109,7 @@ internal sealed class MainWindow : Window, IDisposable
                 if (target is null) target = string.Equals(slot, row.Slot, StringComparison.OrdinalIgnoreCase) ? row.Target : _plugin.Bodies.FindSibling(row.Target, slot);
                 if (target is null || !target.SupportsGender(identity.Gender))
                 {
-                    reason = $"This {row.Slot.ToLowerInvariant()} also needs a {slot.ToLowerInvariant()} body. Pick one below.";
+                    reason = $"{row.Slot} also uses the {slot.ToLowerInvariant()} body shape while fitting. Choose the {slot.ToLowerInvariant()} target body below; the {slot.ToLowerInvariant()} outfit piece does not need to be converted.";
                     return false;
                 }
                 vanillaBuiltSelections.Add(new SlotConversionSelection(slot, null, target, raceCode));
@@ -3083,12 +3141,12 @@ internal sealed class MainWindow : Window, IDisposable
             if (target is null) target = string.Equals(slot, row.Slot, StringComparison.OrdinalIgnoreCase) ? row.Target : _plugin.Bodies.FindSibling(row.Target, slot);
             if (source is null || !source.SupportsGender(identity.Gender))
             {
-                reason = $"This {row.Slot.ToLowerInvariant()} also needs a {slot.ToLowerInvariant()} source body. Pick one below.";
+                reason = $"{row.Slot} also uses the {slot.ToLowerInvariant()} body shape while fitting. Choose the {slot.ToLowerInvariant()} source body below; the {slot.ToLowerInvariant()} outfit piece does not need to be converted.";
                 return false;
             }
             if (target is null || !target.SupportsGender(identity.Gender))
             {
-                reason = $"This {row.Slot.ToLowerInvariant()} also needs a {slot.ToLowerInvariant()} body. Pick one below.";
+                reason = $"{row.Slot} also uses the {slot.ToLowerInvariant()} body shape while fitting. Choose the {slot.ToLowerInvariant()} target body below; the {slot.ToLowerInvariant()} outfit piece does not need to be converted.";
                 return false;
             }
             built.Add(new SlotConversionSelection(slot, source, target, raceCode));
@@ -3236,7 +3294,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var mod in visibleMods)
             {
-                if (!ImGui.Selectable(mod.Name, string.Equals(_bodyImportMod?.Directory, mod.Directory, StringComparison.OrdinalIgnoreCase)))
+                if (!SelectComboOption(mod.Name, string.Equals(_bodyImportMod?.Directory, mod.Directory, StringComparison.OrdinalIgnoreCase)))
                     continue;
                 SelectBodyImportMod(mod);
                 _bodyImportModFilter = string.Empty;
@@ -3262,7 +3320,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             foreach (var choice in visibleChoices)
             {
-                if (!ImGui.Selectable(choice.Label, string.Equals(_bodyImportChoice?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
+                if (!SelectComboOption(choice.Label, string.Equals(_bodyImportChoice?.Identity, choice.Identity, StringComparison.OrdinalIgnoreCase)))
                     continue;
                 _bodyImportChoice = choice;
                 _bodyImportVariantName = choice.Option.Name;
@@ -3368,7 +3426,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             if (accessory.Selection is null || accessory.Analysing || accessory.Analysis is null)
             {
-                reason = accessory.Analysing ? $"Checking {accessory.Slot} garment coverage..." : $"Choose and analyse a {accessory.Slot} accessory garment.";
+                reason = accessory.Analysing ? $"Checking {accessory.Slot} fit..." : $"Choose a {accessory.Slot} accessory.";
                 return false;
             }
             if (!TryBuildAccessorySlotSelections(accessory, swap: true, out _, out reason)) return false;
@@ -3389,12 +3447,12 @@ internal sealed class MainWindow : Window, IDisposable
         }
         if (!_plugin.ModelBridge.Status.Available)
         {
-            reason = "Model bridge unavailable.";
+            reason = "Model tools are unavailable.";
             return false;
         }
         if (!_plugin.Solver.Ready || !_plugin.Solver.ConversionReady)
         {
-            reason = "Solver not ready.";
+            reason = "RavaFit is still getting ready.";
             return false;
         }
         reason = string.Empty;
@@ -3559,7 +3617,7 @@ internal sealed class MainWindow : Window, IDisposable
         {
             if (accessory.Selection is null || accessory.Analysing || accessory.Analysis is null)
             {
-                reason = accessory.Analysing ? $"Checking {accessory.Slot} garment coverage..." : $"Choose and analyse a {accessory.Slot} accessory garment.";
+                reason = accessory.Analysing ? $"Checking {accessory.Slot} fit..." : $"Choose a {accessory.Slot} accessory.";
                 return false;
             }
             if (!TryBuildAccessorySlotSelections(accessory, swap: false, out _, out reason)) return false;
@@ -3591,12 +3649,12 @@ internal sealed class MainWindow : Window, IDisposable
 
         if (!_plugin.ModelBridge.Status.Available)
         {
-            reason = "Penumbra model bridge is unavailable.";
+            reason = "Model tools are unavailable.";
             return false;
         }
         if (!_plugin.Solver.Ready || !_plugin.Solver.ConversionReady)
         {
-            reason = "Solver runtime is not ready for conversion.";
+            reason = "RavaFit is still getting ready.";
             return false;
         }
 

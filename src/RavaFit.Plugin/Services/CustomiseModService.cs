@@ -1,5 +1,7 @@
 using System.Numerics;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Text.Json.Nodes;
 using Dalamud.Plugin.Services;
 using RavaFit.Core.Models;
@@ -313,17 +315,16 @@ internal sealed class CustomiseModService
         }
     }
 
-    public async Task<V4AppendResult> SplitToAccessoryAsync(AccessorySplitRequest request, CancellationToken cancellationToken = default)
+    public async Task<PenumbraModInfo> SplitToAccessoryAsync(AccessorySplitRequest request, CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var generated = new List<GeneratedModelFile>();
         string? work = null;
-        var metaCommitted = false;
+        string? createdRoot = null;
         try
         {
             RequireReady();
             if (request.PartIndices.Count == 0) throw new InvalidOperationException("Select at least one model part to split into the accessory.");
-            if (string.IsNullOrWhiteSpace(request.OutputOptionName)) throw new InvalidOperationException("Give the generated option a name.");
+            if (string.IsNullOrWhiteSpace(request.OutputOptionName)) throw new InvalidOperationException("Give the new mod a name.");
             var targetAccessorySlot = AccessoryModelSlots.FromGamePath(request.TargetGamePath)
                 ?? throw new InvalidOperationException("Choose a supported XIV accessory target (earrings, necklace, wrists or ring).");
             if (string.Equals(request.Model.GamePath.Replace('\\', '/'), request.TargetGamePath.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))
@@ -331,7 +332,7 @@ internal sealed class CustomiseModService
             var sourceRaceCode = ResolveRaceCode(request.Model.GamePath);
             var targetRaceCode = ResolveRaceCode(request.TargetGamePath);
             if (!string.Equals(sourceRaceCode, targetRaceCode, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Accessory split keeps the source garment rig exactly as authored. Choose the accessory for the same race/gender; use Race/Gender Swap afterwards if you want to port it.");
+                throw new InvalidOperationException("Choose an accessory for the same race and gender. You can use Race/Gender Swap on the finished mod afterwards.");
 
             var document = PenumbraV4Document.Load(Path.Combine(request.Mod.ModRoot, "meta.json"));
             var liveModel = document.GetModelRedirects(request.GroupKey, request.OptionKey).FirstOrDefault(candidate => string.Equals(candidate.GamePath, request.Model.GamePath, StringComparison.OrdinalIgnoreCase))
@@ -342,6 +343,7 @@ internal sealed class CustomiseModService
             var selectedMaterialReferences = await GetAccessorySupportMaterialReferencesAsync(physical, request.PartIndices, cancellationToken).ConfigureAwait(false);
             var targetMaterialIds = ResolveTargetAccessoryMaterialIds(document, request.TargetGamePath, request.TargetVariantId, request.TargetVanillaMaterialId);
             var materialPayloads = ResolveAccessoryMaterialPayloads(document, request.GroupKey, request.OptionKey, request.Model.GamePath, selectedMaterialReferences);
+            var texturePayloads = ResolveAccessoryTexturePayloads(document, request.GroupKey, request.OptionKey, materialPayloads);
 
             work = CreateWorkDirectory("split-accessory");
             var remainingMdl = Path.Combine(work, "remaining.mdl");
@@ -360,49 +362,23 @@ internal sealed class CustomiseModService
                 throw new InvalidDataException("Accessory split completed without producing both native MDL outputs.");
             var sourceLength = new FileInfo(physical).Length;
             if (new FileInfo(remainingMdl).Length != sourceLength || new FileInfo(accessoryMdl).Length != sourceLength)
-                throw new InvalidDataException("Accessory split changed native MDL size; nothing was written to the mod.");
+                throw new InvalidDataException("Accessory split changed native MDL size; nothing was written.");
             var remainingBytes = await File.ReadAllBytesAsync(remainingMdl, cancellationToken).ConfigureAwait(false);
             var accessoryBytes = await File.ReadAllBytesAsync(accessoryMdl, cancellationToken).ConfigureAwait(false);
             if (remainingBytes.AsSpan().SequenceEqual(accessoryBytes))
-                throw new InvalidDataException("Accessory split did not produce distinct source/accessory visibility states; nothing was written to the mod.");
+                throw new InvalidDataException("Accessory split did not produce distinct source and accessory models.");
 
-            var sourceGenerated = await _store.WriteAsync(request.Mod.ModRoot, request.Model.GamePath, request.OutputOptionName + " source", remainingBytes, cancellationToken).ConfigureAwait(false);
-            generated.Add(sourceGenerated);
-            var accessoryGenerated = await _store.WriteAsync(request.Mod.ModRoot, request.TargetGamePath, request.OutputOptionName + " accessory", accessoryBytes, cancellationToken).ConfigureAwait(false);
-            generated.Add(accessoryGenerated);
-
-            var supportingRedirects = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var material in materialPayloads)
-            {
-                var firstTargetPath = BuildAccessoryMaterialGamePath(request.TargetGamePath, targetMaterialIds[0], material.FileName);
-                var materialGenerated = await _store.WriteResourceAsync(request.Mod.ModRoot, firstTargetPath, request.OutputOptionName + " accessory material", material.Bytes, cancellationToken).ConfigureAwait(false);
-                generated.Add(materialGenerated);
-                foreach (var materialId in targetMaterialIds)
-                    supportingRedirects[BuildAccessoryMaterialGamePath(request.TargetGamePath, materialId, material.FileName)] = materialGenerated.RelativePath;
-            }
-
-            Status = $"Creating {request.OutputOptionName}";
-            var redirects = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                [sourceGenerated.GamePath] = sourceGenerated.RelativePath,
-                [accessoryGenerated.GamePath] = accessoryGenerated.RelativePath,
-            };
-            var result = await _writer.AppendClonedOptionAsync(new V4AppendRequest(
-                Path.Combine(request.Mod.ModRoot, "meta.json"), request.GroupKey, request.OptionKey, request.OutputOptionName, redirects, supportingRedirects), cancellationToken).ConfigureAwait(false);
-            metaCommitted = true;
-            if (!_penumbra.Reload(request.Mod, out var reloadError))
-                throw new InvalidOperationException($"Accessory split was written safely, but Penumbra reload failed: {reloadError}");
-            Status = $"Split selected parts to {request.TargetDisplayName} ({targetAccessorySlot})";
-            return result;
+            Status = "Creating new mod...";
+            var created = await CreateStandaloneAccessoryModAsync(request, document, remainingBytes, accessoryBytes, targetMaterialIds, materialPayloads, texturePayloads, cancellationToken).ConfigureAwait(false);
+            createdRoot = created.ModRoot;
+            Status = $"Created {created.Name}";
+            return created;
         }
         catch
         {
-            if (!metaCommitted)
+            if (!string.IsNullOrWhiteSpace(createdRoot))
             {
-                foreach (var file in generated)
-                {
-                    try { if (File.Exists(file.AbsolutePath)) File.Delete(file.AbsolutePath); } catch { }
-                }
+                try { if (Directory.Exists(createdRoot)) Directory.Delete(createdRoot, true); } catch { }
             }
             throw;
         }
@@ -417,13 +393,229 @@ internal sealed class CustomiseModService
     }
 
     private sealed record AccessoryMaterialPayload(string FileName, string SourceGamePath, byte[] Bytes);
+    private sealed record AccessoryTexturePayload(string GamePath, byte[] Bytes);
+
+    private async Task<PenumbraModInfo> CreateStandaloneAccessoryModAsync(AccessorySplitRequest request, PenumbraV4Document sourceDocument, byte[] remainingMdl, byte[] accessoryMdl,
+        IReadOnlyList<byte> targetMaterialIds, IReadOnlyList<AccessoryMaterialPayload> materials, IReadOnlyList<AccessoryTexturePayload> textures, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_penumbra.ModDirectoryRoot) || !Directory.Exists(_penumbra.ModDirectoryRoot))
+            throw new DirectoryNotFoundException("Penumbra did not provide its mod directory.");
+
+        var displayName = MakeUniqueStandaloneModName(request.OutputOptionName.Trim());
+        var directoryName = MakeUniqueStandaloneDirectoryName(displayName);
+        var root = Path.Combine(_penumbra.ModDirectoryRoot, directoryName);
+        Directory.CreateDirectory(root);
+        try
+        {
+            var data = BuildEffectiveStandaloneData(sourceDocument, request.GroupKey, request.OptionKey);
+            var files = PenumbraV4Document.FindProperty(data, "Files") as JsonObject;
+            if (files is null)
+            {
+                files = new JsonObject();
+                SetJsonProperty(data, "Files", files);
+            }
+
+            var sourceMappings = CollectEffectiveFileMappings(sourceDocument, request.GroupKey, request.OptionKey);
+            foreach (var (gamePath, relative) in sourceMappings)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var source = sourceDocument.ResolvePhysicalPath(new ModelRedirect(gamePath, relative, false));
+                if (!File.Exists(source))
+                    throw new FileNotFoundException($"The selected option points to a missing file for '{gamePath}'.", source);
+                var copiedRelative = await CopyStandaloneFileAsync(root, gamePath, source, cancellationToken).ConfigureAwait(false);
+                files[gamePath] = copiedRelative;
+            }
+
+            files[NormalizeResourcePath(request.Model.GamePath)] = await WriteStandaloneBytesAsync(root, request.Model.GamePath, remainingMdl, cancellationToken).ConfigureAwait(false);
+            files[NormalizeResourcePath(request.TargetGamePath)] = await WriteStandaloneBytesAsync(root, request.TargetGamePath, accessoryMdl, cancellationToken).ConfigureAwait(false);
+
+            foreach (var material in materials)
+            {
+                var relative = await WriteStandaloneBytesAsync(root, material.SourceGamePath, material.Bytes, cancellationToken).ConfigureAwait(false);
+                files[NormalizeResourcePath(material.SourceGamePath)] = relative;
+                foreach (var materialId in targetMaterialIds)
+                    files[BuildAccessoryMaterialGamePath(request.TargetGamePath, materialId, material.FileName)] = relative;
+            }
+
+            foreach (var texture in textures)
+                files[NormalizeResourcePath(texture.GamePath)] = await WriteStandaloneBytesAsync(root, texture.GamePath, texture.Bytes, cancellationToken).ConfigureAwait(false);
+
+            var meta = new JsonObject
+            {
+                ["FileVersion"] = 4,
+                ["Name"] = displayName,
+                ["Author"] = string.IsNullOrWhiteSpace(sourceDocument.Author) ? "RavaFit" : sourceDocument.Author,
+                ["Version"] = "1.0.0",
+                ["Website"] = sourceDocument.Website,
+                ["Description"] = $"Accessory split from {request.Mod.Name}. {request.TargetDisplayName} carries the selected parts; the original outfit piece is kept without them.",
+                ["Tags"] = new JsonArray(),
+                ["LastWrite"] = DateTimeOffset.UtcNow.ToString("O"),
+                ["DefaultData"] = data,
+                ["PageNames"] = new JsonObject(),
+                ["Groups"] = new JsonArray(),
+            };
+
+            var metaPath = Path.Combine(root, "meta.json");
+            await File.WriteAllTextAsync(metaPath, meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), cancellationToken).ConfigureAwait(false);
+            _ = PenumbraV4Document.Load(metaPath);
+            if (!_penumbra.AddMod(directoryName, out var addError))
+                throw new InvalidOperationException($"The new mod was created, but Penumbra could not add it: {addError}");
+            _penumbra.Refresh();
+            return _penumbra.Mods.FirstOrDefault(mod => string.Equals(Path.GetFullPath(mod.ModRoot), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase))
+                ?? new PenumbraModInfo(directoryName, displayName, root);
+        }
+        catch
+        {
+            try { Directory.Delete(root, true); } catch { }
+            throw;
+        }
+    }
+
+    private IReadOnlyList<AccessoryTexturePayload> ResolveAccessoryTexturePayloads(PenumbraV4Document document, string groupKey, string optionKey, IReadOnlyList<AccessoryMaterialPayload> materials)
+    {
+        var output = new Dictionary<string, AccessoryTexturePayload>(StringComparer.OrdinalIgnoreCase);
+        foreach (var material in materials)
+        {
+            var ascii = Encoding.ASCII.GetString(material.Bytes);
+            foreach (Match match in Regex.Matches(ascii, @"[a-z0-9_./\\-]{3,}?\.tex", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            {
+                var gamePath = ResolveTextureGamePath(material.SourceGamePath, match.Value);
+                if (string.IsNullOrWhiteSpace(gamePath) || output.ContainsKey(gamePath)) continue;
+                var bytes = ReadResourceBytes(document, groupKey, optionKey, gamePath);
+                if (bytes is null || bytes.Length == 0) continue;
+                output[gamePath] = new AccessoryTexturePayload(gamePath, bytes);
+            }
+        }
+        return output.Values.OrderBy(value => value.GamePath, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static string? ResolveTextureGamePath(string materialGamePath, string rawReference)
+    {
+        var value = NormalizeResourcePath(rawReference);
+        var chara = value.IndexOf("chara/", StringComparison.OrdinalIgnoreCase);
+        if (chara >= 0) return value[chara..];
+        if (value.StartsWith("common/", StringComparison.OrdinalIgnoreCase)) return value;
+        var fileName = Path.GetFileName(value.Replace('/', Path.DirectorySeparatorChar));
+        if (string.IsNullOrWhiteSpace(fileName)) return null;
+        var material = NormalizeResourcePath(materialGamePath);
+        var marker = material.IndexOf("/material/", StringComparison.OrdinalIgnoreCase);
+        if (marker <= 0) return null;
+        return $"{material[..marker]}/texture/{ExtractVersionFolder(material) ?? "v0001"}/{fileName}";
+    }
+
+    private static JsonObject BuildEffectiveStandaloneData(PenumbraV4Document document, string groupKey, string optionKey)
+    {
+        var result = EmptyOptionData();
+        MergeOptionData(result, PenumbraV4Document.FindProperty(document.Root, "DefaultData") as JsonObject);
+        MergeOptionData(result, document.GetOption(document.GetGroup(groupKey), optionKey).Node);
+        return result;
+    }
+
+    private static Dictionary<string, string> CollectEffectiveFileMappings(PenumbraV4Document document, string groupKey, string optionKey)
+    {
+        var mappings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        AddFileMappings(mappings, PenumbraV4Document.FindProperty(document.Root, "DefaultData"));
+        AddFileMappings(mappings, document.GetOption(document.GetGroup(groupKey), optionKey).Node);
+        return mappings;
+    }
+
+    private static void AddFileMappings(Dictionary<string, string> output, JsonNode? node)
+    {
+        if (node is not JsonObject obj || PenumbraV4Document.FindProperty(obj, "Files") is not JsonObject files) return;
+        foreach (var pair in files)
+            if (pair.Value is JsonValue value && value.TryGetValue<string>(out var relative) && !string.IsNullOrWhiteSpace(relative))
+                output[NormalizeResourcePath(pair.Key)] = relative;
+    }
+
+    private static JsonObject EmptyOptionData() => new()
+    {
+        ["Files"] = new JsonObject(),
+        ["FileSwaps"] = new JsonObject(),
+        ["Manipulations"] = new JsonArray(),
+    };
+
+    private static void MergeOptionData(JsonObject destination, JsonObject? source)
+    {
+        if (source is null) return;
+        MergeJsonObjectMap(destination, source, "Files");
+        MergeJsonObjectMap(destination, source, "FileSwaps");
+        var destinationManipulations = PenumbraV4Document.FindProperty(destination, "Manipulations") as JsonArray;
+        if (destinationManipulations is null)
+        {
+            destinationManipulations = new JsonArray();
+            SetJsonProperty(destination, "Manipulations", destinationManipulations);
+        }
+        if (PenumbraV4Document.FindProperty(source, "Manipulations") is JsonArray sourceManipulations)
+            foreach (var manipulation in sourceManipulations)
+                destinationManipulations.Add(manipulation?.DeepClone());
+    }
+
+    private static void MergeJsonObjectMap(JsonObject destination, JsonObject source, string name)
+    {
+        var target = PenumbraV4Document.FindProperty(destination, name) as JsonObject;
+        if (target is null)
+        {
+            target = new JsonObject();
+            SetJsonProperty(destination, name, target);
+        }
+        if (PenumbraV4Document.FindProperty(source, name) is not JsonObject sourceMap) return;
+        foreach (var pair in sourceMap) target[pair.Key] = pair.Value?.DeepClone();
+    }
+
+    private static void SetJsonProperty(JsonObject obj, string name, JsonNode? value)
+    {
+        var existing = PenumbraV4Document.FindPropertyName(obj, name);
+        obj[existing ?? name] = value;
+    }
+
+    private static async Task<string> CopyStandaloneFileAsync(string root, string gamePath, string source, CancellationToken cancellationToken)
+    {
+        var bytes = await File.ReadAllBytesAsync(source, cancellationToken).ConfigureAwait(false);
+        return await WriteStandaloneBytesAsync(root, gamePath, bytes, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<string> WriteStandaloneBytesAsync(string root, string gamePath, ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
+    {
+        if (bytes.IsEmpty) throw new InvalidDataException($"'{gamePath}' is empty.");
+        var normalized = NormalizeResourcePath(gamePath);
+        if (normalized.Split('/', StringSplitOptions.RemoveEmptyEntries).Any(segment => segment == "..")) throw new InvalidDataException($"Invalid game path '{gamePath}'.");
+        var relative = Path.Combine("Files", normalized.Replace('/', Path.DirectorySeparatorChar)).Replace('\\', '/');
+        var absolute = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+        var rootPrefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
+        if (!absolute.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Invalid game path '{gamePath}'.");
+        Directory.CreateDirectory(Path.GetDirectoryName(absolute)!);
+        await File.WriteAllBytesAsync(absolute, bytes.ToArray(), cancellationToken).ConfigureAwait(false);
+        return relative;
+    }
+
+    private string MakeUniqueStandaloneModName(string requested)
+    {
+        var baseName = string.IsNullOrWhiteSpace(requested) ? "RavaFit Accessory" : requested.Trim();
+        if (_penumbra.Mods.All(mod => !string.Equals(mod.Name, baseName, StringComparison.OrdinalIgnoreCase))) return baseName;
+        for (var i = 2; ; i++)
+        {
+            var candidate = $"{baseName} ({i})";
+            if (_penumbra.Mods.All(mod => !string.Equals(mod.Name, candidate, StringComparison.OrdinalIgnoreCase))) return candidate;
+        }
+    }
+
+    private string MakeUniqueStandaloneDirectoryName(string displayName)
+    {
+        var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+        var safe = new string(displayName.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim().Trim('.');
+        if (string.IsNullOrWhiteSpace(safe)) safe = "RavaFit Accessory";
+        var candidate = safe;
+        for (var i = 2; Directory.Exists(Path.Combine(_penumbra.ModDirectoryRoot, candidate)); i++) candidate = $"{safe} ({i})";
+        return candidate;
+    }
+
 
     private async Task<IReadOnlyList<string>> GetAccessorySupportMaterialReferencesAsync(string physicalMdl, IReadOnlyList<int> requestedPartIndices, CancellationToken cancellationToken)
     {
         using var reply = await _solver.CallAsync("inspect_mdl_parts", new { mdl = physicalMdl }, cancellationToken).ConfigureAwait(false);
         EnsureOk(reply.RootElement, "Could not inspect selected parts before the accessory split.");
         if (!reply.RootElement.TryGetProperty("parts", out var parts) || parts.ValueKind != JsonValueKind.Array)
-            throw new InvalidDataException("Accessory split inspection did not return authored model parts.");
+            throw new InvalidDataException("RavaFit could not read the selected model parts.");
 
         var requested = requestedPartIndices.Distinct().ToHashSet();
         var found = new HashSet<int>();
@@ -439,7 +631,7 @@ internal sealed class CustomiseModService
             found.Add(partIndex);
             selectedMeshes.Add(meshIndex);
             if (string.IsNullOrWhiteSpace(material) || !material.EndsWith(".mtrl", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"Selected part {partIndex} has no resolvable XIV material reference, so RavaFit will not create a broken accessory.");
+                throw new InvalidDataException("One of the selected parts has no usable material, so the accessory cannot be created safely.");
         }
         if (!requested.SetEquals(found))
             throw new InvalidDataException("One or more selected model parts are no longer valid. Refresh Customise and retry.");
@@ -470,7 +662,7 @@ internal sealed class CustomiseModService
             if (byFileName.TryGetValue(fileName, out var existing))
             {
                 if (!existing.Bytes.AsSpan().SequenceEqual(bytes))
-                    throw new InvalidDataException($"Selected garment parts use two different materials named '{fileName}'. RavaFit cannot safely collapse those into one accessory material name.");
+                    throw new InvalidDataException($"Two selected materials both use the file name '{fileName}'. Rename one in the source mod, then try again.");
                 continue;
             }
             byFileName[fileName] = new AccessoryMaterialPayload(fileName, gamePath, bytes);
@@ -725,8 +917,8 @@ internal sealed class CustomiseModService
 
     private void RequireReady()
     {
-        if (!_solver.Ready || !_solver.ConversionReady) throw new InvalidOperationException("Solver runtime is not ready.");
-        if (!_bridge.Status.Available) throw new InvalidOperationException("Penumbra model bridge is unavailable.");
+        if (!_solver.Ready || !_solver.ConversionReady) throw new InvalidOperationException("RavaFit is still getting ready.");
+        if (!_bridge.Status.Available) throw new InvalidOperationException("Model tools are unavailable.");
     }
 
     private static void EnsureOk(JsonElement root, string message)
