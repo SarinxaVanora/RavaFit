@@ -38,10 +38,12 @@ def main()->int:
             if local_rms is None and value is not None:local_rms=float(value)
             worker_reports.append({'mesh':name,'worker_sec':payload.get('elapsed_sec'),'pid':payload.get('pid')})
         source=SerializedMultiGarmentSource(common['source_js'],meshes);cache=common['cache']
+        capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
         target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
         if local_rms is None:
             _A,quality,_tree=prod.precompute_body_local_affines(cache['X'],cache['Y'],cache['BW']);local_rms=float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0)
         positions,skinning,records,stats=prod._finalize_garment_solution(source,cache,positions,skinning,records,float(local_rms),_assembly_in_process=True)
+        stats['source_influence_capacity_registry']=capacity_report
         stats['garment_mesh_workers']={'enabled':True,'mode':'one-clean-multimesh-worker+fresh-finalizer','mesh_count':len(rows),'workers':worker_reports,'finalizer_pid':__import__('os').getpid(),'pipeline_wall_sec':time.perf_counter()-started}
         output_path.parent.mkdir(parents=True,exist_ok=True)
         with output_path.open('wb') as f:pickle.dump({'positions':positions,'skinning':skinning,'records':records,'stats':stats},f,protocol=pickle.HIGHEST_PROTOCOL)

@@ -28,12 +28,14 @@ def _solve_one(common:dict, mesh:dict, output_path:Path, report_path:Path, share
     started=time.perf_counter();mesh_name=str(mesh['name'])
     source=SerializedGarmentSource(common['source_js'],mesh_name,mesh['data'])
     cache=shared_cache if shared_cache is not None else dict(common['cache'])
+    capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
     target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
     if reset_runtime:
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
         prod._reset_b14_runtime_caches();prod._set_surface_query_cache_enabled(True)
     positions,skinning,records,stats=prod._solve_garment_meshes(source,cache,set(),{mesh_name},_skip_final_assembly=True)
+    stats['source_influence_capacity_registry']=capacity_report
     if mesh_name not in positions or mesh_name not in skinning:raise ValueError(f'mesh {mesh_name!r} did not produce a solved garment result')
     output_path.parent.mkdir(parents=True,exist_ok=True);report_path.parent.mkdir(parents=True,exist_ok=True)
     np.savez(output_path,position=np.asarray(positions[mesh_name],dtype=np.float64),weights=np.asarray(skinning[mesh_name]['weights'],dtype=np.float64))
@@ -56,11 +58,13 @@ def _batch_main()->int:
             name=str(mesh['name']);ordered.append(name);meshes[name]=mesh['data']
         source=SerializedMultiGarmentSource(common['source_js'],meshes)
         cache=dict(common['cache'])
+        capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
         target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
         prod._reset_b14_runtime_caches();prod._set_surface_query_cache_enabled(True)
         positions,skinning,records,stats=prod._solve_garment_meshes(source,cache,set(),set(ordered),_skip_final_assembly=True)
+        stats['source_influence_capacity_registry']=capacity_report
         solve_elapsed=time.perf_counter()-started
 
         for row,name in zip(rows,ordered):
