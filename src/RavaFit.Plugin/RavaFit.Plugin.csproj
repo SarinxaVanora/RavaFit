@@ -1,0 +1,45 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>1.1.5</Version>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>RavaFit</AssemblyName>
+    <RootNamespace>RavaFit</RootNamespace>
+    <Description>Outfit and animation porting for Penumbra V4 mods.</Description>
+    <Authors>RavaFit</Authors>
+    <IsPackable>false</IsPackable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RavaFit.Core\RavaFit.Core.csproj" />
+    <PackageReference Include="Penumbra.Api" Version="5.15.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\VFXEditor\common_pap" LogicalName="RavaFit.Assets.VFXEditor.common_pap" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="RavaFit.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\VFXEditor\VFXEDITOR_LICENSE.txt" CopyToOutputDirectory="PreserveNewest" Link="ThirdParty\VFXEDITOR_LICENSE.txt" />
+  </ItemGroup>
+  <PropertyGroup>
+    <RavaFitRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</RavaFitRepoRoot>
+  </PropertyGroup>
+
+  <Target Name="PrepareRavaFitDevAssets" BeforeTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and '$(RavaFitSkipDevAssetCheck)' != 'true'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(RavaFitRepoRoot)\scripts\Prepare-DevEnvironment.ps1&quot;" />
+  </Target>
+
+  <Target Name="PackageRavaFitPlugin" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <DalamudPackager ProjectDir="$(ProjectDir)" OutputPath="$(OutputPath)" AssemblyName="$(AssemblyName)" MakeZip="true" VersionComponents="3" Include="RavaFit.dll;RavaFit.Core.dll;Penumbra.Api.dll;RavaFit.deps.json;RavaFit.json;ThirdParty/VFXEDITOR_LICENSE.txt" />
+    <MakeDir Directories="$(RavaFitRepoRoot)\distribution" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName)\latest.zip" DestinationFiles="$(RavaFitRepoRoot)\distribution\latest.zip" />
+  </Target>
+
+</Project>

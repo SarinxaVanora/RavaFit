@@ -1,0 +1,6 @@
+* text=auto
+
+distribution/assets/RavaFit.Runtime.win-x64*.zip filter=lfs diff=lfs merge=lfs -text
+distribution/assets/Bodies.rbody filter=lfs diff=lfs merge=lfs -text
+
+distribution/latest.zip -text

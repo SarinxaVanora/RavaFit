@@ -1,0 +1,48 @@
+{
+  "mesh": "mesh 2.1",
+  "fresh_from_original": true,
+  "generation_uses_validation": false,
+  "behavior": "conservative_component_assembly",
+  "features": {
+    "root_component": 0,
+    "root_vertices": 1060,
+    "root_fraction": 0.20927936821322804,
+    "boundary_fraction": 0.0,
+    "source_clearance_median_mm": 2.8961207888468254,
+    "component_count": 69,
+    "boundary_loops": 0
+  },
+  "metrics": null,
+  "quality": {
+    "edge_p": [
+      0.6678234913928478,
+      0.8299116977634977,
+      0.9869195431189655,
+      1.2614682911755388,
+      1.3452959814686256
+    ],
+    "area_p": [
+      0.6674222826162253,
+      0.7595489798641571,
+      0.9920668462573101,
+      1.428340799627335,
+      1.644879705648407
+    ],
+    "tiny_area_frac": 0.0
+  },
+  "orientation": {
+    "opposed": 0,
+    "orient_min": 0.025379820578122846,
+    "orient_p1": 0.04543355001841269,
+    "area_min": 0.5695827482718699,
+    "area_p1": 0.6674222826162253
+  },
+  "stage": {
+    "mode": "conservative_component_assembly"
+  },
+  "elapsed_sec": 1.0169641971588135,
+  "source_hash": "3a506c513c7976480299c41237cc4f256a3a329331d702ae7b1dbfefccce9fdc",
+  "target_hash_before": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_hash_after": "c59e17bbc224dce347abfaac4cd7571beecafb9eee5e1c0714b2ac0faa923d74",
+  "target_unchanged": true
+}

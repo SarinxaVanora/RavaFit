@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+"""Minimal evidence-gated local retargeting around Frozen B14 geometry.
+
+Frozen B14 remains geometry authority.  This module may alter only a connected local
+component when the untouched source body proves that B14 transferred that component's
+support/clearance relationship poorly *and* the existing body correspondence predicts a
+materially better relationship.  It never globally conforms or re-solves a garment.
+
+The implementation is garment-name agnostic.  Narrow open ribbon/shell components are
+recognised from topology and physical shape, then a low-frequency correction field is
+fit to B14 -> correspondence displacement.  B14 edge lengths are re-projected before a
+small literal-body collision polish.  All non-selected vertices remain bit-identical.
+"""
+
+from dataclasses import dataclass
+from typing import Callable, Any
+import numpy as np
+from scipy.interpolate import UnivariateSpline
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
+
+_EPS=1e-12
+
+
+@dataclass(frozen=True)
+class LocalRetargetConfig:
+    min_vertices: int = 24
+    min_extent_m: float = 0.045
+    max_thin_ratio: float = 0.10
+    min_boundary_fraction: float = 0.08
+    min_b14_clearance_p95_error_m: float = 0.0020
+    required_clearance_p95_ratio: float = 0.65
+    displacement_bins: int = 12
+    edge_iterations: int = 80
+    edge_relaxation: float = 0.70
+    macro_pull: float = 0.001
+    collision_margin_m: float = 0.00015
+    collision_iterations: int = 8
+    collision_blend: float = 0.35
+    collision_max_push_m: float = 0.0015
+    max_edge_strain_p95: float = 0.07
+    min_area_ratio: float = 0.45
+
+
+def _component_labels(vertex_count: int, faces: np.ndarray) -> np.ndarray:
+    F=np.asarray(faces,dtype=np.int64)
+    if vertex_count<=0:return np.zeros(0,dtype=np.int64)
+    if not len(F):return np.arange(vertex_count,dtype=np.int64)
+    edges=np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]]))
+    rows=np.r_[edges[:,0],edges[:,1]];cols=np.r_[edges[:,1],edges[:,0]]
+    graph=coo_matrix((np.ones(len(rows),dtype=np.uint8),(rows,cols)),shape=(vertex_count,vertex_count)).tocsr()
+    _,labels=connected_components(graph,directed=False,return_labels=True)
+    return labels.astype(np.int64)
+
+
+def _local_faces(faces: np.ndarray, ids: np.ndarray, vertex_count: int) -> np.ndarray:
+    ids=np.asarray(ids,dtype=np.int64);mask=np.zeros(vertex_count,dtype=bool);mask[ids]=True
+    selected=np.asarray(faces,dtype=np.int64)[np.all(mask[np.asarray(faces,dtype=np.int64)],axis=1)]
+    if not len(selected):return np.zeros((0,3),dtype=np.int64)
+    lookup=np.full(vertex_count,-1,dtype=np.int64);lookup[ids]=np.arange(len(ids),dtype=np.int64)
+    return lookup[selected]
+
+
+def _unique_edges(faces: np.ndarray) -> np.ndarray:
+    F=np.asarray(faces,dtype=np.int64)
+    if not len(F):return np.zeros((0,2),dtype=np.int64)
+    return np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0)
+
+
+def _shape_features(vertices: np.ndarray, faces: np.ndarray) -> dict[str,float]:
+    P=np.asarray(vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64)
+    if not len(P):return {"max_extent":0.0,"middle_ratio":0.0,"thin_ratio":0.0,"boundary_fraction":0.0}
+    centred=P-np.mean(P,axis=0);sv=np.linalg.svd(centred,compute_uv=False);lead=max(float(sv[0]) if len(sv) else 0.0,_EPS)
+    edges=np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1) if len(F) else np.zeros((0,2),dtype=np.int64)
+    boundary=0.0
+    if len(edges):
+        unique,count=np.unique(edges,axis=0,return_counts=True);bedges=unique[count==1]
+        if len(bedges):boundary=float(len(np.unique(bedges))/len(P))
+    return {"max_extent":float(np.max(np.ptp(P,axis=0))),"middle_ratio":float(sv[1]/lead) if len(sv)>1 else 0.0,"thin_ratio":float(sv[2]/lead) if len(sv)>2 else 0.0,"boundary_fraction":boundary}
+
+
+def _is_local_ribbon_candidate(features: dict[str,float], vertex_count: int, cfg: LocalRetargetConfig) -> bool:
+    return int(vertex_count)>=cfg.min_vertices and float(features["max_extent"])>=cfg.min_extent_m and float(features["thin_ratio"])<=cfg.max_thin_ratio and float(features["boundary_fraction"])>=cfg.min_boundary_fraction
+
+
+def _geodesic_coordinate(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    P=np.asarray(vertices,dtype=np.float64);edges=_unique_edges(faces)
+    if len(P)<2 or not len(edges):return np.linspace(0.0,1.0,len(P),dtype=np.float64)
+    length=np.linalg.norm(P[edges[:,1]]-P[edges[:,0]],axis=1)
+    graph=coo_matrix((np.r_[length,length],(np.r_[edges[:,0],edges[:,1]],np.r_[edges[:,1],edges[:,0]])),shape=(len(P),len(P))).tocsr()
+    first=dijkstra(graph,indices=0);a=int(np.argmax(first));da=dijkstra(graph,indices=a);b=int(np.argmax(da));db=dijkstra(graph,indices=b)
+    return np.asarray(da/np.maximum(da+db,_EPS),dtype=np.float64)
+
+
+def _low_frequency_displacement(source: np.ndarray, faces: np.ndarray, displacement: np.ndarray, bins: int) -> np.ndarray:
+    t=_geodesic_coordinate(source,faces);D=np.asarray(displacement,dtype=np.float64);bins=max(4,int(bins));cuts=np.linspace(0.0,1.0,bins+1);xs=[];ys=[]
+    for i in range(bins):
+        sel=(t>=cuts[i])&(t<(cuts[i+1] if i<bins-1 else cuts[i+1]+1e-12))
+        if np.any(sel):xs.append(float(np.median(t[sel])));ys.append(np.median(D[sel],axis=0))
+    if len(xs)<2:return np.repeat(np.median(D,axis=0,keepdims=True),len(D),axis=0)
+    x=np.asarray(xs,dtype=np.float64);y=np.asarray(ys,dtype=np.float64);out=np.empty_like(D);order=np.argsort(x);x=x[order];y=y[order]
+    for axis in range(3):
+        spline=UnivariateSpline(x,y[:,axis],k=min(3,len(x)-1),s=0.0,ext=3)
+        out[:,axis]=spline(t)
+    return out
+
+
+def _edge_project(rest: np.ndarray, target: np.ndarray, faces: np.ndarray, cfg: LocalRetargetConfig) -> np.ndarray:
+    R=np.asarray(rest,dtype=np.float64);goal=np.asarray(target,dtype=np.float64);U=goal.copy();edges=_unique_edges(faces)
+    if not len(edges):return U
+    rest_len=np.linalg.norm(R[edges[:,1]]-R[edges[:,0]],axis=1)
+    for _ in range(max(0,int(cfg.edge_iterations))):
+        vec=U[edges[:,1]]-U[edges[:,0]];cur=np.linalg.norm(vec,axis=1);direction=vec/np.maximum(cur[:,None],_EPS);corr=.5*(cur-rest_len)[:,None]*direction
+        accum=np.zeros_like(U);count=np.zeros(len(U),dtype=np.float64);np.add.at(accum,edges[:,0],corr);np.add.at(accum,edges[:,1],-corr);np.add.at(count,edges[:,0],1.0);np.add.at(count,edges[:,1],1.0)
+        U+=float(cfg.edge_relaxation)*accum/np.maximum(count[:,None],1.0)
+        U+=float(cfg.macro_pull)*(goal-U)
+    return U
+
+
+def _edge_strain_p95(reference: np.ndarray, candidate: np.ndarray, faces: np.ndarray) -> float:
+    edges=_unique_edges(faces)
+    if not len(edges):return 0.0
+    a=np.linalg.norm(reference[edges[:,1]]-reference[edges[:,0]],axis=1);b=np.linalg.norm(candidate[edges[:,1]]-candidate[edges[:,0]],axis=1)
+    return float(np.percentile(np.abs(b/np.maximum(a,_EPS)-1.0),95))
+
+
+def _topology_ok(reference: np.ndarray, candidate: np.ndarray, faces: np.ndarray, min_area_ratio: float) -> bool:
+    F=np.asarray(faces,dtype=np.int64)
+    if not len(F):return True
+    ar=np.cross(reference[F[:,1]]-reference[F[:,0]],reference[F[:,2]]-reference[F[:,0]]);ac=np.cross(candidate[F[:,1]]-candidate[F[:,0]],candidate[F[:,2]]-candidate[F[:,0]])
+    nr=np.linalg.norm(ar,axis=1);nc=np.linalg.norm(ac,axis=1);valid=nr>1e-12
+    if np.any(valid & (np.einsum("ij,ij->i",ar,ac)<0.0)):return False
+    if np.any(valid & (nc/np.maximum(nr,_EPS)<float(min_area_ratio))):return False
+    return True
+
+
+def _signed_clearance(nearest_surface_fn: Callable[...,Any], vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    result=nearest_surface_fn(np.asarray(vertices,dtype=np.float64),np.asarray(triangles,dtype=np.float64),k=24)
+    return np.asarray(result[2],dtype=np.float64)
+
+
+def retarget_b14_local_components(source_vertices: np.ndarray, faces: np.ndarray, b14_vertices: np.ndarray, correspondence_vertices: np.ndarray, source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, *, nearest_surface_fn: Callable[...,Any], collision_polish_fn: Callable[...,Any], config: LocalRetargetConfig | None=None) -> tuple[np.ndarray,dict[str,Any]]:
+    """Return B14 geometry with only strongly evidenced local ribbon corrections applied."""
+    cfg=config or LocalRetargetConfig();P=np.asarray(source_vertices,dtype=np.float64);F=np.asarray(faces,dtype=np.int64);B=np.asarray(b14_vertices,dtype=np.float64);C=np.asarray(correspondence_vertices,dtype=np.float64)
+    if P.shape!=B.shape or B.shape!=C.shape:raise ValueError("source, B14 and correspondence vertices must have identical shape")
+    out=B.copy();labels=_component_labels(len(P),F);reports=[]
+    for component_index in sorted(np.unique(labels).tolist()):
+        ids=np.flatnonzero(labels==component_index);lf=_local_faces(F,ids,len(P));features=_shape_features(P[ids],lf);row={"component_index":int(component_index),"vertex_count":int(len(ids)),"features":features,"selected":False}
+        if not _is_local_ribbon_candidate(features,len(ids),cfg):row["reason"]="not a narrow open local structure";reports.append(row);continue
+        macro_delta=np.linalg.norm(C[ids]-B[ids],axis=1);row["b14_to_correspondence_p95_mm"]=float(np.percentile(macro_delta,95)*1000.0)
+        source_clear=_signed_clearance(nearest_surface_fn,P[ids],source_body_triangles);b14_clear=_signed_clearance(nearest_surface_fn,B[ids],target_body_triangles);corr_clear=_signed_clearance(nearest_surface_fn,C[ids],target_body_triangles)
+        b14_error=np.abs(b14_clear-source_clear);corr_error=np.abs(corr_clear-source_clear);b14_p95=float(np.percentile(b14_error,95));corr_p95=float(np.percentile(corr_error,95));ratio=corr_p95/max(b14_p95,_EPS)
+        row.update({"b14_clearance_error_p95_mm":b14_p95*1000.0,"correspondence_clearance_error_p95_mm":corr_p95*1000.0,"clearance_error_ratio":ratio,"b14_penetrating_vertices":int(np.count_nonzero(b14_clear<0.0)),"correspondence_penetrating_vertices":int(np.count_nonzero(corr_clear<0.0))})
+        if b14_p95<cfg.min_b14_clearance_p95_error_m:row["reason"]="B14 relationship already within local tolerance";reports.append(row);continue
+        if ratio>cfg.required_clearance_p95_ratio:row["reason"]="correspondence does not materially improve source relationship";reports.append(row);continue
+        low=_low_frequency_displacement(P[ids],lf,C[ids]-B[ids],cfg.displacement_bins);goal=B[ids]+low;candidate=_edge_project(B[ids],goal,lf,cfg)
+        candidate,collision_report=collision_polish_fn(candidate,lf,target_body_triangles,margin=cfg.collision_margin_m,iterations=cfg.collision_iterations,blend=cfg.collision_blend,max_push=cfg.collision_max_push_m)
+        candidate=np.asarray(candidate,dtype=np.float64);edge_p95=_edge_strain_p95(B[ids],candidate,lf);final_clear=_signed_clearance(nearest_surface_fn,candidate,target_body_triangles);final_error=np.abs(final_clear-source_clear);final_p95=float(np.percentile(final_error,95));row.update({"candidate_clearance_error_p95_mm":final_p95*1000.0,"candidate_penetrating_vertices":int(np.count_nonzero(final_clear<-1e-9)),"edge_strain_p95_percent":edge_p95*100.0,"collision":collision_report})
+        if final_p95>=b14_p95:row["reason"]="candidate did not improve B14 source relationship";reports.append(row);continue
+        if edge_p95>cfg.max_edge_strain_p95:row["reason"]="candidate exceeded B14 local edge-strain budget";reports.append(row);continue
+        if not _topology_ok(B[ids],candidate,lf,cfg.min_area_ratio):row["reason"]="candidate violated B14 local topology";reports.append(row);continue
+        out[ids]=candidate;row["selected"]=True;row["reason"]="strong local evidence; B14 detail preserved with bounded macro correction";row["moved_vertices"]=int(np.count_nonzero(np.linalg.norm(candidate-B[ids],axis=1)>1e-12));row["displacement_p95_mm"]=float(np.percentile(np.linalg.norm(candidate-B[ids],axis=1),95)*1000.0);reports.append(row)
+    changed=np.linalg.norm(out-B,axis=1)>1e-12
+    return out,{"policy":"Frozen B14 geometry authority; evidence-gated local low-frequency correction only","changed_vertex_count":int(np.count_nonzero(changed)),"unchanged_vertex_count":int(len(B)-np.count_nonzero(changed)),"component_count":int(len(np.unique(labels))),"selected_components":int(sum(bool(r.get("selected")) for r in reports)),"components":reports}
