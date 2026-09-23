@@ -7,6 +7,7 @@ HERE=Path(__file__).resolve().parent
 if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
 import production_b14 as prod
 import target_fit_authority as target_fit
+import adaptive_skinning
 
 
 class SerializedMultiGarmentSource:
@@ -27,7 +28,7 @@ def _solve_one(common:dict, mesh:dict, output_path:Path, report_path:Path, share
     started=time.perf_counter();mesh_name=str(mesh['name'])
     source=SerializedGarmentSource(common['source_js'],mesh_name,mesh['data'])
     cache=shared_cache if shared_cache is not None else dict(common['cache'])
-    target_fit.install_close_shell_macro_authority(prod)
+    target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
     if reset_runtime:
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
@@ -49,15 +50,13 @@ def _batch_main()->int:
         rows=json.loads(manifest_path.read_text(encoding='utf-8')).get('meshes',[])
         if not rows:raise ValueError('garment batch manifest contains no authored meshes')
 
-        # Solve the complete authored garment in one isolated worker to preserve peer context.
-        meshes={}
-        ordered=[]
+        meshes={};ordered=[]
         for row in rows:
             with Path(row['mesh_payload']).open('rb') as f:mesh=pickle.load(f)
             name=str(mesh['name']);ordered.append(name);meshes[name]=mesh['data']
         source=SerializedMultiGarmentSource(common['source_js'],meshes)
         cache=dict(common['cache'])
-        target_fit.install_close_shell_macro_authority(prod)
+        target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
         prod._reset_b14_runtime_caches();prod._set_surface_query_cache_enabled(True)
