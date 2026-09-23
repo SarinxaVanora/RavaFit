@@ -84,9 +84,9 @@ def test_late_coupled_guard_pulls_loose_close_shell_back_to_authored_spacing():
         {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
     )
 
-    # The authored spacing is 1 mm.  The guard allows only the small fit tolerance
-    # above that, instead of the historical several-millimetre loose envelope.
-    expected = 1.0 + .001 + max(.00045, .00065 * .70)
+    # Preserve the 1 mm authored source spacing plus only the 0.15 mm numerical
+    # tolerance.  The 0.70 mm literal-body floor is lower, so it does not loosen it.
+    expected = 1.0 + .001 + .00015
     np.testing.assert_allclose(result["cup"][:, 2], expected, atol=1e-9)
     assert "cup" in changed
     fit = report["source_authored_close_fit"]
@@ -98,7 +98,7 @@ def test_late_coupled_guard_does_not_pull_already_close_shell_further_in():
     prod = _install_fake_coupled_prod(source_distance=.001)
     context = _context("constructed_close_shell", 1.0)
     current = np.asarray(context["data"]["V"]).copy()
-    current[:, 2] = 1.0012
+    current[:, 2] = 1.0011
 
     result, changed, report = prod._coupled_target_clearance_guard(
         {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
@@ -107,6 +107,22 @@ def test_late_coupled_guard_does_not_pull_already_close_shell_further_in():
     np.testing.assert_array_equal(result["cup"], current)
     assert "cup" not in changed
     assert report["source_authored_close_fit"]["adjusted_mesh_count"] == 0
+
+
+def test_literal_floor_prevents_copying_an_unsafe_tiny_source_gap():
+    prod = _install_fake_coupled_prod(source_distance=.0001)
+    context = _context("constructed_close_shell", .1)
+    current = np.asarray(context["data"]["V"]).copy()
+    current[:, 2] = 1.004
+
+    result, changed, report = prod._coupled_target_clearance_guard(
+        {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
+    )
+
+    expected = 1.0 + .00070 + .00015
+    np.testing.assert_allclose(result["cup"][:, 2], expected, atol=1e-9)
+    assert "cup" in changed
+    assert report["source_authored_close_fit"]["meshes"][0]["clearance_floor_mm"] == .7
 
 
 def test_body_following_layer_uses_same_late_clearance_rule():
@@ -120,7 +136,7 @@ def test_body_following_layer_uses_same_late_clearance_rule():
     )
 
     assert "stocking" in changed
-    assert float(np.max(result["stocking"][:, 2])) < 1.003
+    assert float(np.max(result["stocking"][:, 2])) < 1.0023
 
 
 def test_stand_off_structure_is_never_shrink_wrapped_by_late_guard():
