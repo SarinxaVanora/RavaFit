@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RuntimeVersion = "1.1.7"
+$RuntimeVersion = "1.1.8"
 $ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
 $PythonVersion = "3.13.5"
 $PipZipappVersion = "26.2.1"

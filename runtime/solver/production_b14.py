@@ -5705,6 +5705,42 @@ def _gather_layer_positions_from_meshes(layers: list[GarmentLayer], positions: d
         out[layer.stable_id]=B14LayerResult(layer.stable_id,_readonly_array(V),"universal_coherent_refit",float(layer.source_clearance_median_mm),float(layer.source_clearance_p95_mm),0.0,{"mode":"universal_coherent_refit"})
     return out
 
+def _preserve_source_shared_seam_skinning(source: Any, positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[dict[str,dict[str,Any]],dict[str,Any]]:
+    """Preserve the source deformation relationship across source-proven cross-mesh seams.
+
+    Geometry can be perfectly joined in bind pose yet open in game if the two meshes are independently
+    reweighted.  For every repeated source-proven seam witness, preserve the source pair's weight delta
+    around the target-adapted average.  Equal source seam weights therefore remain equal; deliberately
+    different authored seam weights retain that difference.  This changes skinning only, never geometry.
+    """
+    if not skinning:return skinning,{"enabled":False,"reason":"no skinning payload"}
+    pairs,discovery=_source_proven_cross_mesh_seam_pairs(source,positions,tolerance_m=tolerance_m,minimum_pair_witnesses=minimum_pair_witnesses)
+    if not pairs:return skinning,{"enabled":False,"reason":"no repeated source-proven cross-mesh seam","discovery":discovery}
+    out={name:{**row,"weights":np.asarray(row["weights"],dtype=np.float64).copy(),"joint_names":list(row["joint_names"])} for name,row in skinning.items()}
+    accum={name:np.zeros_like(np.asarray(row["weights"],dtype=np.float64)) for name,row in out.items()};count={name:np.zeros(len(np.asarray(row["weights"])),dtype=np.float64) for name,row in out.items()}
+    before=[];after=[];used=0;skipped=0
+    for an,ai,bn,bi,_ in pairs:
+        if an not in out or bn not in out:skipped+=1;continue
+        a_names=list(out[an]["joint_names"]);b_names=list(out[bn]["joint_names"])
+        if a_names!=b_names:skipped+=1;continue
+        A=np.asarray(out[an]["weights"],dtype=np.float64);B=np.asarray(out[bn]["weights"],dtype=np.float64)
+        sa=np.asarray(source.data(an).get("W",[]),dtype=np.float64);sb=np.asarray(source.data(bn).get("W",[]),dtype=np.float64)
+        if ai>=len(A) or bi>=len(B) or ai>=len(sa) or bi>=len(sb) or A.shape[1]!=B.shape[1] or sa.shape[1]!=A.shape[1] or sb.shape[1]!=B.shape[1]:skipped+=1;continue
+        wa=A[ai];wb=B[bi];swa=sa[ai];swb=sb[bi];source_delta=swa-swb;target_avg=(wa+wb)*.5
+        da=np.maximum(target_avg+source_delta*.5,0.0);db=np.maximum(target_avg-source_delta*.5,0.0)
+        ta=float(da.sum());tb=float(db.sum())
+        if ta<=1e-12 or tb<=1e-12:skipped+=1;continue
+        da/=ta;db/=tb
+        before.append(float(np.abs((wa-wb)-source_delta).sum()));after.append(float(np.abs((da-db)-source_delta).sum()))
+        accum[an][ai]+=da;count[an][ai]+=1.0;accum[bn][bi]+=db;count[bn][bi]+=1.0;used+=1
+    changed_vertices=0
+    for name,row in out.items():
+        mask=count[name]>0
+        if not np.any(mask):continue
+        W=np.asarray(row["weights"],dtype=np.float64);W[mask]=accum[name][mask]/count[name][mask,None];W[mask]/=np.maximum(W[mask].sum(axis=1,keepdims=True),1e-12);row["weights"]=W;changed_vertices+=int(np.count_nonzero(mask))
+    return out,{"enabled":bool(used),"policy":"source-proven cross-mesh seams preserve their authored skin-weight relationship after target retargeting","discovery":discovery,"used_pair_witnesses":int(used),"skipped_pair_witnesses":int(skipped),"changed_vertices":int(changed_vertices),"pair_weight_delta_error_l1_p95_before":float(np.percentile(before,95)) if before else 0.0,"pair_weight_delta_error_l1_p95_after":float(np.percentile(after,95)) if after else 0.0}
+
+
 def _retarget_frozen_layer_skinning(source: Any, positions: dict[str,np.ndarray], cache: dict[str,Any], source_body_triangles: np.ndarray):
     """Retarget weights once, after final geometry is frozen. This function never edits positions."""
     before={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
@@ -5714,6 +5750,8 @@ def _retarget_frozen_layer_skinning(source: Any, positions: dict[str,np.ndarray]
         weights,stage=_retarget_garment_skinning(np.asarray(final_pos,dtype=np.float64),np.asarray(data["V"],dtype=np.float64),np.asarray(data["W"],dtype=np.float64),list(data["joint_names"]),cache,behavior,behavior,labels,classes,w["raw_to_weld"])
         skinning[name]={"weights":weights,"joint_names":list(data["joint_names"]),"stage":stage}
         records[name]={"behavior":behavior,"features":features,"component_count":len(details),"skinning":stage}
+    skinning,seam_skinning=_preserve_source_shared_seam_skinning(source,positions,skinning,tolerance_m=.000075,minimum_pair_witnesses=6)
+    for name in records:records[name]["source_shared_seam_skinning"]=seam_skinning
     for name in positions:
         if not np.array_equal(before[name],np.asarray(positions[name])):
             raise AssertionError(f"Skinning retarget moved geometry for {name}; geometry must be frozen before skinning.")
@@ -6878,6 +6916,34 @@ def _masked_vertex_components(faces: np.ndarray, mask: np.ndarray) -> list[np.nd
     return out
 
 
+def _masked_face_components(faces: np.ndarray, mask: np.ndarray) -> list[np.ndarray]:
+    """Connected components of a selected triangle subset, joined only by shared edges."""
+    F=np.asarray(faces,dtype=np.int64);mask=np.asarray(mask,dtype=bool)
+    selected=np.flatnonzero(mask)
+    if not len(selected):return []
+    edge_faces={}
+    for fi in selected.tolist():
+        a,b,c=(int(x) for x in F[fi])
+        for u,v in ((a,b),(b,c),(c,a)):
+            key=(u,v) if u<v else (v,u);edge_faces.setdefault(key,[]).append(int(fi))
+    neighbours={int(fi):set() for fi in selected.tolist()}
+    for rows in edge_faces.values():
+        if len(rows)<2:continue
+        for i in range(len(rows)):
+            for j in range(i+1,len(rows)):
+                neighbours[rows[i]].add(rows[j]);neighbours[rows[j]].add(rows[i])
+    seen=set();out=[]
+    for first in selected.tolist():
+        if first in seen:continue
+        stack=[int(first)];seen.add(int(first));rows=[]
+        while stack:
+            current=stack.pop();rows.append(current)
+            for neighbour in neighbours.get(current,()):
+                if neighbour not in seen:seen.add(neighbour);stack.append(neighbour)
+        out.append(np.asarray(rows,dtype=np.int64))
+    return sorted(out,key=len,reverse=True)
+
+
 def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_slot: dict[str, list[dict[str, Any]]], present_slots: list[str], body_mesh_names: set[str], mesh_filter: set[str] | None):
     garment_triangles=[]
     for mesh_name in source.mesh_names():
@@ -6935,6 +7001,42 @@ def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_
                             if not local:continue
                             row={"slot":slot,"native_mesh":int(record.get("mesh_index",0)),"triangles":local};records.append(row);native_suppression.append(row)
                         report["native_meshes"]=[{"native_mesh":row["native_mesh"],"suppressed_triangles":len(row["triangles"])} for row in records]
+                    if not accepted:
+                        # Fallback: classify the *target* body triangles directly.  This catches explicit
+                        # source-body cutaways whose missing region is too sparse or fragmented to form a
+                        # large component on the canonical source reference (common around crotch/chest
+                        # garment cutouts).  Target centres are mapped back through the authoritative
+                        # X<->Y body correspondence, then tested against the body geometry physically
+                        # present in the untouched outfit.  The garment must also cover the mapped source
+                        # location, so arbitrary source holes/LOD cuts cannot delete unrelated target body.
+                        X=np.asarray(pair.get("X",[]),dtype=np.float64);Y=np.asarray(pair.get("Y",[]),dtype=np.float64);BW=np.asarray(pair.get("BW",[]),dtype=np.float64)
+                        target_weights_all=np.asarray(pair.get("target_literal_W",[]),dtype=np.float64)
+                        if len(X)==len(Y) and len(X)>=8 and len(target_V) and len(target_F) and len(target_weights_all)==len(target_V):
+                            centres=target_V[target_F].mean(axis=1);k=min(8,len(Y));distance,index=cKDTree(Y).query(centres,k=k)
+                            if np.asarray(index).ndim==1:index=np.asarray(index)[:,None];distance=np.asarray(distance)[:,None]
+                            distance=np.asarray(distance,dtype=np.float64);index=np.asarray(index,dtype=np.int64)
+                            inv=1.0/np.maximum(distance,.00035)**2;inv/=np.maximum(inv.sum(axis=1,keepdims=True),1e-12)
+                            mapped_source=np.einsum("nk,nkj->nj",inv,X[index]);mapped_source_weights=np.einsum("nk,nkj->nj",inv,BW[index]) if BW.ndim==2 and len(BW)==len(X) else None
+                            _,_,_,mapped_body_distance,_=_b14_nearest_surface(mapped_source,actual_tri,k=32);_,_,_,mapped_garment_distance,_=_b14_nearest_surface(mapped_source,garment_tri,k=32)
+                            mapped_body_distance=np.asarray(mapped_body_distance,dtype=np.float64);mapped_garment_distance=np.asarray(mapped_garment_distance,dtype=np.float64)
+                            target_nearest=np.min(distance,axis=1);candidate=(mapped_body_distance>threshold)&(mapped_garment_distance<=.022)&(target_nearest<=.010)
+                            if mapped_source_weights is not None and mapped_source_weights.shape[1]==target_weights_all.shape[1]:
+                                target_face_weights=target_weights_all[target_F].mean(axis=1);alignment=np.einsum("ij,ij->i",target_face_weights,mapped_source_weights);candidate&=alignment>=.20
+                            selected_components=[];suppress=np.zeros(len(target_F),dtype=bool)
+                            for component in _masked_face_components(target_F,candidate):
+                                if len(component)<max(8,int(np.ceil(len(target_F)*.001))):continue
+                                missing_p50=float(np.median(mapped_body_distance[component]));garment_p50=float(np.median(mapped_garment_distance[component]));map_p95=float(np.percentile(target_nearest[component],95))
+                                if missing_p50<threshold+.001 or garment_p50>.022 or map_p95>.010:continue
+                                suppress[component]=True;selected_components.append(component)
+                                report["accepted_components"].append({"target_triangles":int(len(component)),"coverage_fraction":1.0,"garment_distance_p50_mm":garment_p50*1000.0,"missing_depth_p50_mm":missing_p50*1000.0,"mode":"target-centric explicit source cutaway"})
+                            if np.any(suppress):
+                                keep&=~suppress;report["status"]="source body explicitly removes garment-covered geometry";report["suppressed_target_triangles"]=int(np.count_nonzero(suppress));report["target_centric_fallback"]=True
+                                records=[]
+                                for record in pair.get("target_mesh_records",[]):
+                                    start=int(record.get("face_offset",0));count=int(record.get("face_count",0));local=np.where(suppress[start:start+count])[0].astype(int).tolist()
+                                    if not local:continue
+                                    row={"slot":slot,"native_mesh":int(record.get("mesh_index",0)),"triangles":local};records.append(row);native_suppression.append(row)
+                                report["native_meshes"]=[{"native_mesh":row["native_mesh"],"suppressed_triangles":len(row["triangles"])} for row in records]
                 else:report["status"]="source body does not match selected source closely enough; suppression disabled"
         elif slot not in present_slots:
             report["status"]="fit-context only; no embedded source body, so nothing may be removed"

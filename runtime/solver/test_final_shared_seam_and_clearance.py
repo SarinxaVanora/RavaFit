@@ -186,3 +186,36 @@ def test_final_clearance_and_shared_seam_compose_without_reopening_boundary():
     assert np.max(np.linalg.norm(positions["left"][left_seam] - positions["right"][right_seam], axis=1)) < 1e-9
     assert float(np.min(positions["left"][:, 2])) >= -.00008
     assert float(np.min(positions["right"][:, 2])) >= -.00008
+
+
+def test_source_shared_seam_skinning_preserves_authored_pair_relationship():
+    left, left_faces = _grid(-.10, 0.0, -.05, .05, .010)
+    right, right_faces = _grid(0.0, .10, -.05, .05, .010)
+    left_w = np.zeros((len(left), 3), dtype=np.float64)
+    right_w = np.zeros((len(right), 3), dtype=np.float64)
+    left_w[:, 0] = .60; left_w[:, 1] = .40
+    right_w[:, 0] = .55; right_w[:, 1] = .45
+    source = _Source({
+        "left": {"V": left, "F": left_faces, "W": left_w, "joint_names": ["pelvis", "left", "right"]},
+        "right": {"V": right, "F": right_faces, "W": right_w, "joint_names": ["pelvis", "left", "right"]},
+    })
+    solved = {"left": left.copy(), "right": right.copy()}
+    # Deliberately divergent target-retargeted seam weights that would open in pose.
+    a = left_w.copy(); b = right_w.copy()
+    a[:, 0] = .20; a[:, 1] = .80
+    b[:, 0] = .85; b[:, 1] = .15
+    skinning = {
+        "left": {"weights": a, "joint_names": ["pelvis", "left", "right"], "stage": {}},
+        "right": {"weights": b, "joint_names": ["pelvis", "left", "right"], "stage": {}},
+    }
+
+    out, report = p._preserve_source_shared_seam_skinning(source, solved, skinning, tolerance_m=.000001, minimum_pair_witnesses=3)
+
+    assert report["enabled"]
+    assert report["pair_weight_delta_error_l1_p95_after"] < report["pair_weight_delta_error_l1_p95_before"]
+    left_seam = np.flatnonzero(np.isclose(left[:, 0], 0.0))
+    right_seam = np.flatnonzero(np.isclose(right[:, 0], 0.0))
+    for ai, bi in zip(left_seam, right_seam):
+        source_delta = left_w[ai] - right_w[bi]
+        solved_delta = out["left"]["weights"][ai] - out["right"]["weights"][bi]
+        np.testing.assert_allclose(solved_delta, source_delta, atol=1e-12)
