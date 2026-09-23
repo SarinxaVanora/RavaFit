@@ -138,10 +138,9 @@ def test_body_blend_is_capacity_limited_without_sacrificing_non_body_influence()
 
 
 def test_existing_eight_influence_source_proves_eight_slot_capacity():
-    source = np.asarray([[0.20, 0.15, 0.10, 0.10, 0.10, 0.10, 0.10, 0.05, 0.10]])
-    # First eight columns are body supported except the final garment-only column.
-    # The source already has >4 active influences, proving JOINTS_1/WEIGHTS_1 exists.
-    delta = np.asarray([[-0.05, 0.01, 0.01, 0.01, 0.01, 0.01, 0.0, 0.0]])
+    # Seven body influences plus one garment-only influence = eight authored slots.
+    source = np.asarray([[0.20, 0.15, 0.10, 0.10, 0.10, 0.10, 0.15, 0.0, 0.10]])
+    delta = np.asarray([[-0.05, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
     report = {
         "enabled": True,
         "verified_body_delta": True,
@@ -155,6 +154,7 @@ def test_existing_eight_influence_source_proves_eight_slot_capacity():
     assert stage["source_influence_capacity_hint"] == 8
     assert solved[0, -1] == source[0, -1]
     assert stage["max_final_active_influences"] <= 8
+    assert stage["capacity_limited_vertices"] == 0
 
 
 def test_required_missing_target_joint_fails_instead_of_guessing():
