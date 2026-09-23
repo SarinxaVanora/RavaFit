@@ -37,7 +37,7 @@ def main()->int:
             if local_rms is None and value is not None:local_rms=float(value)
             worker_reports.append({'mesh':name,'worker_sec':payload.get('elapsed_sec'),'pid':payload.get('pid')})
         source=SerializedMultiGarmentSource(common['source_js'],meshes);cache=common['cache']
-        target_fit.prepare_worker(prod,cache)
+        target_fit.install_close_shell_macro_authority(prod)
         if local_rms is None:
             _A,quality,_tree=prod.precompute_body_local_affines(cache['X'],cache['Y'],cache['BW']);local_rms=float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0)
         positions,skinning,records,stats=prod._finalize_garment_solution(source,cache,positions,skinning,records,float(local_rms),_assembly_in_process=True)
