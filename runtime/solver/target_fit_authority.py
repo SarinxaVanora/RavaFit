@@ -41,7 +41,12 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
     out = {name: np.asarray(value, dtype=np.float64).copy() for name, value in positions.items()}
     changed: set[str] = set()
     reports: list[dict[str, Any]] = []
-    tolerance = max(.00045, float(margin) * .70)
+    # Source spacing is the authored target.  Keep only a tiny numerical buffer, while
+    # retaining the stronger 0.70 mm floor already established by the final literal
+    # collision pass.  Dynamic reserve, if required, belongs to pose validation rather
+    # than making the neutral fit visibly baggy.
+    tolerance = .00015
+    clearance_floor = max(.00070, float(margin))
 
     for name, context in contexts.items():
         if name not in out:
@@ -78,9 +83,10 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
         authority = _close_authority(source_distance)
         authority[~finite] = 0.0
 
-        # The source distance is already a positive Euclidean support spacing. Keep a
-        # small collision floor, but do not preserve accidental source penetration.
-        desired = np.clip(source_distance, max(float(margin), .00035), .030)
+        # The source distance is already a positive support spacing.  Preserve it unless
+        # it is tighter than the established literal-body safety floor; never preserve
+        # accidental source penetration.
+        desired = np.clip(source_distance, clearance_floor, .030)
         excess = current_projection - (desired + tolerance)
         pull = np.maximum(excess, 0.0) * authority
         pull = np.minimum(pull, .0080)
@@ -125,6 +131,7 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
             "move_p95_mm": float(np.percentile(moved[active], 95) * 1000.0),
             "move_max_mm": float(np.max(moved[active]) * 1000.0),
             "tolerance_mm": float(tolerance * 1000.0),
+            "clearance_floor_mm": float(clearance_floor * 1000.0),
             "topology_alpha": float(alpha),
             "topology": topology,
             "edge": edge,
@@ -134,7 +141,7 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
         "enabled": True,
         "adjusted_mesh_count": int(len(changed)),
         "meshes": reports,
-        "policy": "close cloth may be pulled inward only toward its source-authored support spacing; tangential authored shape and later literal collision remain authoritative",
+        "policy": "close cloth may be pulled inward only toward its source-authored support spacing with the established literal-body floor; tangential authored shape and later literal collision remain authoritative",
     }
 
 
