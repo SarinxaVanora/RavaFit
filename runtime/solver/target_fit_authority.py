@@ -60,7 +60,6 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
     """
     support_frame = getattr(prod, "_coupled_support_frame", None)
     topology_guard = getattr(prod, "_coupled_topology_safe_alpha", None)
-    preserve_seams = getattr(prod, "_preserve_final_source_shared_seams", None)
     if not callable(support_frame):
         return positions, set(), {"enabled": False, "reason": "coupled support frame unavailable"}
 
@@ -108,8 +107,9 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         ideal = contact + normal * desired_distance[:, None]
         error = ideal - current
 
-        # Keep the source-authored normal spacing exactly. Only the tangential component is
-        # low-passed, because it represents target macro width/position rather than garment detail.
+        # Keep source-authored normal spacing. Tangential movement is the target's macro
+        # width/position change, so low-pass that displacement field rather than flattening
+        # the garment itself.
         normal_scalar = np.einsum("ij,ij->i", error, normal)
         normal_move = normal_scalar[:, None] * normal
         tangent_move = error - normal_move
@@ -173,26 +173,12 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
             "edge": edge,
         })
 
-    seam_report = {"enabled": False, "reason": "source seam synchronizer unavailable"}
-    if changed and callable(preserve_seams):
-        out, seam_report = preserve_seams(source=None if False else _ContextSource(contexts), positions=out)
-
     return out, changed, {
         "enabled": True,
         "adjusted_mesh_count": int(len(changed)),
         "meshes": reports,
-        "seams": seam_report,
-        "policy": "close cloth follows the complete paired target macro frame plus source-authored support spacing; tangential correction is low-pass displacement only, and literal body detail remains collision-only",
+        "policy": "close cloth follows the complete paired target macro frame plus source-authored support spacing; tangential correction is low-pass displacement only, literal body detail remains collision-only, and the existing final seam stage remains untouched",
     }
-
-
-class _ContextSource:
-    """Small adapter for the existing source-seam synchronizer."""
-    def __init__(self, contexts: dict[str, dict[str, Any]]):
-        self._contexts = contexts
-
-    def data(self, name: str):
-        return (self._contexts.get(name) or {}).get("data") or {}
 
 
 def install_close_shell_macro_authority(prod: Any) -> None:
