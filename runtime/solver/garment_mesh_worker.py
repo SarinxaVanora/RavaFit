@@ -27,7 +27,7 @@ def _solve_one(common:dict, mesh:dict, output_path:Path, report_path:Path, share
     started=time.perf_counter();mesh_name=str(mesh['name'])
     source=SerializedGarmentSource(common['source_js'],mesh_name,mesh['data'])
     cache=shared_cache if shared_cache is not None else dict(common['cache'])
-    target_fit.prepare_worker(prod,cache)
+    target_fit.install_close_shell_macro_authority(prod)
     if reset_runtime:
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
@@ -57,7 +57,7 @@ def _batch_main()->int:
             name=str(mesh['name']);ordered.append(name);meshes[name]=mesh['data']
         source=SerializedMultiGarmentSource(common['source_js'],meshes)
         cache=dict(common['cache'])
-        target_fit.prepare_worker(prod,cache)
+        target_fit.install_close_shell_macro_authority(prod)
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
         prod._reset_b14_runtime_caches();prod._set_surface_query_cache_enabled(True)
