@@ -1,14 +1,13 @@
 """Target-fit guards for close garments.
 
-Two rules live here, outside frozen B14:
+Close clothing has two different authorities that must never be confused:
 
-1. Close constructed cloth should not inherit literal target micro-relief during the
-   early relief stage. Target macro shape still drives the fit and literal anatomy
-   still drives final collision.
-2. The late coupled finalizer must preserve the source-authored garment/body spacing
-   in both directions. The production guard already pushes cloth outward when it is
-   too close, but historically did not pull cloth back in when a target solve was too
-   loose. That asymmetry is what this module closes.
+* the smooth paired target support frame owns macro fit, position and authored spacing;
+* the complete literal target body owns occupancy only.
+
+A close garment therefore follows the target body's low-frequency frame in all three
+axes while retaining its own high-frequency construction. Literal nipples, grooves,
+folds and genital relief are never allowed to become garment-shaping targets.
 """
 from __future__ import annotations
 
@@ -25,13 +24,39 @@ def _close_authority(source_distance: np.ndarray) -> np.ndarray:
     return 1.0 - smooth
 
 
-def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np.ndarray], contexts: dict[str, dict[str, Any]], cache: dict[str, Any], margin: float) -> tuple[dict[str, np.ndarray], set[str], dict[str, Any]]:
-    """Pull only demonstrably loose close cloth toward its source-authored body spacing.
+def _smooth_tangent_field(values: np.ndarray, faces: np.ndarray, iterations: int = 5) -> np.ndarray:
+    """Low-pass only the macro tangential retarget displacement, never garment geometry."""
+    values = np.asarray(values, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if not len(values) or not len(faces) or iterations <= 0:
+        return values.copy()
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges = np.sort(edges, axis=1)
+    edges = np.unique(edges, axis=0)
+    current = values.copy()
+    for _ in range(iterations):
+        accum = np.zeros_like(current)
+        counts = np.zeros(len(current), dtype=np.float64)
+        np.add.at(accum, edges[:, 0], current[edges[:, 1]])
+        np.add.at(accum, edges[:, 1], current[edges[:, 0]])
+        np.add.at(counts, edges[:, 0], 1.0)
+        np.add.at(counts, edges[:, 1], 1.0)
+        mask = counts > 0.0
+        neighbour = current.copy()
+        neighbour[mask] = accum[mask] / counts[mask, None]
+        current = .62 * current + .38 * neighbour
+    return current
 
-    ``production_b14._coupled_support_frame`` gives the exact source->target support
-    correspondence for each untouched source garment vertex. Its returned distance is
-    therefore the authored source-body spacing we want to preserve. We alter only the
-    target support-normal component; tangential garment construction stays untouched.
+
+def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarray], contexts: dict[str, dict[str, Any]], cache: dict[str, Any], margin: float) -> tuple[dict[str, np.ndarray], set[str], dict[str, Any]]:
+    """Align close cloth to the full paired target support frame.
+
+    The previous guard corrected only support-normal distance. That could leave a cup at
+    approximately the source body's width/position even after fitting to a differently
+    shaped breast. Here the exact source->target support correspondence supplies a complete
+    per-vertex target frame. Normal displacement is authoritative; tangential displacement
+    is low-pass filtered so macro width/position follows the target without erasing authored
+    cup curvature, folds, seams or other local garment construction.
     """
     support_frame = getattr(prod, "_coupled_support_frame", None)
     topology_guard = getattr(prod, "_coupled_topology_safe_alpha", None)
@@ -41,10 +66,6 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
     out = {name: np.asarray(value, dtype=np.float64).copy() for name, value in positions.items()}
     changed: set[str] = set()
     reports: list[dict[str, Any]] = []
-    # Source spacing is the authored target.  Keep only a tiny numerical buffer, while
-    # retaining the stronger 0.70 mm floor already established by the final literal
-    # collision pass.  Dynamic reserve, if required, belongs to pose validation rather
-    # than making the neutral fit visibly baggy.
     tolerance = .00015
     clearance_floor = max(.00070, float(margin))
 
@@ -55,7 +76,8 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
         effective = str(context.get("effective_behavior") or behaviour).casefold()
         features = context.get("features") or {}
         median_clearance_mm = float(features.get("source_clearance_median_mm", 999.0))
-        if behaviour not in {"constructed_close_shell", "body_following_flexible_layer"} and effective not in {"constructed_close_shell", "body_following_flexible_layer"}:
+        close = {"constructed_close_shell", "body_following_flexible_layer"}
+        if behaviour not in close and effective not in close:
             continue
         if median_clearance_mm > 8.0:
             continue
@@ -78,20 +100,34 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
             continue
         normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
 
-        current_projection = np.einsum("ij,ij->i", current - contact, normal)
-        finite = np.isfinite(source_distance) & np.isfinite(current_projection)
+        finite = np.isfinite(source_distance) & np.all(np.isfinite(contact), axis=1) & np.all(np.isfinite(normal), axis=1)
         authority = _close_authority(source_distance)
         authority[~finite] = 0.0
+        desired_distance = np.clip(source_distance, clearance_floor, .030)
+        ideal = contact + normal * desired_distance[:, None]
+        error = ideal - current
 
-        # The source distance is already a positive support spacing.  Preserve it unless
-        # it is tighter than the established literal-body safety floor; never preserve
-        # accidental source penetration.
-        desired = np.clip(source_distance, clearance_floor, .030)
-        excess = current_projection - (desired + tolerance)
-        pull = np.maximum(excess, 0.0) * authority
-        pull = np.minimum(pull, .0080)
-        active = pull > 1e-7
+        # Keep source-authored normal spacing. Tangential movement is the target's macro
+        # width/position change, so low-pass that displacement field rather than flattening
+        # the garment itself.
+        normal_scalar = np.einsum("ij,ij->i", error, normal)
+        normal_move = normal_scalar[:, None] * normal
+        tangent_move = error - normal_move
+        tangent_move = _smooth_tangent_field(tangent_move, faces, iterations=5)
+        move = normal_move + tangent_move
+
+        magnitude = np.linalg.norm(move, axis=1)
+        beyond = magnitude > tolerance
+        scale = np.zeros(len(move), dtype=np.float64)
+        scale[beyond] = (magnitude[beyond] - tolerance) / np.maximum(magnitude[beyond], 1e-12)
+        move *= (scale * authority)[:, None]
+
+        move_length = np.linalg.norm(move, axis=1)
+        too_large = move_length > .020
+        move[too_large] *= (.020 / np.maximum(move_length[too_large], 1e-12))[:, None]
+        active = np.linalg.norm(move, axis=1) > 1e-7
         if not np.any(active):
+            current_projection = np.einsum("ij,ij->i", current - contact, normal)
             reports.append({
                 "mesh": name,
                 "active_vertices": 0,
@@ -100,7 +136,7 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
             })
             continue
 
-        proposed = current - pull[:, None] * normal
+        proposed = current + move
         safe = proposed
         alpha = 1.0
         topology = None
@@ -109,9 +145,6 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
             try:
                 safe, alpha, topology, edge = topology_guard(source, current, proposed, faces)
             except Exception:
-                # Correctness over bravado: if the shared topology veto cannot certify
-                # this inward correction, leave this mesh alone and let normal collision
-                # handling continue unchanged.
                 reports.append({"mesh": name, "active_vertices": int(np.count_nonzero(active)), "skipped": "topology guard failed"})
                 continue
 
@@ -121,6 +154,8 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
         out[name] = safe
         changed.add(name)
         final_projection = np.einsum("ij,ij->i", safe - contact, normal)
+        current_projection = np.einsum("ij,ij->i", current - contact, normal)
+        target_error = np.linalg.norm(safe - ideal, axis=1)
         reports.append({
             "mesh": name,
             "active_vertices": int(np.count_nonzero(active)),
@@ -128,6 +163,7 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
             "source_clearance_p50_mm": float(np.median(source_distance[finite]) * 1000.0) if np.any(finite) else None,
             "before_target_clearance_p50_mm": float(np.median(current_projection[active]) * 1000.0),
             "after_target_clearance_p50_mm": float(np.median(final_projection[active]) * 1000.0),
+            "target_frame_error_p95_mm": float(np.percentile(target_error[active], 95) * 1000.0),
             "move_p95_mm": float(np.percentile(moved[active], 95) * 1000.0),
             "move_max_mm": float(np.max(moved[active]) * 1000.0),
             "tolerance_mm": float(tolerance * 1000.0),
@@ -141,12 +177,12 @@ def _pull_close_garment_to_authored_clearance(prod: Any, positions: dict[str, np
         "enabled": True,
         "adjusted_mesh_count": int(len(changed)),
         "meshes": reports,
-        "policy": "close cloth may be pulled inward only toward its source-authored support spacing with the established literal-body floor; tangential authored shape and later literal collision remain authoritative",
+        "policy": "close cloth follows the complete paired target macro frame plus source-authored support spacing; tangential correction is low-pass displacement only, literal body detail remains collision-only, and the existing final seam stage remains untouched",
     }
 
 
 def install_close_shell_macro_authority(prod: Any) -> None:
-    """Install close-garment relief and late source-clearance authority."""
+    """Install close-garment relief and full target-frame authority."""
     if getattr(prod, "_ravafit_close_shell_macro_authority_installed", False):
         return
 
@@ -167,11 +203,11 @@ def install_close_shell_macro_authority(prod: Any) -> None:
     clearance_original = getattr(prod, "_coupled_target_clearance_guard", None)
     if callable(clearance_original):
         def clearance_guard(positions, contexts, cache, margin=.00065, enforce_support=True):
-            tightened, tightened_meshes, tightened_report = _pull_close_garment_to_authored_clearance(prod, positions, contexts, cache, float(margin))
-            result, changed, report = clearance_original(tightened, contexts, cache, margin=margin, enforce_support=enforce_support)
-            changed = set(changed) | set(tightened_meshes)
+            fitted, fitted_meshes, fitted_report = _fit_close_garment_to_target_frame(prod, positions, contexts, cache, float(margin))
+            result, changed, report = clearance_original(fitted, contexts, cache, margin=margin, enforce_support=enforce_support)
+            changed = set(changed) | set(fitted_meshes)
             merged = dict(report or {})
-            merged["source_authored_close_fit"] = tightened_report
+            merged["source_authored_close_fit"] = fitted_report
             return result, changed, merged
         prod._coupled_target_clearance_guard = clearance_guard
 

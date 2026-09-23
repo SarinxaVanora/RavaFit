@@ -9,15 +9,16 @@ class _Prod:
     pass
 
 
-def _install_fake_coupled_prod(source_distance=.001):
+def _install_fake_coupled_prod(source_distance=.001, contact_shift=(0., 0., 0.)):
     prod = _Prod()
+    contact_shift = np.asarray(contact_shift, dtype=np.float64)
 
     def relief_original(source_vertices, faces, mapped, blend, blend_ids, cache, behavior, features):
         return np.asarray(mapped) + 9.0, {"enabled": True, "original": True}
 
     def support_frame(source, cache):
         count = len(source)
-        contact = np.column_stack((source[:, 0], source[:, 1], np.full(count, 1.0)))
+        contact = np.asarray(source, dtype=np.float64) + np.asarray([0., 0., 1.]) + contact_shift
         normal = np.tile(np.asarray([[0., 0., 1.]]), (count, 1))
         distance = np.full(count, source_distance)
         return contact, normal, distance, np.zeros(count, dtype=np.int64)
@@ -84,14 +85,44 @@ def test_late_coupled_guard_pulls_loose_close_shell_back_to_authored_spacing():
         {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
     )
 
-    # Preserve the 1 mm authored source spacing plus only the 0.15 mm numerical
-    # tolerance.  The 0.70 mm literal-body floor is lower, so it does not loosen it.
     expected = 1.0 + .001 + .00015
     np.testing.assert_allclose(result["cup"][:, 2], expected, atol=1e-9)
     assert "cup" in changed
     fit = report["source_authored_close_fit"]
     assert fit["adjusted_mesh_count"] == 1
     assert fit["meshes"][0]["move_p95_mm"] > 4.0
+
+
+def test_close_shell_follows_target_frame_tangentially_without_destroying_local_form():
+    prod = _install_fake_coupled_prod(source_distance=.001, contact_shift=(.010, 0., 0.))
+    context = _context("constructed_close_shell", 1.0)
+    source = np.asarray(context["data"]["V"]).copy()
+    current = source + np.asarray([0., 0., 1.001])
+    before_edges = np.asarray([
+        current[1] - current[0],
+        current[2] - current[1],
+        current[0] - current[2],
+    ])
+
+    result, changed, report = prod._coupled_target_clearance_guard(
+        {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
+    )
+
+    solved = result["cup"]
+    after_edges = np.asarray([
+        solved[1] - solved[0],
+        solved[2] - solved[1],
+        solved[0] - solved[2],
+    ])
+    assert "cup" in changed
+    # Ten millimetres of paired target-frame translation should be followed to within
+    # the deliberate 0.15 mm numerical tolerance.
+    shift = np.mean(solved - current, axis=0)
+    assert 0.00980 < float(shift[0]) < 0.01001
+    assert abs(float(shift[1])) < 1e-10
+    np.testing.assert_allclose(after_edges, before_edges, atol=1e-10)
+    fit = report["source_authored_close_fit"]["meshes"][0]
+    assert fit["target_frame_error_p95_mm"] <= .151
 
 
 def test_late_coupled_guard_does_not_pull_already_close_shell_further_in():
@@ -125,7 +156,7 @@ def test_literal_floor_prevents_copying_an_unsafe_tiny_source_gap():
     assert report["source_authored_close_fit"]["meshes"][0]["clearance_floor_mm"] == .7
 
 
-def test_body_following_layer_uses_same_late_clearance_rule():
+def test_body_following_layer_uses_same_full_target_frame_rule():
     prod = _install_fake_coupled_prod(source_distance=.002)
     context = _context("body_following_flexible_layer", 2.0)
     current = np.asarray(context["data"]["V"]).copy()
@@ -140,7 +171,7 @@ def test_body_following_layer_uses_same_late_clearance_rule():
 
 
 def test_stand_off_structure_is_never_shrink_wrapped_by_late_guard():
-    prod = _install_fake_coupled_prod(source_distance=.001)
+    prod = _install_fake_coupled_prod(source_distance=.001, contact_shift=(.010, 0., 0.))
     context = _context("stand_off_structured_shell", 1.0)
     current = np.asarray(context["data"]["V"]).copy()
     current[:, 2] = 1.020
@@ -155,7 +186,7 @@ def test_stand_off_structure_is_never_shrink_wrapped_by_late_guard():
 
 
 def test_close_component_above_clearance_classification_threshold_is_left_alone():
-    prod = _install_fake_coupled_prod(source_distance=.001)
+    prod = _install_fake_coupled_prod(source_distance=.001, contact_shift=(.010, 0., 0.))
     context = _context("constructed_close_shell", 12.0)
     current = np.asarray(context["data"]["V"]).copy()
     current[:, 2] = 1.020
