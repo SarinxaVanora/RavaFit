@@ -45,7 +45,7 @@ def _base_prod(delta, report):
     return prod
 
 
-def _invoke(prod, weights, names, cache, points=None):
+def _invoke(prod, weights, names, cache, points=None, behavior="body_following_flexible_layer"):
     count = len(weights)
     if points is None:
         points = np.zeros((count, 3), dtype=np.float64)
@@ -54,18 +54,71 @@ def _invoke(prod, weights, names, cache, points=None):
     labels = np.zeros(count, dtype=np.int64)
     return prod._retarget_garment_skinning(
         points, points, np.asarray(weights, dtype=np.float64), list(names), cache,
-        "body_following_flexible_layer", "body_following_flexible_layer", labels, {0: "cloth"}, np.arange(count),
+        behavior, behavior, labels, {0: "cloth"}, np.arange(count),
     )
 
 
-def test_same_body_field_preserves_authored_weights_exactly():
+def _paired_cache(source_point, target_point, body_weights=(.2, .8)):
+    source_point = np.asarray(source_point, dtype=np.float64).reshape(1, 3)
+    target_point = np.asarray(target_point, dtype=np.float64).reshape(1, 3)
+    weights = np.asarray([body_weights], dtype=np.float64)
+    return {
+        "names": ["j_body_a", "j_body_b"],
+        "X": source_point,
+        "Y": target_point,
+        "BW": weights.copy(),
+        "target_correspondence_W": weights.copy(),
+    }
+
+
+def test_same_body_field_preserves_authored_weights_exactly_when_geometry_evidence_is_unavailable():
     source = np.asarray([[0.6, 0.3, 0.1]])
     prod = _base_prod(None, {"enabled": True, "verified_body_delta": False, "reason": "same field"})
     solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], {"names": ["j_body_a", "j_body_b"]})
     np.testing.assert_array_equal(solved, source)
     assert stage["exact_source_weight_preserve"] is True
     assert stage["retargeted_vertices"] == 0
-    assert stage["motion_skinning_revision"] == 2
+    assert stage["motion_skinning_revision"] == 3
+
+
+def test_identical_paired_body_geometry_and_field_preserve_close_garment_exactly():
+    source = np.asarray([[0.80, 0.10, 0.10]])
+    points = np.asarray([[0.0, 0.0, .001]])
+    cache = _paired_cache([0., 0., 0.], [0., 0., 0.])
+    prod = _base_prod(None, {"enabled": True, "verified_body_delta": False, "reason": "same field"})
+    solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], cache, points=points)
+    np.testing.assert_array_equal(solved, source)
+    assert stage["exact_source_weight_preserve"] is True
+    assert stage["retargeted_vertices"] == 0
+
+
+def test_same_weight_field_but_changed_target_shape_adapts_close_body_mass_to_target_motion():
+    # This is the case the old revision missed: two body variants can publish identical
+    # body weights while the actual support surface moves materially. A tight garment that
+    # was fitted onto that new surface must move with the new body's local deformation blend.
+    source = np.asarray([[0.80, 0.10, 0.10]])
+    points = np.asarray([[0.0, 0.0, .001]])
+    cache = _paired_cache([0., 0., 0.], [0., 0., .010], body_weights=(.2, .8))
+    prod = _base_prod(None, {"enabled": True, "verified_body_delta": False, "reason": "same weight field"})
+    solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], cache, points=points)
+    np.testing.assert_allclose(solved, [[.18, .72, .10]], atol=1e-12)
+    assert solved[0, 2] == source[0, 2]
+    assert stage["geometry_driven_vertices"] == 1
+    assert stage["geometry_motion_authority_p95"] > .99
+    assert stage["preserved_non_body_weights_exact"] is True
+
+
+def test_changed_target_shape_does_not_reweight_stand_off_structure():
+    source = np.asarray([[0.80, 0.10, 0.10]])
+    points = np.asarray([[0.0, 0.0, .001]])
+    cache = _paired_cache([0., 0., 0.], [0., 0., .010], body_weights=(.2, .8))
+    prod = _base_prod(None, {"enabled": True, "verified_body_delta": False, "reason": "same weight field"})
+    solved, stage = _invoke(
+        prod, source, ["j_body_a", "j_body_b", "j_cloth"], cache, points=points,
+        behavior="stand_off_structured_shell",
+    )
+    np.testing.assert_array_equal(solved, source)
+    assert stage["exact_source_weight_preserve"] is True
 
 
 def test_local_change_below_quantisation_floor_preserves_source_exactly():
@@ -151,9 +204,6 @@ def test_body_blend_is_capacity_limited_without_sacrificing_non_body_influence()
 
 
 def test_registered_eight_slot_primitive_can_use_free_second_set_for_target_motion():
-    # The authored vertex currently uses only three body influences + one cloth influence,
-    # but the source primitive genuinely owns JOINTS_1/WEIGHTS_1. The target may therefore
-    # use additional body influences without sacrificing the cloth weight.
     source_weights = np.asarray([[0.50, 0.25, 0.15, 0.0, 0.0, 0.0, 0.10]])
     names = ["j_body_a", "j_body_b", "j_body_c", "j_body_d", "j_body_e", "j_body_f", "j_cloth"]
     points = np.asarray([[0.01, 0.02, 0.03]])
