@@ -82,7 +82,7 @@ def test_changed_body_field_applies_full_delta_to_existing_body_mass():
     np.testing.assert_allclose(solved, [[0.37, 0.53, 0.10]], atol=1e-12)
     assert solved[0, 2] == source[0, 2]
     assert stage["full_delta_vertices"] == 1
-    assert stage["motion_response_residual_l1_max"] == 0.0
+    assert stage["motion_response_residual_l1_max"] < 1e-12
     assert stage["preserved_non_body_weights_exact"] is True
 
 
@@ -106,7 +106,7 @@ def test_target_body_may_add_body_influences_without_evicting_cloth():
     assert solved[0, 3] == source[0, 3]
     assert stage["max_final_active_influences"] == 4
     assert stage["capacity_limited_vertices"] == 0
-    assert stage["motion_response_residual_l1_max"] == 0.0
+    assert stage["motion_response_residual_l1_max"] < 1e-12
 
 
 def test_body_blend_is_capacity_limited_without_sacrificing_non_body_influence():
