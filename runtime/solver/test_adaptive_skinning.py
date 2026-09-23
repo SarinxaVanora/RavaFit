@@ -44,9 +44,27 @@ def test_same_body_field_preserves_authored_weights_exactly():
     np.testing.assert_array_equal(solved, source)
     assert stage["exact_source_weight_preserve"] is True
     assert stage["retargeted_vertices"] == 0
+    assert stage["motion_skinning_revision"] == 2
 
 
-def test_changed_body_field_adapts_only_existing_body_mass():
+def test_local_change_below_quantisation_floor_preserves_source_exactly():
+    source = np.asarray([[0.55, 0.35, 0.10]])
+    delta = np.asarray([[-0.001, 0.001]])
+    report = {
+        "enabled": True,
+        "verified_body_delta": True,
+        "body_supported_cache_columns": np.asarray([0, 1]),
+        "local_delta_l1": np.asarray([0.002]),
+        "quantisation_floor": 0.0035,
+    }
+    prod = _base_prod(delta, report)
+    solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], {"names": ["j_body_a", "j_body_b"]})
+    np.testing.assert_array_equal(solved, source)
+    assert stage["exact_source_weight_preserve"] is True
+    assert stage["retargeted_vertices"] == 0
+
+
+def test_changed_body_field_applies_full_delta_to_existing_body_mass():
     source = np.asarray([[0.55, 0.35, 0.10]])
     delta = np.asarray([[-0.20, 0.20]])
     report = {
@@ -58,40 +76,95 @@ def test_changed_body_field_adapts_only_existing_body_mass():
     }
     prod = _base_prod(delta, report)
     solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], {"names": ["j_body_a", "j_body_b"]})
-    assert solved[0, 0] < source[0, 0]
-    assert solved[0, 1] > source[0, 1]
+
+    # The garment has 0.9 body-supported mass. Applying the complete paired-body
+    # delta therefore moves 0.18 from body_a to body_b. This must not be alpha-blended.
+    np.testing.assert_allclose(solved, [[0.37, 0.53, 0.10]], atol=1e-12)
     assert solved[0, 2] == source[0, 2]
-    assert abs(float(solved.sum()) - float(source.sum())) < 1e-9
-    assert abs(float(solved[0, :2].sum()) - float(source[0, :2].sum())) < 1e-9
+    assert stage["full_delta_vertices"] == 1
+    assert stage["motion_response_residual_l1_max"] < 1e-12
     assert stage["preserved_non_body_weights_exact"] is True
-    assert stage["retargeted_vertices"] == 1
 
 
-def test_changed_body_field_does_not_add_more_body_influences_than_source():
-    source = np.asarray([[0.9, 0.0, 0.0, 0.1]])
-    delta = np.asarray([[-0.4, 0.2, 0.2]])
+def test_target_body_may_add_body_influences_without_evicting_cloth():
+    source = np.asarray([[0.90, 0.0, 0.0, 0.10]])
+    delta = np.asarray([[-0.40, 0.20, 0.20]])
     report = {
         "enabled": True,
         "verified_body_delta": True,
         "body_supported_cache_columns": np.asarray([0, 1, 2]),
-        "local_delta_l1": np.asarray([0.8]),
+        "local_delta_l1": np.asarray([0.80]),
         "quantisation_floor": 0.0035,
     }
     prod = _base_prod(delta, report)
     solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_body_c", "j_cloth"], {"names": ["j_body_a", "j_body_b", "j_body_c"]})
-    assert np.count_nonzero(solved[0, :3] > 1e-8) == 1
+
+    # A one-bone source body blend is not sacred. If the target body's paired field
+    # genuinely needs three body bones and the vertex has room, use all three.
+    np.testing.assert_allclose(solved, [[0.54, 0.18, 0.18, 0.10]], atol=1e-12)
+    assert np.count_nonzero(solved[0, :3] > 1e-8) == 3
     assert solved[0, 3] == source[0, 3]
-    assert stage["influence_budget_preserved"] is True
+    assert stage["max_final_active_influences"] == 4
+    assert stage["capacity_limited_vertices"] == 0
+    assert stage["motion_response_residual_l1_max"] < 1e-12
+
+
+def test_body_blend_is_capacity_limited_without_sacrificing_non_body_influence():
+    source = np.asarray([[0.90, 0.0, 0.0, 0.0, 0.10]])
+    delta = np.asarray([[-0.45, 0.15, 0.15, 0.15]])
+    report = {
+        "enabled": True,
+        "verified_body_delta": True,
+        "body_supported_cache_columns": np.asarray([0, 1, 2, 3]),
+        "local_delta_l1": np.asarray([0.90]),
+        "quantisation_floor": 0.0035,
+    }
+    prod = _base_prod(delta, report)
+    solved, stage = _invoke(
+        prod, source,
+        ["j_body_a", "j_body_b", "j_body_c", "j_body_d", "j_cloth"],
+        {"names": ["j_body_a", "j_body_b", "j_body_c", "j_body_d"]},
+    )
+
+    # With a conservative four-influence source primitive and one authored cloth
+    # influence, only three body slots remain. The cloth weight stays exact and the
+    # body weights still sum to the original 0.9 body mass.
+    assert solved[0, 4] == 0.10
+    assert np.count_nonzero(solved[0, :4] > 1e-8) == 3
+    assert abs(float(solved[0, :4].sum()) - 0.90) < 1e-12
+    assert abs(float(solved.sum()) - 1.0) < 1e-12
+    assert stage["capacity_limited_vertices"] == 1
+    assert stage["motion_response_residual_l1_max"] > 0.0
+
+
+def test_existing_eight_influence_source_proves_eight_slot_capacity():
+    # Seven body influences plus one garment-only influence = eight authored slots.
+    source = np.asarray([[0.20, 0.15, 0.10, 0.10, 0.10, 0.10, 0.15, 0.0, 0.10]])
+    delta = np.asarray([[-0.05, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    report = {
+        "enabled": True,
+        "verified_body_delta": True,
+        "body_supported_cache_columns": np.arange(8, dtype=np.int64),
+        "local_delta_l1": np.asarray([0.10]),
+        "quantisation_floor": 0.0035,
+    }
+    prod = _base_prod(delta, report)
+    names = [f"j_body_{i}" for i in range(8)] + ["j_cloth"]
+    solved, stage = _invoke(prod, source, names, {"names": names[:8]})
+    assert stage["source_influence_capacity_hint"] == 8
+    assert solved[0, -1] == source[0, -1]
+    assert stage["max_final_active_influences"] <= 8
+    assert stage["capacity_limited_vertices"] == 0
 
 
 def test_required_missing_target_joint_fails_instead_of_guessing():
-    source = np.asarray([[0.9, 0.1]])
-    delta = np.asarray([[-0.4, 0.4]])
+    source = np.asarray([[0.90, 0.10]])
+    delta = np.asarray([[-0.40, 0.40]])
     report = {
         "enabled": True,
         "verified_body_delta": True,
         "body_supported_cache_columns": np.asarray([0, 1]),
-        "local_delta_l1": np.asarray([0.8]),
+        "local_delta_l1": np.asarray([0.80]),
         "quantisation_floor": 0.0035,
     }
     prod = _base_prod(delta, report)

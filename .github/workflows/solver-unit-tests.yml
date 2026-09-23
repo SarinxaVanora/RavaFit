@@ -1,0 +1,38 @@
+name: Solver Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - "runtime/solver/**"
+      - ".github/workflows/solver-unit-tests.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "runtime/solver/**"
+      - ".github/workflows/solver-unit-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  focused-solver-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install focused test dependencies
+        run: python -m pip install --disable-pip-version-check numpy==2.3.5 pytest
+
+      - name: Run adaptive skinning and target-fit regressions
+        working-directory: runtime/solver
+        run: python -m pytest -q test_adaptive_skinning.py test_target_fit_authority.py
