@@ -162,6 +162,8 @@ def install_adaptive_body_skinning(prod: Any) -> None:
 
         mapped_cache = np.asarray([row[0] for row in mapped_pairs], dtype=np.int64)
         body_columns = np.asarray([row[1] for row in mapped_pairs], dtype=np.int64)
+        missing_cache = np.asarray([int(ci) for ci in body_supported_cache.tolist()
+                                    if 0 <= int(ci) < len(cache_names) and cache_names[int(ci)] not in garment_index], dtype=np.int64)
 
         local_l1 = np.asarray((delta_report or {}).get("local_delta_l1", np.abs(delta).sum(axis=1)), dtype=np.float64)
         if local_l1.shape != (len(preserved),):
@@ -191,6 +193,22 @@ def install_adaptive_body_skinning(prod: Any) -> None:
             })
             return preserved, stage
 
+        # If a future paired-body helper exposes a target body joint that the garment
+        # skin cannot represent, never smear that required motion onto some other bone.
+        # Current same-skeleton conversions normally have no missing columns here.
+        if len(missing_cache):
+            missing_positive = np.clip(delta[:, missing_cache], 0.0, None).sum(axis=1) * body_mass
+            missing_active = active & (missing_positive > max(quantisation_floor, 1.0 / 255.0))
+            if np.any(missing_active):
+                missing_names = [cache_names[int(ci)] for ci in missing_cache.tolist()
+                                 if np.any(active & (np.clip(delta[:, int(ci)], 0.0, None) * body_mass > max(quantisation_floor, 1.0 / 255.0)))]
+                shown = ", ".join(missing_names[:12])
+                extra = f" (+{len(missing_names)-12} more)" if len(missing_names) > 12 else ""
+                raise ValueError(
+                    "Target body deformation requires body joint(s) absent from the garment skin: "
+                    f"{shown}{extra}. RavaFit will not approximate the missing motion using unrelated bones."
+                )
+
         source_body = preserved[:, body_columns].copy()
         body_delta = delta[:, mapped_cache]
         ideal_body = source_body + body_delta * body_mass[:, None]
@@ -214,7 +232,6 @@ def install_adaptive_body_skinning(prod: Any) -> None:
         )
 
         candidate = preserved.copy()
-        candidate[active[:, None] & np.isin(np.arange(candidate.shape[1])[None, :], body_columns)] = candidate[active[:, None] & np.isin(np.arange(candidate.shape[1])[None, :], body_columns)]
         candidate[:, body_columns] = np.where(active[:, None], packed_body, source_body)
 
         # Authored garment/cloth/secondary influences are never collateral damage from
