@@ -319,3 +319,60 @@ def test_bilateral_bridge_skinning_preserves_source_weights_exactly(monkeypatch)
     np.testing.assert_allclose(out,source_weights,atol=1e-12)
     assert report["bilateral_authored_vertices"]==2
     assert report["bilateral_exact_source_weight_preserve"] is True
+
+
+def test_geometry_refit_never_rewrites_authored_garment_skinning(monkeypatch):
+    names=["j_asi_a_l","j_asi_a_r","j_kosi","j_sebo_a"]
+    raw=np.asarray([[0.0,0.0,0.0],[0.01,0.0,0.0],[0.02,0.0,0.0]],dtype=np.float64)
+    fitted=raw+np.asarray([[0.0,.010,.030],[0.0,-.015,.025],[.012,0.0,.020]],dtype=np.float64)
+    source_weights=np.asarray([[.82,.02,.11,.05],[.03,.77,.15,.05],[.00,.00,.35,.65]],dtype=np.float64)
+    target_weights=np.asarray([[.05,.80,.10,.05],[.80,.05,.10,.05],[.45,.45,.05,.05]],dtype=np.float64)
+    def fake_target(points,cache,source_weights=None,source_joint_names=None):
+        return target_weights.copy(),np.zeros(len(points),dtype=np.float64)
+    monkeypatch.setattr(p,"_target_skin_weights_at_points",fake_target)
+    cache={"names":names,"target_surface_W":np.ones((1,len(names)),dtype=np.float64)}
+    labels=np.asarray([0,0,0],dtype=np.int64);classes={0:"shell"};raw_to_weld=np.asarray([0,1,2],dtype=np.int64)
+
+    out,report=p._retarget_garment_skinning(fitted,raw,source_weights,names,cache,"body_following_flexible_layer","body_following_flexible_layer",labels,classes,raw_to_weld)
+
+    assert np.array_equal(out,source_weights)
+    assert report["mode"]=="source_authored_skinning_preserved"
+    assert report["retargeted_vertices"]==0
+    assert report["weight_delta_l1_p95"]==0.0
+    assert report["exact_source_weight_preserve"] is True
+
+
+def test_paired_body_weight_field_equivalence_keeps_source_weights_byte_stable():
+    names=["j_kosi","j_sebo_a"]
+    raw=np.asarray([[0.0,0.0,0.0],[0.01,0.0,0.0]],dtype=np.float64)
+    fitted=raw+np.asarray([[0.0,.02,.03],[0.0,-.02,.025]],dtype=np.float64)
+    source_weights=np.asarray([[.80,.20],[.35,.65]],dtype=np.float64)
+    body_weights=np.asarray([[.75,.25],[.30,.70]],dtype=np.float64)
+    cache={"names":names,"X":raw.copy(),"BW":body_weights.copy(),"target_correspondence_W":body_weights.copy()}
+    labels=np.asarray([0,0],dtype=np.int64);classes={0:"shell"};raw_to_weld=np.asarray([0,1],dtype=np.int64)
+
+    out,report=p._retarget_garment_skinning(fitted,raw,source_weights,names,cache,"body_following_flexible_layer","body_following_flexible_layer",labels,classes,raw_to_weld)
+
+    assert np.array_equal(out,source_weights)
+    assert report["mode"]=="source_authored_skinning_preserved"
+    assert report["body_weight_delta"]["verified_body_delta"] is False
+    assert report["exact_source_weight_preserve"] is True
+
+
+def test_paired_body_weight_delta_does_not_override_authored_garment_skinning():
+    names=["j_kosi","j_sebo_a"]
+    raw=np.asarray([[0.0,0.0,0.0],[0.01,0.0,0.0]],dtype=np.float64)
+    fitted=raw+np.asarray([[0.0,.01,.015],[0.0,-.01,.010]],dtype=np.float64)
+    source_weights=np.asarray([[.80,.20],[.70,.30]],dtype=np.float64)
+    source_body=np.asarray([[.80,.20],[.70,.30]],dtype=np.float64)
+    target_body=np.asarray([[.60,.40],[.50,.50]],dtype=np.float64)
+    cache={"names":names,"X":raw.copy(),"BW":source_body,"target_correspondence_W":target_body}
+    labels=np.asarray([0,0],dtype=np.int64);classes={0:"shell"};raw_to_weld=np.asarray([0,1],dtype=np.int64)
+
+    out,report=p._retarget_garment_skinning(fitted,raw,source_weights,names,cache,"body_following_flexible_layer","body_following_flexible_layer",labels,classes,raw_to_weld)
+
+    np.testing.assert_allclose(out,source_weights,atol=1e-12,rtol=0)
+    assert report["mode"]=="source_authored_skinning_preserved"
+    assert report["retargeted_vertices"]==0
+    assert report["body_weight_delta"]["verified_body_delta"] is False
+    assert report["exact_source_weight_preserve"] is True

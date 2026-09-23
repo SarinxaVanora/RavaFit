@@ -70,9 +70,10 @@ from universal_garment_refit import coherent_universal_refit, fit_body_macro_tra
 from unilateral_pair_separation import UnilateralPairSeparationConfig, preserve_source_unilateral_pair_separation
 from surface_relative_detail_layout import SurfaceRelativeDetailConfig, preserve_surface_relative_detail_layout
 from source_relative_structural_carriers import StructuralCarrierConfig, preserve_source_relative_structural_carriers
+from cloth_clearance_envelope import clearance_envelope
 
 # B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.
-PRODUCTION_REVISION = "1.1.1-multi-region-support-source-preserve"
+PRODUCTION_REVISION = "1.1.9-target-authority-source-skin-hard-authority-cloth-envelope"
 
 
 def _best_effort_trim_process_memory() -> dict[str, object]:
@@ -540,18 +541,24 @@ def _strict_uv_map(SV: np.ndarray, SUV: np.ndarray, SN: np.ndarray, SW: np.ndarr
     tree=cKDTree(TUV);dist,idx=tree.query(SUV,k=min(12,len(TV)));dist=dist if dist.ndim>1 else dist[:,None];idx=idx if idx.ndim>1 else idx[:,None]
     ww=1.0/(dist*dist+1e-7);ww/=np.maximum(ww.sum(axis=1,keepdims=True),1e-12)
     Y=np.sum(TV[idx]*ww[:,:,None],axis=1);NT=np.sum(TN[idx]*ww[:,:,None],axis=1);NT/=np.maximum(np.linalg.norm(NT,axis=1,keepdims=True),1e-12)
+    target_weights=np.sum(TW[idx]*ww[:,:,None],axis=1);target_weights=np.maximum(target_weights,0.0);target_weights/=np.maximum(target_weights.sum(axis=1,keepdims=True),1e-12)
+    exact_weight_correspondence=bool(SW.shape==TW.shape and SUV.shape==TUV.shape and np.max(np.abs(SUV-TUV),initial=0.0)<=1e-10)
+    if exact_weight_correspondence:target_weights=TW.copy()
     repaired=np.zeros(len(SV),dtype=bool)
     if SW.ndim==2 and TW.ndim==2 and SW.shape[1]==TW.shape[1] and SW.shape[1]>0:
         align=np.einsum('nk,nqk->nq',SW,TW[idx]);spread=np.max(align,axis=1)-np.min(align,axis=1)
         wr=ww*np.square(.05+np.maximum(align,0.0));wr/=np.maximum(wr.sum(axis=1,keepdims=True),1e-12)
         Yr=np.sum(TV[idx]*wr[:,:,None],axis=1);NTr=np.sum(TN[idx]*wr[:,:,None],axis=1);NTr/=np.maximum(np.linalg.norm(NTr,axis=1,keepdims=True),1e-12)
+        target_weights_r=np.sum(TW[idx]*wr[:,:,None],axis=1);target_weights_r=np.maximum(target_weights_r,0.0);target_weights_r/=np.maximum(target_weights_r.sum(axis=1,keepdims=True),1e-12)
         delta=np.linalg.norm(Yr-Y,axis=1);base_disp=np.linalg.norm(Y-SV,axis=1);rig_disp=np.linalg.norm(Yr-SV,axis=1)
         # Only repair candidates where UV-near vertices have radically different rig identity and the
         # rig-consistent interpolation removes a large implausible jump. Ordinary historical mapping
         # (including the successful Rue chest case) remains byte-for-byte on the pure UV formula.
         repaired=(spread>.75)&(delta>.020)&(base_disp>.060)&(rig_disp<base_disp*.50)
-        if np.any(repaired):Y[repaired]=Yr[repaired];NT[repaired]=NTr[repaired]
-    return Y,NT,{"rig_ambiguity_repaired_vertices":int(np.count_nonzero(repaired)),"rig_ambiguity_max_correction_mm":float(np.max(np.linalg.norm(Yr-Y,axis=1))*1000.0) if 'Yr' in locals() and len(Yr) else 0.0}
+        if np.any(repaired):
+            Y[repaired]=Yr[repaired];NT[repaired]=NTr[repaired]
+            if not exact_weight_correspondence:target_weights[repaired]=target_weights_r[repaired]
+    return Y,NT,{"rig_ambiguity_repaired_vertices":int(np.count_nonzero(repaired)),"rig_ambiguity_max_correction_mm":float(np.max(np.linalg.norm(Yr-Y,axis=1))*1000.0) if 'Yr' in locals() and len(Yr) else 0.0,"_target_weight_correspondence":target_weights}
 
 
 def _apply_strict_historical_uv_contract(pairs: list[tuple[dict[str,Any],dict[str,Any]]], base_cache: dict[str,Any]) -> dict[str,Any]:
@@ -574,15 +581,15 @@ def _apply_strict_historical_uv_contract(pairs: list[tuple[dict[str,Any],dict[st
         nearest=cKDTree(TUV).query(SUV,k=1)[0];p95=float(np.percentile(nearest,95));uv_p95.append(p95)
         if not np.isfinite(p95) or p95>.025:
             out=dict(base_cache);out['_ravafit_strict_b14_contract']=False;out['_ravafit_strict_b14_report']={'enabled':False,'reason':f'body UV layouts are incompatible (p95={p95:.6f})'};return out
-        Y,NT,ambiguity=_strict_uv_map(SV,SUV,SN,SW,TV,TUV,TN,TW);ambiguity_reports.append(ambiguity)
+        Y,NT,ambiguity=_strict_uv_map(SV,SUV,SN,SW,TV,TUV,TN,TW);target_correspondence_W=np.asarray(ambiguity.pop('_target_weight_correspondence'),dtype=np.float64);ambiguity_reports.append(ambiguity)
         NS=SN.copy();NS/=np.maximum(np.linalg.norm(NS,axis=1,keepdims=True),1e-12);BW=SW.copy();BW/=np.maximum(BW.sum(axis=1,keepdims=True),1e-12)
-        slot=str(src.get('slot') or tgt.get('slot') or 'body');rows.append((SV.copy(),Y,BW,NS,NT,np.asarray([slot]*len(SV),dtype=object)))
+        slot=str(src.get('slot') or tgt.get('slot') or 'body');rows.append((SV.copy(),Y,BW,target_correspondence_W,NS,NT,np.asarray([slot]*len(SV),dtype=object)))
         sF_raw=src.get('F');tF_raw=tgt.get('F')
         if sF_raw is not None and tF_raw is not None:
             sF=np.asarray(sF_raw,dtype=np.int64);tF=np.asarray(tF_raw,dtype=np.int64)
             if sF.ndim==2 and sF.shape[1]==3 and tF.ndim==2 and tF.shape[1]==3 and len(sF) and len(tF):
                 strict_source_surfaces.append((SV.copy(),sF.copy()));strict_target_surfaces.append((TV.copy(),tF.copy()))
-    out=dict(base_cache);out['X']=np.vstack([r[0] for r in rows]);out['Y']=np.vstack([r[1] for r in rows]);out['BW']=np.vstack([r[2] for r in rows]);out['NS']=np.vstack([r[3] for r in rows]);out['NT']=np.vstack([r[4] for r in rows]);out['names']=list(common_names or []);out['parts']=np.concatenate([r[5] for r in rows]);out['identity_body_mapping']=bool(np.max(np.linalg.norm(out['Y']-out['X'],axis=1))<1e-9);out['_ravafit_strict_b14_contract']=True
+    out=dict(base_cache);out['X']=np.vstack([r[0] for r in rows]);out['Y']=np.vstack([r[1] for r in rows]);out['BW']=np.vstack([r[2] for r in rows]);out['target_correspondence_W']=np.vstack([r[3] for r in rows]);out['NS']=np.vstack([r[4] for r in rows]);out['NT']=np.vstack([r[5] for r in rows]);out['names']=list(common_names or []);out['parts']=np.concatenate([r[6] for r in rows]);out['identity_body_mapping']=bool(np.max(np.linalg.norm(out['Y']-out['X'],axis=1))<1e-9);out['_ravafit_strict_b14_contract']=True
     # Keep macro support separate from complete body-package collision/detail geometry.
     if strict_source_surfaces and len(strict_source_surfaces)==len(strict_target_surfaces):
         sV=[];sF=[];tV=[];tF=[];sb=0;tb=0
@@ -1876,95 +1883,92 @@ def _target_skin_weights_at_points(points: np.ndarray, cache: dict[str, Any], so
     return weights,distance
 
 
-def _retarget_garment_skinning(raw_positions: np.ndarray, source_positions: np.ndarray, source_weights: np.ndarray, source_joint_names: list[str], cache: dict[str, Any], behavior: str, effective_behavior: str, labels: np.ndarray, classes: dict[int, str], raw_to_weld: np.ndarray):
-    """Keep authored articulation while adapting the body-supported part to the new fit."""
-    raw_positions=np.asarray(raw_positions,dtype=np.float64);source_positions=np.asarray(source_positions,dtype=np.float64)
-    source=np.asarray(source_weights,dtype=np.float64)
-    if raw_positions.shape!=source_positions.shape:raise ValueError(f"Garment skin retarget position mismatch {raw_positions.shape} vs {source_positions.shape}.")
-    target,distance=_target_skin_weights_at_points(raw_positions,cache,source,source_joint_names)
-    cache_names=list(cache["names"]);source_joint_names=list(source_joint_names)
-    target_surface_weights=np.asarray(cache.get("target_surface_W"),dtype=np.float64)
-    supported_cache=np.sum(target_surface_weights,axis=0)>1e-8
-    if cache_names!=source_joint_names:
-        source_index={name:i for i,name in enumerate(source_joint_names)}
-        missing=[name for name in cache_names if name not in source_index]
-        if missing:raise ValueError(f"Target body skinning requires joints absent from garment skin: {missing[:20]}")
-        remapped=np.zeros((len(target),len(source_joint_names)),dtype=np.float64)
-        for ci,name in enumerate(cache_names):remapped[:,source_index[name]]=target[:,ci]
-        target=remapped
-        supported=np.zeros(len(source_joint_names),dtype=bool)
-        for ci,name in enumerate(cache_names):supported[source_index[name]]=bool(supported_cache[ci])
-    else:
-        supported=supported_cache.copy()
-    if target.shape!=source.shape:raise ValueError(f"Target garment skin weights {target.shape} do not match source skin weights {source.shape}.")
+def _verified_body_skin_delta_at_points(points: np.ndarray, garment_weights: np.ndarray, garment_joint_names: list[str], cache: dict[str,Any]):
+    """Transfer only a body-correspondence-proven source->target skin-weight delta to garment points.
 
-    proximity=np.clip((0.030-distance)/0.022,0.0,1.0)
-    geometric_move=np.linalg.norm(raw_positions-source_positions,axis=1)
-    move_authority=np.clip((geometric_move-.002)/.030,0.0,1.0)
-    alpha=proximity*(.05+.60*move_authority)
-    raw_labels=np.asarray(labels,dtype=np.int64)[np.asarray(raw_to_weld,dtype=np.int64)]
-    rigid=np.asarray([str(classes.get(int(component),"")).casefold()=="rigid" for component in raw_labels],dtype=bool)
-    smoothed_rigid_vertices=0;smoothed_rigid_components=0
-    for component in sorted(set(raw_labels[rigid].tolist())):
-        ids=np.flatnonzero(raw_labels==component)
-        if len(ids)<3:continue
-        source_mean=np.mean(source[ids],axis=0)
-        source_variation=float(np.mean(np.abs(source[ids]-source_mean).sum(axis=1)))
-        if source_variation>=0.035:continue
-        local_distance=distance[ids];scale=max(float(np.median(local_distance)),1e-6);authority=np.exp(-((local_distance/scale)**2));authority/=max(float(authority.sum()),1e-12)
-        target_mean=np.sum(target[ids]*authority[:,None],axis=0);target_mean/=max(float(target_mean.sum()),1e-12)
-        target[ids]=target_mean
-        smoothed_rigid_vertices+=int(len(ids));smoothed_rigid_components+=1
+    The field is defined on the *paired body correspondence* (X/BW -> Y/target_correspondence_W), not
+    by independently sampling whichever target-body triangle happens to be nearest after refitting.
+    This distinction is important: moving garment geometry across a skin-weight gradient is not itself
+    evidence that the garment should be reweighted.  If paired source/target body weights are the same,
+    the returned delta is exactly zero regardless of geometric movement.
+    """
+    P=np.asarray(points,dtype=np.float64);Wg=np.asarray(garment_weights,dtype=np.float64)
+    X=np.asarray(cache.get("X"),dtype=np.float64);BW=np.asarray(cache.get("BW"),dtype=np.float64);TW=np.asarray(cache.get("target_correspondence_W"),dtype=np.float64)
+    cache_names=list(cache.get("names") or []);garment_joint_names=list(garment_joint_names)
+    if X.ndim!=2 or X.shape[1:]!=(3,) or BW.ndim!=2 or TW.shape!=BW.shape or len(BW)!=len(X) or BW.shape[1]!=len(cache_names):
+        return None,{"enabled":False,"reason":"paired source/target body skin-weight correspondence is unavailable"}
+    if Wg.ndim!=2 or len(Wg)!=len(P) or Wg.shape[1]!=len(garment_joint_names):
+        return None,{"enabled":False,"reason":"garment skinning does not match garment joint list"}
+    source_index={name:i for i,name in enumerate(garment_joint_names)}
+    common_cache=np.asarray([i for i,name in enumerate(cache_names) if name in source_index],dtype=np.int64)
+    if not len(common_cache):
+        return None,{"enabled":False,"reason":"garment and paired body expose no common skin joints"}
+    body_supported=(np.sum(BW,axis=0)+np.sum(TW,axis=0))>1e-8
+    common_cache=common_cache[body_supported[common_cache]]
+    if not len(common_cache):
+        return None,{"enabled":False,"reason":"no common body-supported skin joints"}
+
+    body_delta=np.asarray(TW-BW,dtype=np.float64)
+    body_delta_l1=np.abs(body_delta).sum(axis=1)
+    field_max=float(np.max(body_delta_l1,initial=0.0));field_p95=float(np.percentile(body_delta_l1,95)) if len(body_delta_l1) else 0.0
+    # One 8-bit weight step transferred from one bone to another is ~2/255 L1.  The correspondence
+    # builders preserve exact same-topology weights, while this small floor suppresses interpolation
+    # noise for cross-topology pairs that do not contain a meaningful rigging change.
+    field_floor=0.0035
+    if field_max<=field_floor:
+        return np.zeros((len(P),len(cache_names)),dtype=np.float64),{"enabled":True,"verified_body_delta":False,"reason":"paired body weight field is equivalent within quantisation tolerance","field_delta_l1_p95":field_p95,"field_delta_l1_max":field_max,"quantisation_floor":field_floor}
+
+    signature=np.zeros((len(P),len(cache_names)),dtype=np.float64)
+    for ci in common_cache.tolist():signature[:,ci]=Wg[:,source_index[cache_names[ci]]]
+    signature_total=signature.sum(axis=1,keepdims=True);has_signature=signature_total[:,0]>1e-8;signature[has_signature]/=signature_total[has_signature]
+    if not np.any(has_signature):
+        return np.zeros((len(P),len(cache_names)),dtype=np.float64),{"enabled":True,"verified_body_delta":False,"reason":"garment has no body-supported weight mass","field_delta_l1_p95":field_p95,"field_delta_l1_max":field_max,"quantisation_floor":field_floor}
+
+    k=min(32,len(X));tree=cKDTree(X);distance,index=tree.query(P,k=k);distance=distance if distance.ndim>1 else distance[:,None];index=index if index.ndim>1 else index[:,None]
+    alignment=np.einsum("nk,nqk->nq",signature,BW[index],optimize=True);score=distance+.015*(1.0-alignment)
+    sx=np.sign(P[:,0])[:,None];bx=np.sign(X[index][:,:,0]);score+=np.where((np.abs(P[:,0,None])>.020)&(sx!=bx),.080,0.0)
+    take=min(12,score.shape[1]);order=np.argpartition(score,take-1,axis=1)[:,:take];selected=np.take_along_axis(index,order,axis=1);selected_score=np.take_along_axis(score,order,axis=1);selected_distance=np.take_along_axis(distance,order,axis=1)
+    rel=selected_score-selected_score.min(axis=1,keepdims=True);blend=np.exp(-rel/.0035);blend/=np.maximum(blend.sum(axis=1,keepdims=True),1e-12)
+    transferred=np.sum(body_delta[selected]*blend[:,:,None],axis=1);support_distance=np.sum(selected_distance*blend,axis=1);local_l1=np.abs(transferred).sum(axis=1)
+    transferred[~has_signature]=0.0;local_l1[~has_signature]=0.0
+    return transferred,{"enabled":True,"verified_body_delta":True,"field_delta_l1_p95":field_p95,"field_delta_l1_max":field_max,"local_delta_l1_p95":float(np.percentile(local_l1,95)) if len(local_l1) else 0.0,"local_delta_l1_max":float(np.max(local_l1,initial=0.0)),"support_distance_p95_mm":float(np.percentile(support_distance,95)*1000.0) if len(support_distance) else 0.0,"support_distance":support_distance,"local_delta_l1":local_l1,"body_supported_cache_columns":common_cache,"quantisation_floor":field_floor}
+
+
+def _retarget_garment_skinning(raw_positions: np.ndarray, source_positions: np.ndarray, source_weights: np.ndarray, source_joint_names: list[str], cache: dict[str, Any], behavior: str, effective_behavior: str, labels: np.ndarray, classes: dict[int, str], raw_to_weld: np.ndarray):
+    """Preserve the untouched garment skinning exactly after geometry refitting.
+
+    Target-body geometry is authoritative for fit and collision.  It is not skinning authority.  A
+    source->target body weight-field difference can describe the bodies themselves without proving
+    that an authored garment should be reweighted, and broad transfer here was able to destroy cloth,
+    stocking, strap and pelvis/thigh deformation relationships.  Until a garment-specific necessity is
+    proved independently, the untouched garment weights remain byte-stable structural authority.
+    """
+    raw_positions=np.asarray(raw_positions,dtype=np.float64);source_positions=np.asarray(source_positions,dtype=np.float64);source=np.asarray(source_weights,dtype=np.float64);source_joint_names=list(source_joint_names)
+    if raw_positions.shape!=source_positions.shape:raise ValueError(f"Garment skin preserve position mismatch {raw_positions.shape} vs {source_positions.shape}.")
+    if source.ndim!=2 or len(source)!=len(raw_positions):raise ValueError(f"Garment skin weights {source.shape} do not match {len(raw_positions)} garment vertices.")
+    if source.shape[1]!=len(source_joint_names):raise ValueError(f"Garment skin weights {source.shape} do not match {len(source_joint_names)} source joints.")
+    total=source.sum(axis=1)
+    if np.any(~np.isfinite(source)) or np.any(~np.isfinite(total)) or np.any(total<=1e-12):
+        raise ValueError(f"Source garment skinning contains {int(np.count_nonzero((~np.isfinite(total))|(total<=1e-12)))} invalid or unweighted vertices.")
+
+    geometric_move=np.linalg.norm(raw_positions-source_positions,axis=1);preserved=source.copy()
     left_columns,right_columns=_leg_joint_columns(source_joint_names)
     if left_columns and right_columns:
-        source_left=source[:,left_columns].sum(axis=1);source_right=source[:,right_columns].sum(axis=1)
-        bilateral=(source_left>=.04)&(source_right>=.04)
-        # Source-authored bilateral bridge weighting is structural garment authority.  Crotch/cloth
-        # vertices deliberately shared across both legs must not be reweighted toward whichever target
-        # thigh happens to be nearest after the geometry refit.
-        alpha[bilateral]=0.0
-    else:
-        bilateral=np.zeros(len(source),dtype=bool)
-
-    preserved=~supported
-    preserved_mass=source[:,preserved].sum(axis=1) if np.any(preserved) else np.zeros(len(source),dtype=np.float64)
-    body_mass=np.clip(1.0-preserved_mass,0.0,1.0)
-    source_body=source.copy();source_body[:,preserved]=0.0
-    source_body_total=source_body.sum(axis=1,keepdims=True);source_body_good=source_body_total[:,0]>1e-12;source_body[source_body_good]/=source_body_total[source_body_good]
-    target_body=target.copy();target_body[:,preserved]=0.0
-    target_body_total=target_body.sum(axis=1,keepdims=True);target_body_good=target_body_total[:,0]>1e-12;target_body[target_body_good]/=target_body_total[target_body_good]
-
-    source_active=source>1e-8;source_active_count=np.count_nonzero(source_active,axis=1);influence_capacity=max(1,int(np.max(source_active_count,initial=1)))
-    allowed=source_active.copy();new_target_slots=0
-    for row in range(len(source)):
-        spare=influence_capacity-int(source_active_count[row])
-        if spare<=0:continue
-        candidates=np.flatnonzero((~allowed[row])&supported&(target_body[row]>1e-6))
-        if not len(candidates):continue
-        order=candidates[np.argsort(-target_body[row,candidates],kind="stable")[:spare]]
-        allowed[row,order]=True;new_target_slots+=int(len(order))
-    target_body=np.where(allowed,target_body,0.0)
-    target_body_total=target_body.sum(axis=1,keepdims=True);target_body_good=target_body_total[:,0]>1e-12;target_body[target_body_good]/=target_body_total[target_body_good]
-    no_target=~target_body_good
-    if np.any(no_target):target_body[no_target]=source_body[no_target]
-    blended_body=(1.0-alpha[:,None])*source_body+alpha[:,None]*target_body
-    blended=blended_body*body_mass[:,None]
-    if np.any(preserved):blended[:,preserved]+=source[:,preserved]
-    blended=np.maximum(blended,0.0);total=blended.sum(axis=1,keepdims=True);good=total[:,0]>1e-12
-    if not np.all(good):raise ValueError(f"Garment skin retarget produced {int(np.count_nonzero(~good))} unweighted vertices.")
-    blended[good]/=total[good]
-
-    delta=np.abs(blended-source).sum(axis=1)
-    return blended,{
-        "mode":"target_body_skin_weight_retarget",
-        "vertices":int(len(blended)),"retargeted_vertices":int(np.count_nonzero(alpha>1e-6)),"geometry_rigid_vertices":int(np.count_nonzero(rigid)),
-        "skin_rigid_smoothed_vertices":smoothed_rigid_vertices,"skin_rigid_smoothed_components":smoothed_rigid_components,
-        "preserved_non_body_joint_count":int(np.count_nonzero(preserved)),"preserved_non_body_weight_mean":float(np.mean(preserved_mass)),
-        "bilateral_authored_vertices":int(np.count_nonzero(bilateral)),"bilateral_exact_source_weight_preserve":True,"source_influence_capacity":influence_capacity,"new_target_joint_slots":new_target_slots,"geometric_move_p50_mm":float(np.median(geometric_move)*1000.0),"geometric_move_p95_mm":float(np.percentile(geometric_move,95)*1000.0),
-        "alpha_mean":float(np.mean(alpha)),"alpha_p95":float(np.percentile(alpha,95)),"target_distance_p50_mm":float(np.median(distance)*1000.0),
-        "target_distance_p95_mm":float(np.percentile(distance,95)*1000.0),"weight_delta_l1_mean":float(np.mean(delta)),"weight_delta_l1_p95":float(np.percentile(delta,95)),
+        source_left=source[:,left_columns].sum(axis=1);source_right=source[:,right_columns].sum(axis=1);bilateral=(source_left>=.04)&(source_right>=.04)
+    else:bilateral=np.zeros(len(source),dtype=bool)
+    raw_labels=np.asarray(labels,dtype=np.int64)[np.asarray(raw_to_weld,dtype=np.int64)] if len(raw_to_weld)==len(source) else np.full(len(source),-1,dtype=np.int64)
+    rigid=np.asarray([str(classes.get(int(component),"")).casefold()=="rigid" for component in raw_labels],dtype=bool)
+    return preserved,{
+        "mode":"source_authored_skinning_preserved",
+        "policy":"target body controls garment fit/clearance; untouched source garment skinning remains exact structural authority unless a future garment-specific rule proves a reweight is required",
+        "vertices":int(len(preserved)),"retargeted_vertices":0,"geometry_rigid_vertices":int(np.count_nonzero(rigid)),"skin_rigid_smoothed_vertices":0,"skin_rigid_smoothed_components":0,
+        "preserved_non_body_joint_count":int(len(source_joint_names)),"preserved_non_body_weight_mean":1.0,"bilateral_authored_vertices":int(np.count_nonzero(bilateral)),"bilateral_exact_source_weight_preserve":True,
+        "source_influence_capacity":int(np.max(np.count_nonzero(source>1e-8,axis=1),initial=0)),"new_target_joint_slots":0,
+        "geometric_move_p50_mm":float(np.median(geometric_move)*1000.0) if len(geometric_move) else 0.0,"geometric_move_p95_mm":float(np.percentile(geometric_move,95)*1000.0) if len(geometric_move) else 0.0,
+        "alpha_mean":0.0,"alpha_p95":0.0,"target_distance_p50_mm":0.0,"target_distance_p95_mm":0.0,
+        "weight_delta_l1_mean":0.0,"weight_delta_l1_p95":0.0,"weight_delta_l1_max":0.0,"exact_source_weight_preserve":True,
+        "body_weight_delta":{"enabled":False,"verified_body_delta":False,"reason":"body skin-weight differences are diagnostic only and do not override authored garment skinning"},
     }
-
 
 def _preserve_leg_component_separation(source_positions: np.ndarray, solved_positions: np.ndarray, source_weights: np.ndarray, joint_names: list[str], labels: np.ndarray):
     source=np.asarray(source_positions,dtype=np.float64);solved=np.asarray(solved_positions,dtype=np.float64).copy();weights=np.asarray(source_weights,dtype=np.float64);labels=np.asarray(labels,dtype=np.int64)
@@ -5088,23 +5092,68 @@ def _apply_b14_local_structural_retarget(source: Any, positions: dict[str,np.nda
     return out,{"enabled":True,"policy":"same authored garment, one continuous source-clearance-weighted body field, distributed literal collision","body_motion_p95_mm":body_motion_p95*1000.0,"changed_meshes":changed_meshes,"changed_mesh_count":len(changed_meshes),"meshes":reports}
 
 
-def _apply_final_local_shell_bridge(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, max_passes: int=8) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
-    """Bridge target-only local convex relief after the last body/layer fit, before attachment closure.
+def _apply_final_local_shell_bridge(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, target_support_triangles: np.ndarray | None=None, max_passes: int=3, detail_gate_m: float=.00075, cumulative_cap_m: float=.00320) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Bridge only literal target relief that is absent from the smooth target support surface.
 
-    This is intentionally a bounded post-fit cleanup, not another body solver.  The untouched source
-    garment proves whether a convexity is new, the surrounding solved shell proves the bridge surface,
-    and the literal target body remains a penetration veto.  Running a few bounded evidence-gated
-    passes lets a sharp local artifact relax without one aggressive topology-changing move.
+    The target support surface owns macro fit (breast volume/position, hips, abdomen, etc.).  The literal
+    target body is collision evidence only for local surface relief.  A post-fit bridge is therefore
+    allowed to alter B14 geometry only where the literal target body materially departs from the smooth
+    target support surface *and* the source-aware bridge detector independently identifies new local
+    curvature.  This prevents repeated cleanup passes from flattening genuine target macro shape or
+    source-authored cup/apex relief.
     """
     if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
+    literal=np.asarray(target_body_triangles,dtype=np.float64)
+    support=np.asarray(target_support_triangles,dtype=np.float64) if target_support_triangles is not None else np.zeros((0,3,3),dtype=np.float64)
+    have_support=bool(support.ndim==3 and support.shape[1:]==(3,3) and len(support))
     out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};mesh_reports={};changed=[]
     for name in sorted(out):
         data=source.data(name);w=weld_mesh(data);source_w=np.asarray(w["V"],dtype=np.float64);faces=np.asarray(w["F"],dtype=np.int64)
         current=_weld_positions_from_raw(w,out[name]);initial=current.copy();passes=[]
+        neighbours=[set() for _ in range(len(current))]
+        if len(faces):
+            for a,b in np.unique(np.sort(np.vstack((faces[:,[0,1]],faces[:,[1,2]],faces[:,[2,0]])),axis=1),axis=0):
+                neighbours[int(a)].add(int(b));neighbours[int(b)].add(int(a))
         for pass_index in range(max(1,int(max_passes))):
-            candidate,report=_bridge_new_local_curvature(source_w,faces,current,source_body_triangles,target_body_triangles,nearest_surface_fn=_b14_nearest_surface,config=None)
-            candidate=np.asarray(candidate,dtype=np.float64);step=np.linalg.norm(candidate-current,axis=1);changed_count=int(np.count_nonzero(step>1e-12))
-            passes.append({"pass":pass_index+1,"changed_vertex_count":changed_count,"step_p95_mm":float(np.percentile(step[step>1e-12],95)*1000.0) if changed_count else 0.0,"step_max_mm":float(np.max(step,initial=0.0)*1000.0),"bridge":report})
+            candidate,report=_bridge_new_local_curvature(source_w,faces,current,source_body_triangles,literal,nearest_surface_fn=_b14_nearest_surface,config=None)
+            candidate=np.asarray(candidate,dtype=np.float64);step=np.linalg.norm(candidate-current,axis=1);step_mask=step>1e-12
+            raw_changed=int(np.count_nonzero(step_mask));detail_seed_count=0;detail_p95=0.0
+            if raw_changed and have_support:
+                ids=np.flatnonzero(step_mask)
+                literal_cp,_,_,_,_=_nearest_surface_reference_chunked(current[ids],literal,k=32)
+                support_cp,_,_,_,_=_nearest_surface_reference_chunked(current[ids],support,k=32)
+                detail=np.linalg.norm(np.asarray(literal_cp)-np.asarray(support_cp),axis=1)
+                detail_p95=float(np.percentile(detail,95)*1000.0) if len(detail) else 0.0
+                seeds=ids[detail>=float(detail_gate_m)];detail_seed_count=int(len(seeds))
+                if not len(seeds):
+                    candidate=current.copy();step_mask[:]=False
+                else:
+                    allowed=np.zeros(len(current),dtype=bool);allowed[seeds]=True;front=set(int(i) for i in seeds.tolist())
+                    # Keep the bridge spatially smooth around target-only detail, but do not allow it to
+                    # spread into unrelated macro shell/cup regions.
+                    for _ in range(2):
+                        nxt=set()
+                        for vi in front:nxt.update(int(nb) for nb in neighbours[vi])
+                        nxt={vi for vi in nxt if step_mask[vi] and not allowed[vi]}
+                        if not nxt:break
+                        allowed[list(nxt)]=True;front=nxt
+                    candidate[~allowed]=current[~allowed]
+                    step_mask=allowed&(np.linalg.norm(candidate-current,axis=1)>1e-12)
+            elif raw_changed and not have_support:
+                # Compatibility fallback: retain the historical detector, but still enforce the hard
+                # cumulative cap below. Production strict-B14 supplies a support surface.
+                detail_seed_count=raw_changed
+
+            if np.any(step_mask):
+                cumulative_vec=candidate-initial;cumulative_mag=np.linalg.norm(cumulative_vec,axis=1)
+                over=cumulative_mag>float(cumulative_cap_m)
+                if np.any(over):
+                    cumulative_vec[over]*=(float(cumulative_cap_m)/np.maximum(cumulative_mag[over],1e-12))[:,None]
+                    candidate=initial+cumulative_vec
+                step=np.linalg.norm(candidate-current,axis=1);changed_count=int(np.count_nonzero(step>1e-12))
+            else:
+                candidate=current.copy();step=np.zeros(len(current),dtype=np.float64);changed_count=0
+            passes.append({"pass":pass_index+1,"raw_bridge_changed_vertex_count":raw_changed,"target_only_detail_seed_vertices":detail_seed_count,"literal_vs_support_detail_p95_mm":detail_p95,"changed_vertex_count":changed_count,"step_p95_mm":float(np.percentile(step[step>1e-12],95)*1000.0) if changed_count else 0.0,"step_max_mm":float(np.max(step,initial=0.0)*1000.0),"bridge":report})
             if changed_count<=0:break
             current=candidate
         cumulative=np.linalg.norm(current-initial,axis=1);mesh_changed=int(np.count_nonzero(cumulative>1e-12))
@@ -5113,7 +5162,7 @@ def _apply_final_local_shell_bridge(source: Any, positions: dict[str,np.ndarray]
             raw=expand_welded(w,current)
             if raw.shape!=out[name].shape:raise ValueError(f"{name}: final local shell bridge produced {raw.shape}, expected {out[name].shape}")
             out[name]=np.asarray(raw,dtype=np.float64);changed.append(name)
-    return out,{"enabled":bool(changed),"policy":"iterative source-proven local convexity bridge after final fit; literal target remains penetration veto; no control geometry","max_passes":int(max_passes),"changed_meshes":changed,"changed_mesh_count":len(changed),"meshes":mesh_reports}
+    return out,{"enabled":bool(changed),"policy":"source-aware local bridge may act only where literal target relief departs from smooth target macro support; source-authored and target-macro relief are protected","max_passes":int(max_passes),"target_only_detail_gate_mm":float(detail_gate_m*1000.0),"cumulative_vertex_cap_mm":float(cumulative_cap_m*1000.0),"changed_meshes":changed,"changed_mesh_count":len(changed),"meshes":mesh_reports}
 
 
 def _preserve_final_unilateral_pair_separation(source: Any, positions: dict[str,np.ndarray], *, preserve_proximal_structure: bool = True) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
@@ -5520,89 +5569,212 @@ def _strict_source_literal_body_triangles(cache: dict[str,Any], fallback: np.nda
     return combined
 
 
-def _final_source_authored_body_clearance(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00005, maximum_vertex_move_m: float=.00150) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
-    """Repair small genuine body penetrations without letting target anatomy reshape the garment.
+def _final_target_body_clearance(source: Any, positions: dict[str,np.ndarray], target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00010, maximum_vertex_move_m: float=.00800, maximum_step_m: float=.00150, max_passes: int=8) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Clear the target while source-proven seam copies share one displacement."""
+    kwargs=dict(margin_m=margin_m,maximum_vertex_move_m=maximum_vertex_move_m,
+                maximum_step_m=maximum_step_m,max_passes=max_passes)
+    pairs,discovery=_source_proven_cross_mesh_seam_pairs(source,positions,include_same_mesh=True)
+    if not pairs:
+        return _clear_target_body_surfaces(source,positions,target_body_triangles,target_support_triangles,**kwargs)
+    joined,seams=_preserve_final_source_shared_seams(source,positions)
+    names=sorted(joined);starts={};source_parts=[];current_parts=[];faces=[];offset=0
+    for name in names:
+        data=source.data(name);S=np.asarray(data["V"],dtype=np.float64);F=np.asarray(data["F"],dtype=np.int64)
+        starts[name]=offset;source_parts.append(S);current_parts.append(joined[name]);faces.append(F+offset);offset+=len(S)
+    S=np.vstack(source_parts);P=np.vstack(current_parts);F=np.vstack(faces);parent=np.arange(len(S))
+    def root(i):
+        while parent[i]!=i:parent[i]=parent[parent[i]];i=int(parent[i])
+        return i
+    for an,ai,bn,bi,_ in pairs:
+        a=root(starts[an]+ai);b=root(starts[bn]+bi)
+        if a!=b:parent[b]=a
+    roots=np.asarray([root(i) for i in range(len(S))],dtype=np.int64)
+    _,inverse=np.unique(roots,return_inverse=True);count=np.bincount(inverse).astype(np.float64)
+    source_centres=np.zeros((len(count),3));displacement=np.zeros_like(source_centres)
+    np.add.at(source_centres,inverse,S);source_centres/=count[:,None]
+    np.add.at(displacement,inverse,P-S);displacement/=count[:,None]
+    centres=source_centres+displacement;authored_offsets=S-source_centres[inverse]
+    proxy_faces=inverse[F]
+    proxy_faces=proxy_faces[(proxy_faces[:,0]!=proxy_faces[:,1])&(proxy_faces[:,1]!=proxy_faces[:,2])&(proxy_faces[:,2]!=proxy_faces[:,0])]
+    class SeamSurface:
+        def data(self,name):return {"V":source_centres,"F":proxy_faces}
+    # Near-coincident authored seams retain their tiny offsets on expansion; this
+    # extra clearance bounds the maximum difference from the shared solve surface.
+    kwargs["margin_m"]+=float(np.max(np.linalg.norm(authored_offsets,axis=1),initial=0.))
+    solved,report=_clear_target_body_surfaces(SeamSurface(),{"seam_surface":centres},target_body_triangles,target_support_triangles,**kwargs)
+    expanded=solved["seam_surface"][inverse]+authored_offsets
+    out={name:expanded[starts[name]:starts[name]+len(joined[name])].copy() for name in names}
+    report["source_seams"]={"discovery":discovery,"closure":seams,"shared_displacement":True}
+    report["changed_meshes"]=[name for name in names if np.any(np.linalg.norm(out[name]-positions[name],axis=1)>1e-12)]
+    report["changed_mesh_count"]=len(report["changed_meshes"])
+    report["maximum_move_mm"]=max(float(np.max(np.linalg.norm(out[name]-positions[name],axis=1),initial=0.))*1000 for name in names)
+    return out,report
 
-    Only regions that were close to the body geometry physically present in the untouched source outfit
-    are eligible.  Already-positive target clearance is left exactly alone.  Corrections use the smooth
-    support surface for direction, sample triangle interiors, stay local, and are capped so a target-only
-    nipple, mound or other literal relief can never inflate an otherwise-correct B14 result.
+
+def _clear_target_body_surfaces(source: Any, positions: dict[str,np.ndarray], target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00010, maximum_vertex_move_m: float=.00800, maximum_step_m: float=.00150, max_passes: int=8) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Repair sampled residual garment penetration against the selected target body without embossing it.
+
+    The selected target body is final fit/occupancy authority even where the untouched source outfit had
+    body geometry removed.  Literal target geometry answers only one question here: *is cloth inside the
+    target?*  The accumulated correction is spread over a physical neighbourhood of connected cloth,
+    relative to the already-fitted garment normals. This also handles anatomy embedded in the main
+    body material, where the nominal target support and literal body are the same surface.
+
+    Nearby clear cloth can follow a contact to bridge small relief. Unaffected components and authored
+    garment geometry stay intact: this filters collision displacement, not the garment positions.
     """
     if not positions:return {},{"enabled":False,"reason":"no garment meshes"}
-    source_tri=np.asarray(source_body_triangles,dtype=np.float64);target_tri=np.asarray(target_body_triangles,dtype=np.float64);support_tri=np.asarray(target_support_triangles,dtype=np.float64)
-    if source_tri.ndim!=3 or source_tri.shape[1:]!=(3,3) or len(source_tri)==0:
-        return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no embedded source-body contact surface"}
+    target_tri=np.asarray(target_body_triangles,dtype=np.float64);support_tri=np.asarray(target_support_triangles,dtype=np.float64)
     if target_tri.ndim!=3 or target_tri.shape[1:]!=(3,3) or len(target_tri)==0:
         return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no target collision surface"}
-    bary=np.asarray([(i/4.0,j/4.0,(4-i-j)/4.0) for i in range(5) for j in range(5-i)],dtype=np.float64)
-    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};reports={};changed=[];total_faces=0;maximum_move=0.0;minimum_after=None;unresolved_total=0
+    have_support=bool(support_tri.ndim==3 and support_tri.shape[1:]==(3,3) and len(support_tri))
+    # Vertices, edge midpoints and the centroid miss narrow crossings between those probes.
+    # Include the quarter-grid interiors as well; final MDL topology can put a body ridge
+    # directly underneath one of these previously untested parts of a garment triangle.
+    bary=np.asarray([(i/4.,j/4.,(4-i-j)/4.) for i in range(5) for j in range(5-i)]+[(1./3.,1./3.,1./3.)],dtype=np.float64)
+    out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()};reports={};changed=[];total_faces=0;maximum_move=0.0;minimum_after=None;unresolved_total=0;initial_minimum=None
     for name in sorted(out):
-        data=source.data(name);S=np.asarray(data.get("V",[]),dtype=np.float64);F=np.asarray(data.get("F",[]),dtype=np.int64);P=np.asarray(out[name],dtype=np.float64)
-        if S.shape!=P.shape or S.ndim!=2 or S.shape[1:]!=(3,) or F.ndim!=2 or F.shape[1:]!=(3,) or len(F)==0:
+        data=source.data(name);F=np.asarray(data.get("F",[]),dtype=np.int64);P=np.asarray(out[name],dtype=np.float64)
+        if P.ndim!=2 or P.shape[1:]!=(3,) or F.ndim!=2 or F.shape[1:]!=(3,) or len(F)==0 or int(np.max(F,initial=-1))>=len(P):
             reports[name]={"enabled":False,"reason":"no compatible indexed garment surface"};continue
-        source_samples=np.einsum("bk,fkj->fbj",bary,S[F]).reshape(-1,3)
-        _,_,source_signed,source_distance,_=_b14_nearest_surface(source_samples,source_tri,k=32)
-        source_signed=np.asarray(source_signed,dtype=np.float64).reshape(len(F),len(bary));source_distance=np.asarray(source_distance,dtype=np.float64).reshape(len(F),len(bary))
-        authored=(source_distance<=.012)&(source_signed>=-.0015)&(source_signed<=.012)
-        contact_faces=np.flatnonzero(np.any(authored,axis=1))
-        if len(contact_faces)==0:
-            reports[name]={"enabled":True,"affected_faces":0,"changed_vertex_count":0,"reason":"no contact with embedded source body"};continue
-        original=P.copy();V=P.copy();affected=set();opposite_rejections=0
-        for _ in range(3):
-            grid=np.einsum("bk,fkj->fbj",bary,V[F[contact_faces]]);samples=grid.reshape(-1,3)
-            _,literal_normals,signed,_,_,rejections=_nearest_literal_surface_consistent_with_support(samples,target_tri,support_tri if len(support_tri) else None)
-            opposite_rejections+=int(rejections);signed=np.asarray(signed,dtype=np.float64).reshape(len(contact_faces),len(bary));literal_normals=np.asarray(literal_normals,dtype=np.float64).reshape(len(contact_faces),len(bary),3)
-            local_authored=authored[contact_faces];penetrating=local_authored&(signed<-.00002)
-            if not np.any(penetrating):break
-            deficit=np.where(penetrating,float(margin_m)-signed,0.0);bad_rows=np.flatnonzero(np.max(deficit,axis=1)>1e-7)
+        original=P.copy();V=P.copy();affected=set();opposite_rejections=0;bisector_pushes=0;iterations=0;initial_penetrating_faces=0
+        edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);neighbours=[[] for _ in range(len(V))]
+        for a,b in edges:neighbours[int(a)].append(int(b));neighbours[int(b)].append(int(a))
+        base_area=np.cross(original[F[:,1]]-original[F[:,0]],original[F[:,2]]-original[F[:,0]]);base_norm=np.linalg.norm(base_area,axis=1);valid_area=base_norm>1e-12
+        for pass_index in range(max(1,int(max_passes))):
+            grid=np.einsum("bk,fkj->fbj",bary,V[F]);samples=grid.reshape(-1,3)
+            _,literal_normals,signed,_,_,rejections=_nearest_literal_surface_consistent_with_support(samples,target_tri,support_tri if have_support else None,exact_base=(pass_index==max(1,int(max_passes))-1))
+            opposite_rejections+=int(rejections);signed=np.asarray(signed,dtype=np.float64).reshape(len(F),len(bary));literal_normals=np.asarray(literal_normals,dtype=np.float64).reshape(len(F),len(bary),3)
+            if pass_index==0:
+                initial_minimum=float(np.min(signed))*1000.0 if initial_minimum is None else min(initial_minimum,float(np.min(signed))*1000.0)
+                initial_penetrating_faces=int(np.count_nonzero(np.any(signed<-.00002,axis=1)))
+            deficit=np.maximum(0.0,float(margin_m)-signed);deficit[signed>=-.00002]=0.0
+            bad_rows=np.flatnonzero(np.max(deficit,axis=1)>1e-8)
             if len(bad_rows)==0:break
-            chosen=np.argmax(deficit[bad_rows],axis=1);face_ids=contact_faces[bad_rows];need=np.minimum(deficit[bad_rows,chosen],.0010)
-            if len(support_tri):
-                _,push_normals,_,_,_=_nearest_surface_reference_chunked(grid[bad_rows,chosen],support_tri,k=32)
-                push_normals=np.asarray(push_normals,dtype=np.float64)
-                literal=np.asarray(literal_normals[bad_rows,chosen],dtype=np.float64);flip=np.einsum("ij,ij->i",push_normals,literal)<0.0;push_normals[flip]*=-1.0
-            else:push_normals=np.asarray(literal_normals[bad_rows,chosen],dtype=np.float64)
+            iterations=pass_index+1;affected.update(int(x) for x in bad_rows.tolist())
+            chosen=np.argmax(deficit[bad_rows],axis=1);sample_points=grid[bad_rows,chosen];literal=np.asarray(literal_normals[bad_rows,chosen],dtype=np.float64)
+            if have_support:
+                _,support_normals,_,_,_=_nearest_surface_reference_chunked(sample_points,support_tri,k=32);support_normals=np.asarray(support_normals,dtype=np.float64)
+                push_normals,bisector_report=_clearance_push_normals_with_bisector(support_normals,literal,signed[bad_rows,chosen]);bisector_pushes+=int(bisector_report.get("used",0))
+                flip=np.einsum("ij,ij->i",push_normals,literal)<-.05;push_normals[flip]*=-1.0
+            else:push_normals=literal.copy()
             push_normals/=np.maximum(np.linalg.norm(push_normals,axis=1)[:,None],1e-12)
-            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[face_ids];weights=.30+.70*bary[chosen]
-            contrib=push_normals[:,None,:]*need[:,None,None]*weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),weights.reshape(-1))
+            need=np.minimum(deficit[bad_rows,chosen],float(maximum_step_m))
+            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[bad_rows];corner_weights=.30+.70*bary[chosen]
+            contrib=push_normals[:,None,:]*need[:,None,None]*corner_weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),corner_weights.reshape(-1))
             direct=weight>0;field=np.zeros_like(V);field[direct]=acc[direct]/weight[direct,None]
-            # One small feather ring avoids a hard dent without turning a local collision into a macro reshape.
-            edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);ea=edges[:,0];eb=edges[:,1];degree=np.bincount(np.concatenate((ea,eb)),minlength=len(V)).astype(np.float64);sums=np.zeros_like(V);np.add.at(sums,ea,field[eb]);np.add.at(sums,eb,field[ea]);avg=sums/np.maximum(degree[:,None],1.0);grow=np.zeros(len(V),dtype=bool);edge_active=direct[ea]|direct[eb];grow[ea[edge_active]]=True;grow[eb[edge_active]]=True;grow&=~direct;field[grow]=.18*avg[grow]
-            trial=V+field;delta=trial-original;mag=np.linalg.norm(delta,axis=1);delta*=np.minimum(1.0,float(maximum_vertex_move_m)/np.maximum(mag,1e-12))[:,None];trial=original+delta
-            base_area=np.cross(V[F[:,1]]-V[F[:,0]],V[F[:,2]]-V[F[:,0]]);trial_area=np.cross(trial[F[:,1]]-trial[F[:,0]],trial[F[:,2]]-trial[F[:,0]]);bn=np.linalg.norm(base_area,axis=1);tn=np.linalg.norm(trial_area,axis=1);valid=bn>1e-12;dot=np.ones(len(F));ratio=np.ones(len(F));dot[valid]=np.einsum("ij,ij->i",base_area[valid],trial_area[valid])/np.maximum(bn[valid]*tn[valid],1e-24);ratio[valid]=tn[valid]/np.maximum(bn[valid],1e-12);unsafe=valid&((dot<=.08)|(ratio<=.18))
-            if np.any(unsafe):trial[np.unique(F[unsafe].reshape(-1))]=V[np.unique(F[unsafe].reshape(-1))]
-            if float(np.max(np.linalg.norm(trial-V,axis=1),initial=0.0))<1e-9:break
-            V=trial;affected.update(int(x) for x in face_ids.tolist())
-        final_grid=np.einsum("bk,fkj->fbj",bary,V[F[contact_faces]]).reshape(-1,3);_,_,final_signed,_,_,final_rejections=_nearest_literal_surface_consistent_with_support(final_grid,target_tri,support_tri if len(support_tri) else None,exact_base=True);opposite_rejections+=int(final_rejections);final_signed=np.asarray(final_signed,dtype=np.float64).reshape(len(contact_faces),len(bary));remaining=authored[contact_faces]&(final_signed<-.00002);unresolved=int(np.count_nonzero(np.any(remaining,axis=1)));unresolved_total+=unresolved
-        relevant=final_signed[authored[contact_faces]];after=float(np.min(relevant)) if len(relevant) else None;moved=np.linalg.norm(V-original,axis=1);move_max=float(np.max(moved,initial=0.0))
+            # Build a smooth cloth-support envelope.  Literal anatomy determines the required amount at
+            # the collision core; neighbouring cloth follows a rapidly decaying garment-topology field.
+            seen=set(int(i) for i in np.flatnonzero(direct).tolist());front=set(seen)
+            for scale in (.42,.18):
+                nxt=set()
+                for vi in front:nxt.update(int(nb) for nb in neighbours[vi] if int(nb) not in seen)
+                if not nxt:break
+                for vi in nxt:
+                    refs=[nb for nb in neighbours[vi] if float(np.linalg.norm(field[nb]))>0.0]
+                    if refs:field[vi]=float(scale)*np.mean(field[refs],axis=0)
+                seen.update(nxt);front=nxt
+            trial=V+field
+            cumulative=trial-original;mag=np.linalg.norm(cumulative,axis=1);over=mag>float(maximum_vertex_move_m)
+            if np.any(over):cumulative[over]*=(float(maximum_vertex_move_m)/np.maximum(mag[over],1e-12))[:,None]
+            trial=original+cumulative
+            # Never accept an inverted/collapsed local triangle.  Halve the local step a few times before
+            # giving up on those vertices so deep target penetrations can still converge smoothly.
+            local_step=trial-V
+            for _ in range(4):
+                trial_area=np.cross(trial[F[:,1]]-trial[F[:,0]],trial[F[:,2]]-trial[F[:,0]]);trial_norm=np.linalg.norm(trial_area,axis=1);dot=np.ones(len(F));ratio=np.ones(len(F));dot[valid_area]=np.einsum("ij,ij->i",base_area[valid_area],trial_area[valid_area])/np.maximum(base_norm[valid_area]*trial_norm[valid_area],1e-24);ratio[valid_area]=trial_norm[valid_area]/np.maximum(base_norm[valid_area],1e-12);unsafe=valid_area&((dot<=.05)|(ratio<=.12))
+                if not np.any(unsafe):break
+                unsafe_vertices=np.unique(F[unsafe].reshape(-1));local_step[unsafe_vertices]*=.5;trial=V+local_step
+            if np.any(unsafe):
+                unsafe_vertices=np.unique(F[unsafe].reshape(-1));trial[unsafe_vertices]=V[unsafe_vertices]
+            if float(np.max(np.linalg.norm(trial-V,axis=1),initial=0.0))<1e-10:break
+            V=trial
+        envelope, envelope_report = clearance_envelope(original, F, V-original,
+                                                        maximum_move_m=float(maximum_vertex_move_m))
+        envelope_step = original + envelope - V
+        for _ in range(8):
+            trial = V + envelope_step
+            trial_area = np.cross(trial[F[:,1]]-trial[F[:,0]], trial[F[:,2]]-trial[F[:,0]])
+            trial_norm = np.linalg.norm(trial_area, axis=1)
+            alignment = np.einsum("ij,ij->i", base_area, trial_area)
+            unsafe = valid_area & ((alignment <= .05*base_norm*trial_norm) | (trial_norm <= .12*base_norm))
+            if not np.any(unsafe):
+                V = trial
+                break
+            envelope_step[np.unique(F[unsafe])] *= .5
+        else:
+            envelope_report["rejected"] = "could not preserve triangle orientation"
+        # Exact residual pinning: after the smooth envelope has done the visible work, remove any tiny
+        # triangle-interior intersections that remain.  Query only the residual face set on subsequent
+        # iterations so this hard no-clipping invariant is cheap compared with the broad envelope pass.
+        micro_iterations=0
+        audit_grid=np.einsum("bk,fkj->fbj",bary,V[F]);_,_,audit_signed,_,_,audit_rejections=_nearest_literal_surface_consistent_with_support(audit_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(audit_rejections);audit_signed=np.asarray(audit_signed,dtype=np.float64).reshape(len(F),len(bary))
+        micro_faces=np.flatnonzero(np.any(audit_signed<float(margin_m),axis=1))
+        for micro_index in range(12):
+            if len(micro_faces)==0:break
+            local_grid=np.einsum("bk,fkj->fbj",bary,V[F[micro_faces]]);_,local_literal_normals,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(bary));local_literal_normals=np.asarray(local_literal_normals,dtype=np.float64).reshape(len(micro_faces),len(bary),3)
+            deficit=np.maximum(0.0,float(margin_m)-local_signed);bad=np.flatnonzero(np.max(deficit,axis=1)>1e-8)
+            if len(bad)==0:break
+            micro_iterations=micro_index+1;rows=micro_faces[bad];chosen=np.argmax(deficit[bad],axis=1);points=local_grid[bad,chosen];literal_n=local_literal_normals[bad,chosen]
+            if have_support:
+                _,support_normals,_,_,_=_nearest_surface_reference_chunked(points,support_tri,k=32);support_normals=np.asarray(support_normals,dtype=np.float64);push_normals,_=_clearance_push_normals_with_bisector(support_normals,literal_n,local_signed[bad,chosen]);flip=np.einsum("ij,ij->i",push_normals,literal_n)<-.05;push_normals[flip]*=-1.0
+            else:push_normals=np.asarray(literal_n,dtype=np.float64).copy()
+            push_normals/=np.maximum(np.linalg.norm(push_normals,axis=1)[:,None],1e-12)
+            # A small deterministic overshoot avoids asymptotically hovering a few microns inside due
+            # shared-vertex averaging while remaining far below visible garment-shape scale.
+            need=np.minimum(deficit[bad,chosen]*1.20+.000015,.00075)
+            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[rows];corner_weights=.45+.55*bary[chosen];contrib=push_normals[:,None,:]*need[:,None,None]*corner_weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),corner_weights.reshape(-1));direct=weight>0;field=np.zeros_like(V);field[direct]=acc[direct]/weight[direct,None]
+            trial=V+field;cumulative=trial-original;mag=np.linalg.norm(cumulative,axis=1);over=mag>float(maximum_vertex_move_m)
+            if np.any(over):cumulative[over]*=(float(maximum_vertex_move_m)/np.maximum(mag[over],1e-12))[:,None]
+            trial=original+cumulative
+            if float(np.max(np.linalg.norm(trial-V,axis=1),initial=0.0))<1e-10:break
+            V=trial;affected.update(int(x) for x in rows.tolist())
+            # Re-test only the residual set; an outward pin cannot create a new body intersection away
+            # from the moved neighbourhood, and the global exact audit below remains authoritative.
+            local_grid=np.einsum("bk,fkj->fbj",bary,V[F[micro_faces]]);_,_,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(bary));micro_faces=micro_faces[np.any(local_signed<float(margin_m),axis=1)]
+        final_grid=np.einsum("bk,fkj->fbj",bary,V[F]).reshape(-1,3);_,_,final_signed,_,_,final_rejections=_nearest_literal_surface_consistent_with_support(final_grid,target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(final_rejections);final_signed=np.asarray(final_signed,dtype=np.float64).reshape(len(F),len(bary));remaining=np.any(final_signed<-.00002,axis=1);unresolved=int(np.count_nonzero(remaining));unresolved_total+=unresolved
+        after=float(np.min(final_signed)) if final_signed.size else None;moved=np.linalg.norm(V-original,axis=1);move_max=float(np.max(moved,initial=0.0))
         if move_max>1e-12:out[name]=V;changed.append(name)
         total_faces+=len(affected);maximum_move=max(maximum_move,move_max)
         if after is not None and np.isfinite(after):minimum_after=after*1000.0 if minimum_after is None else min(minimum_after,after*1000.0)
-        reports[name]={"enabled":True,"affected_faces":int(len(affected)),"changed_vertex_count":int(np.count_nonzero(moved>1e-12)),"maximum_move_mm":move_max*1000.0,"unresolved_penetrating_faces":unresolved,"opposite_facing_literal_rejections":opposite_rejections,"sample_min_after_mm":after*1000.0 if after is not None else None}
-    return out,{"enabled":True,"policy":"repair true penetration only where the embedded source body proves garment/body contact; positive clearance and target-only relief are not shape authority","penetration_clearance_mm":float(margin_m*1000.0),"maximum_vertex_move_mm":float(maximum_vertex_move_m*1000.0),"changed_meshes":changed,"changed_mesh_count":len(changed),"affected_face_count":int(total_faces),"unresolved_penetrating_face_count":int(unresolved_total),"maximum_move_mm":float(maximum_move*1000.0),"minimum_contact_sample_after_mm":minimum_after,"meshes":reports}
+        reports[name]={"enabled":True,"initial_penetrating_faces":int(initial_penetrating_faces),"affected_faces":int(len(affected)),"changed_vertex_count":int(np.count_nonzero(moved>1e-12)),"maximum_move_mm":move_max*1000.0,"iterations":int(iterations),"micro_iterations":int(micro_iterations),"unresolved_penetrating_faces":unresolved,"opposite_facing_literal_rejections":opposite_rejections,"bisector_pushes":bisector_pushes,"sample_min_after_mm":after*1000.0 if after is not None else None,"cloth_envelope":envelope_report}
+    return out,{"enabled":True,"policy":"selected target body is final occupancy authority; connected cloth spreads collision displacement at physical scale without smoothing authored geometry; source-body holes never suppress target clearance","penetration_clearance_mm":float(margin_m*1000.0),"maximum_vertex_move_mm":float(maximum_vertex_move_m*1000.0),"maximum_step_mm":float(maximum_step_m*1000.0),"max_passes":int(max_passes),"changed_meshes":changed,"changed_mesh_count":len(changed),"affected_face_count":int(total_faces),"unresolved_penetrating_face_count":int(unresolved_total),"maximum_move_mm":float(maximum_move*1000.0),"minimum_sample_before_mm":initial_minimum,"minimum_contact_sample_after_mm":minimum_after,"meshes":reports}
 
 
-def _source_proven_cross_mesh_seam_pairs(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[list[tuple[str,int,str,int,np.ndarray]],dict[str,Any]]:
-    """Discover repeated cross-mesh source seams without relying on garment names or materials."""
+def _final_source_authored_body_clearance(source: Any, positions: dict[str,np.ndarray], source_body_triangles: np.ndarray, target_body_triangles: np.ndarray, target_support_triangles: np.ndarray, margin_m: float=.00010, maximum_vertex_move_m: float=.00800) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Compatibility wrapper for the pre-1.1.9 name; source-body geometry no longer gates target fit."""
+    return _final_target_body_clearance(source,positions,target_body_triangles,target_support_triangles,margin_m=margin_m,maximum_vertex_move_m=maximum_vertex_move_m)
+
+
+def _source_proven_cross_mesh_seam_pairs(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=3, *, include_same_mesh: bool=False) -> tuple[list[tuple[str,int,str,int,np.ndarray]],dict[str,Any]]:
+    """Discover repeated source seams, optionally including split boundaries within a mesh."""
     names=sorted(positions)
-    if len(names)<2:
+    if not names or (len(names)<2 and not include_same_mesh):
         return [],{"candidate_pair_count":0,"accepted_pair_count":0,"mesh_pair_witnesses":{}}
-    source_parts=[];owners=[];locals_=[]
+    source_parts=[];owners=[];locals_=[];boundaries=[];mesh_edges={}
     for owner,name in enumerate(names):
         vertices=np.asarray(source.data(name).get("V",[]),dtype=np.float64)
         current=np.asarray(positions[name],dtype=np.float64)
         if vertices.shape!=current.shape or vertices.ndim!=2 or vertices.shape[1:]!=(3,):
             continue
-        source_parts.append(vertices);owners.extend([owner]*len(vertices));locals_.extend(range(len(vertices)))
+        boundary=np.zeros(len(vertices),dtype=bool)
+        faces=np.asarray(source.data(name).get("F",[]),dtype=np.int64)
+        if faces.ndim==2 and faces.shape[1:]==(3,) and len(faces):
+            edges=np.sort(np.vstack((faces[:,[0,1]],faces[:,[1,2]],faces[:,[2,0]])),axis=1)
+            edges,counts=np.unique(edges,axis=0,return_counts=True)
+            boundary[np.unique(edges[counts==1])]=True
+            mesh_edges[owner]=set(map(tuple,edges.tolist()))
+        source_parts.append(vertices);owners.extend([owner]*len(vertices));locals_.extend(range(len(vertices)));boundaries.extend(boundary.tolist())
     if not source_parts:
         return [],{"candidate_pair_count":0,"accepted_pair_count":0,"mesh_pair_witnesses":{}}
-    source_all=np.vstack(source_parts);owners=np.asarray(owners,dtype=np.int64);locals_=np.asarray(locals_,dtype=np.int64)
+    source_all=np.vstack(source_parts);owners=np.asarray(owners,dtype=np.int64);locals_=np.asarray(locals_,dtype=np.int64);boundaries=np.asarray(boundaries,dtype=bool)
     tree=cKDTree(source_all)
     raw=list(tree.query_pairs(r=max(float(tolerance_m),1e-9)))
     cross=[];counts={}
     for a,b in raw:
         oa=int(owners[a]);ob=int(owners[b])
-        if oa==ob:continue
+        if oa==ob and (not include_same_mesh or not (boundaries[a] and boundaries[b])):continue
+        if oa==ob and (int(locals_[a]),int(locals_[b])) in mesh_edges.get(oa,set()):continue
         if oa>ob:a,b=b,a;oa,ob=ob,oa
         key=(oa,ob);counts[key]=counts.get(key,0)+1;cross.append((int(a),int(b),key))
     eligible={key for key,count in counts.items() if int(count)>=max(2,int(minimum_pair_witnesses))}
@@ -5615,30 +5787,42 @@ def _source_proven_cross_mesh_seam_pairs(source: Any, positions: dict[str,np.nda
     return result,{"candidate_pair_count":int(len(cross)),"accepted_pair_count":int(len(result)),"accepted_mesh_pair_count":int(len(eligible)),"mesh_pair_witnesses":witness_report,"source_tolerance_mm":float(tolerance_m*1000.0),"minimum_pair_witnesses":int(minimum_pair_witnesses)}
 
 
-def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
-    """Keep repeated source-proven seams between separate garment meshes physically joined.
+def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndarray], tolerance_m: float=.000075, minimum_pair_witnesses: int=3) -> tuple[dict[str,np.ndarray],dict[str,Any]]:
+    """Keep source-proven seams joined across meshes and split boundaries within one mesh.
 
     Independent layer fitting is intentionally allowed, but two source meshes that share many
-    effectively-coincident boundary witnesses are one authored construction at that boundary.  Their
-    tiny source offset is retained while the solved midpoint is shared.  A local two-ring feather keeps
+    effectively-coincident boundary witnesses are one authored construction at that boundary. Their
+    tiny source offset is retained while all copies share one displacement. A local two-ring feather keeps
     the correction from producing a hard kink.  This is intentionally much stricter than generic
     proximity: isolated contacts never become seam authority.
     """
     if not positions:
         return {},{"enabled":False,"reason":"no garment meshes"}
-    pairs,discovery=_source_proven_cross_mesh_seam_pairs(source,positions,tolerance_m=tolerance_m,minimum_pair_witnesses=minimum_pair_witnesses)
+    pairs,discovery=_source_proven_cross_mesh_seam_pairs(source,positions,tolerance_m=tolerance_m,minimum_pair_witnesses=minimum_pair_witnesses,include_same_mesh=True)
     if not pairs:
         return {name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()},{"enabled":False,"reason":"no repeated source-proven cross-mesh seam","discovery":discovery}
     out={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
     target_sum={name:np.zeros_like(out[name]) for name in out};target_weight={name:np.zeros(len(out[name]),dtype=np.float64) for name in out}
-    before_gaps=[]
+    before_gaps=[];parent={}
+    def root(node):
+        parent.setdefault(node,node)
+        while parent[node]!=node:
+            parent[node]=parent[parent[node]];node=parent[node]
+        return node
     for an,ai,bn,bi,source_delta in pairs:
-        pa=np.asarray(out[an][ai],dtype=np.float64);pb=np.asarray(out[bn][bi],dtype=np.float64);mid=(pa+pb)*.5
+        pa=np.asarray(out[an][ai],dtype=np.float64);pb=np.asarray(out[bn][bi],dtype=np.float64)
         before_gaps.append(float(np.linalg.norm((pa-pb)-source_delta)))
-        # Garment seams are restored from the untouched garment only.  Body geometry, collision,
-        # clearance and anatomy are intentionally not inputs to seam placement.
-        ta=mid+source_delta*.5;tb=mid-source_delta*.5
-        target_sum[an][ai]+=ta;target_weight[an][ai]+=1.0;target_sum[bn][bi]+=tb;target_weight[bn][bi]+=1.0
+        ar=root((an,ai));br=root((bn,bi))
+        if ar!=br:parent[br]=ar
+    groups={}
+    for node in parent:groups.setdefault(root(node),[]).append(node)
+    # All copies of an authored seam share one displacement. Pairwise midpoint
+    # averaging leaves a gap when a junction has three or more storage copies.
+    for group in groups.values():
+        displacement=np.mean([out[name][idx]-np.asarray(source.data(name)["V"])[idx] for name,idx in group],axis=0)
+        for name,idx in group:
+            target_sum[name][idx]=np.asarray(source.data(name)["V"])[idx]+displacement
+            target_weight[name][idx]=1.0
     changed=[];rejected=[];per_mesh={}
     for name in sorted(out):
         current=out[name];weights=target_weight[name];anchors=weights>0
@@ -5668,14 +5852,17 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
             after_topology["flip_fraction"]>before_topology["flip_fraction"]+.0025
             or after_topology["area_p01"]<min(before_topology["area_p01"]*.55,.20)
             or after_topology["edge_p99"]>max(before_topology["edge_p99"]*1.75,3.0)))
+        status="preserved"
         if unsafe:
+            # Feathering is optional; the source-proven seam itself is not.  Falling back to exact
+            # seam anchors prevents independent mesh/layer solves from leaving a visible split.
             candidate=current.copy();candidate[anchors]=target[anchors]
             after_topology=_source_relative_topology_summary(S,candidate,F)
-            unsafe=bool(after_topology["flip_fraction"]>before_topology["flip_fraction"]+.0025 or after_topology["area_p01"]<min(before_topology["area_p01"]*.45,.15))
-        if unsafe:
-            rejected.append(name);per_mesh[name]={"status":"rejected_topology_guard","seam_vertices":int(np.count_nonzero(anchors)),"topology_before":before_topology,"topology_after":after_topology};continue
+            anchor_warning=bool(after_topology["flip_fraction"]>before_topology["flip_fraction"]+.0025 or after_topology["area_p01"]<min(before_topology["area_p01"]*.45,.15))
+            status="preserved_hard_anchor_topology_warning" if anchor_warning else "preserved_anchor_only_topology_guard"
+            if anchor_warning:rejected.append(name)  # diagnostic only: geometry is still seam-correct.
         moved=np.linalg.norm(candidate-current,axis=1);out[name]=candidate;changed.append(name)
-        per_mesh[name]={"status":"preserved","seam_vertices":int(np.count_nonzero(anchors)),"changed_vertices":int(np.count_nonzero(moved>1e-12)),"move_p95_mm":float(np.percentile(moved[moved>1e-12],95)*1000.0) if np.any(moved>1e-12) else 0.0,"move_max_mm":float(np.max(moved,initial=0.0)*1000.0),"topology_before":before_topology,"topology_after":after_topology}
+        per_mesh[name]={"status":status,"seam_vertices":int(np.count_nonzero(anchors)),"changed_vertices":int(np.count_nonzero(moved>1e-12)),"move_p95_mm":float(np.percentile(moved[moved>1e-12],95)*1000.0) if np.any(moved>1e-12) else 0.0,"move_max_mm":float(np.max(moved,initial=0.0)*1000.0),"topology_before":before_topology,"topology_after":after_topology}
     after_gaps=[]
     for an,ai,bn,bi,source_delta in pairs:
         after_gaps.append(float(np.linalg.norm((out[an][ai]-out[bn][bi])-source_delta)))
@@ -5684,7 +5871,7 @@ def _preserve_final_source_shared_seams(source: Any, positions: dict[str,np.ndar
         "policy":"garment-only source seam witnesses retain their authored relative position after independent fitting; body geometry is not an input",
         "discovery":discovery,
         "changed_meshes":changed,
-        "rejected_meshes":rejected,
+        "topology_warning_meshes":rejected,
         "seam_error_p50_before_mm":float(np.median(before_gaps)*1000.0) if before_gaps else 0.0,
         "seam_error_p95_before_mm":float(np.percentile(before_gaps,95)*1000.0) if before_gaps else 0.0,
         "seam_error_p50_after_mm":float(np.median(after_gaps)*1000.0) if after_gaps else 0.0,
@@ -5705,7 +5892,7 @@ def _gather_layer_positions_from_meshes(layers: list[GarmentLayer], positions: d
         out[layer.stable_id]=B14LayerResult(layer.stable_id,_readonly_array(V),"universal_coherent_refit",float(layer.source_clearance_median_mm),float(layer.source_clearance_p95_mm),0.0,{"mode":"universal_coherent_refit"})
     return out
 
-def _preserve_source_shared_seam_skinning(source: Any, positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], tolerance_m: float=.000075, minimum_pair_witnesses: int=6) -> tuple[dict[str,dict[str,Any]],dict[str,Any]]:
+def _preserve_source_shared_seam_skinning(source: Any, positions: dict[str,np.ndarray], skinning: dict[str,dict[str,Any]], tolerance_m: float=.000075, minimum_pair_witnesses: int=3) -> tuple[dict[str,dict[str,Any]],dict[str,Any]]:
     """Preserve the source deformation relationship across source-proven cross-mesh seams.
 
     Geometry can be perfectly joined in bind pose yet open in game if the two meshes are independently
@@ -5750,7 +5937,7 @@ def _retarget_frozen_layer_skinning(source: Any, positions: dict[str,np.ndarray]
         weights,stage=_retarget_garment_skinning(np.asarray(final_pos,dtype=np.float64),np.asarray(data["V"],dtype=np.float64),np.asarray(data["W"],dtype=np.float64),list(data["joint_names"]),cache,behavior,behavior,labels,classes,w["raw_to_weld"])
         skinning[name]={"weights":weights,"joint_names":list(data["joint_names"]),"stage":stage}
         records[name]={"behavior":behavior,"features":features,"component_count":len(details),"skinning":stage}
-    skinning,seam_skinning=_preserve_source_shared_seam_skinning(source,positions,skinning,tolerance_m=.000075,minimum_pair_witnesses=6)
+    skinning,seam_skinning=_preserve_source_shared_seam_skinning(source,positions,skinning,tolerance_m=.000075,minimum_pair_witnesses=3)
     for name in records:records[name]["source_shared_seam_skinning"]=seam_skinning
     for name in positions:
         if not np.array_equal(before[name],np.asarray(positions[name])):
@@ -5777,8 +5964,6 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
         suppression=cache.get("_ravafit_source_body_suppression") or {}
         target_collision_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
         cache["_ravafit_target_collision_triangles"]=target_collision_tri
-    source_literal_collision_tri=_strict_source_literal_body_triangles(cache,source_tri)
-
     layers,_=_infer_garment_layers(source,body_mesh_names,mesh_filter,source_tri)
     if not layers:raise ValueError("No garment layers were inferred after removing the source body.")
     layers,relations=_infer_layer_order_graph(source,layers,source_tri)
@@ -5849,7 +6034,7 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     # Local target-only relief (nipples, sharp body detail, similar small convexities) is collision
     # evidence, not garment-shape authority.  Bridge only source-disproved convexities after the final
     # fit, then run attachment closure last so straps/rings remain attached to that final shell.
-    positions,final_local_shell_bridge=_apply_final_local_shell_bridge(source,positions,source_tri,target_collision_tri,max_passes=8)
+    positions,final_local_shell_bridge=_apply_final_local_shell_bridge(source,positions,source_tri,target_collision_tri,target_tri,max_passes=3)
     positions,support_stable_component_preserve=_preserve_support_stable_components(source,positions,cache,source_tri,target_collision_tri)
     pre_structural_authority_positions={name:np.asarray(value,dtype=np.float64).copy() for name,value in positions.items()}
     # Reassert disconnected unilateral leg-pair separation after every body/layer/reconciliation stage
@@ -5875,13 +6060,14 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     # Backtrack only the post-fit structural delta where literal body evidence proves it made the
     # already-resolved source-relative body relationship worse.
     positions,final_structural_body_veto=_veto_worsened_source_relative_body_penetration(source,pre_structural_authority_positions,positions,source_tri,target_collision_tri)
-    # Repair only genuine residual penetration where the body actually existed in the source outfit.
-    # Positive clearance is never added here: B14/source structure remains the garment-shape authority.
-    positions,final_source_body_clearance=_final_source_authored_body_clearance(source,positions,source_literal_collision_tri,target_collision_tri,target_tri,margin_m=.00005,maximum_vertex_move_m=.00150)
+    # The selected target body is final occupancy authority, including anatomy absent from the source
+    # outfit body. Repair only actual residual penetration and use smooth target support for the push
+    # field so literal local anatomy cannot become embossed garment-shape authority.
+    positions,final_target_body_clearance=_final_target_body_clearance(source,positions,target_collision_tri,target_tri,margin_m=.00010,maximum_vertex_move_m=.00800,maximum_step_m=.00150,max_passes=8)
     # Independent mesh solves can pull apart a boundary that was physically shared in the source.
-    # Rejoin those source-proven seams once.  Seam closure may make only a tiny true-penetration repair;
-    # it cannot use body spacing as a shaping force.
-    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,tolerance_m=.000075,minimum_pair_witnesses=6)
+    # Rejoin those source-proven seams once as the final garment-construction authority.  Seam
+    # placement is derived only from the untouched garment; body spacing is never used to shape it.
+    positions,final_source_shared_seams=_preserve_final_source_shared_seams(source,positions,tolerance_m=.000075,minimum_pair_witnesses=3)
     post_seam_body_clearance={"enabled":False,"reason":"single bounded penetration pass; seam closure does not own body clearance"}
     final_source_shared_seam_reassert={"enabled":False,"reason":"single authored seam closure is final"}
     skinning,mesh_skin_records=_retarget_frozen_layer_skinning(source,positions,cache,source_tri)
@@ -5921,13 +6107,14 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
         "final_source_relative_structural_carriers":final_source_relative_structural_carriers,
         "post_detail_unilateral_pair_separation":post_detail_unilateral_pair_separation,
         "final_structural_body_veto":final_structural_body_veto,
-        "final_source_body_clearance":final_source_body_clearance,
+        "final_target_body_clearance":final_target_body_clearance,
+        "final_source_body_clearance":final_target_body_clearance,
         "final_source_shared_seams":final_source_shared_seams,
         "post_seam_body_clearance":post_seam_body_clearance,
         "final_source_shared_seam_reassert":final_source_shared_seam_reassert,
         "local_affine_quality_rms_mm":float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0),
         "garment_mesh_count":len(positions),"skinning_retargeted_mesh_count":len(skinning),
-        "post_b14_geometry_mutation":"bounded_layer_reconciler_then_evidence_gated_local_retarget_then_iterative_local_shell_bridge_then_support_stable_component_preserve_then_unilateral_proximal_guard_then_source_attachment_closure_then_unilateral_proximal_reassert_then_surface_relative_detail_layout_then_source_relative_structural_carriers_then_final_unilateral_floor_then_source_relative_body_veto_then_embedded_source_penetration_repair_then_source_proven_cross_mesh_seam_closure",
+        "post_b14_geometry_mutation":"bounded_layer_reconciler_then_evidence_gated_local_retarget_then_iterative_local_shell_bridge_then_support_stable_component_preserve_then_unilateral_proximal_guard_then_source_attachment_closure_then_unilateral_proximal_reassert_then_surface_relative_detail_layout_then_source_relative_structural_carriers_then_final_unilateral_floor_then_source_relative_body_veto_then_target_authoritative_smooth_envelope_penetration_repair_then_source_proven_cross_mesh_seam_closure",
         "post_b14_body_or_macro_solver_called":False,
         "skinning_after_geometry_freeze":True,
     }
@@ -7699,4 +7886,3 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
     result["report"] = str(report_path)
     _reset_b14_runtime_caches()
     return result
-

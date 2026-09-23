@@ -17,6 +17,9 @@ def test_strict_uv_contract_reproduces_target_uv_mapping():
     np.testing.assert_allclose(out["X"],src_v,atol=0,rtol=0)
     np.testing.assert_allclose(out["Y"],tgt_v,atol=1e-6,rtol=0)
     np.testing.assert_allclose(out["BW"],w,atol=1e-12,rtol=0)
+    # Identical UV/topology body variants expose an exact paired target weight field; geometry changes
+    # alone must never manufacture a skinning delta.
+    np.testing.assert_allclose(out["target_correspondence_W"],w,atol=0,rtol=0)
 
 
 def test_indexed_render_view_excludes_dead_storage():

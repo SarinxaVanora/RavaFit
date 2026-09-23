@@ -15,8 +15,8 @@ try {
     if ([string]$assetManifest.runtime.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or [int64]$assetManifest.runtime.size -le 0) {
         throw "Hosted runtime manifest is not published yet. Run .\scripts\Build-GitHubAssets.ps1 first."
     }
-    if ([string]$assetManifest.runtime.version -ne "1.1.8") {
-        throw "Hosted runtime manifest version '$($assetManifest.runtime.version)' is stale; expected 1.1.8. Run .\scripts\Build-GitHubAssets.ps1 first."
+    if ([string]$assetManifest.runtime.version -ne "1.1.9") {
+        throw "Hosted runtime manifest version '$($assetManifest.runtime.version)' is stale; expected 1.1.9. Run .\scripts\Build-GitHubAssets.ps1 first."
     }
 
     dotnet restore .\RavaFit.sln -p:Platform=x64

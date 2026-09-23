@@ -3,13 +3,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RuntimeVersion = "1.1.8"
-$ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
+$RuntimeVersion = "1.1.9"
 $PythonVersion = "3.13.5"
 $PipZipappVersion = "26.2.1"
 $PythonEmbedUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
 $PipZipappUrl = "https://bootstrap.pypa.io/pip/zipapp/pip-$PipZipappVersion.pyz"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$productionSource = Get-Content -LiteralPath (Join-Path $RepoRoot 'runtime\solver\production_b14.py') -Raw
+$revisionMatch = [regex]::Match($productionSource, 'PRODUCTION_REVISION\s*=\s*["''](?<revision>[^"'']+)["'']')
+if (-not $revisionMatch.Success) { throw 'Could not read the production solver revision from source.' }
+$ExpectedProductionRevision = $revisionMatch.Groups['revision'].Value
 $Temp = Join-Path $env:TEMP "RavaFitRuntimeBuild-$([Guid]::NewGuid().ToString('N'))"
 $Destination = [IO.Path]::GetFullPath($Destination)
 $DestinationParent = Split-Path -Parent $Destination
@@ -439,7 +442,7 @@ try {
         Trimesh = '4.11.1'
         Torch = '2.10.0+cpu'
         Layout = 'private-python-wheel-install+validated-runtime-diet+final-bytecode-prune'
-        SolverSource = 'RavaFit 1.1.1-multi-region-support-source-preserve'
+        SolverSource = "RavaFit $ExpectedProductionRevision"
         ProductionRevision = $ExpectedProductionRevision
         PrunedBytes = $prunedBytes
         Components = $components

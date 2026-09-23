@@ -24,15 +24,20 @@ def _hybrid_correspondence(source_ref,target_ref,k=32):
     if spatial_dist.ndim==1:spatial_dist=spatial_dist[:,None];spatial_idx=spatial_idx[:,None]
 
     nearest_spatial=np.asarray(spatial_dist[:,0],dtype=np.float64);spatial_scale=float(np.clip(max(0.020,np.percentile(nearest_spatial,90)*2.0),0.020,0.060))
-    uv_scale=0.010;bone_weight=2.5;output=np.zeros_like(sv,dtype=np.float64);normals=np.zeros_like(sv,dtype=np.float64)
+    uv_scale=0.010;bone_weight=2.5;output=np.zeros_like(sv,dtype=np.float64);normals=np.zeros_like(sv,dtype=np.float64);mapped_weights=np.zeros_like(sw,dtype=np.float64)
     chosen_spatial=np.zeros(len(sv),dtype=np.float64);chosen_alignment=np.zeros(len(sv),dtype=np.float64)
     for row in range(len(sv)):
         candidates=np.unique(np.concatenate((uv_idx[row],spatial_idx[row])));duv=np.linalg.norm(tuv[candidates]-suv[row],axis=1);dsp=np.linalg.norm(tv[candidates]-sv[row],axis=1);align=tw[candidates]@sw[row]
         uv_authority=1.0 if float(uv_dist[row,0])<0.025 else 0.15;score=(uv_authority*np.minimum(duv/uv_scale,4.0))+(dsp/spatial_scale)+(bone_weight*(1.0-align))
         order=np.argsort(score)[:min(6,len(score))];chosen=candidates[order];local_score=score[order];blend=np.exp(-(local_score-local_score.min())*2.0);blend/=np.maximum(blend.sum(),1e-12)
         output[row]=(tv[chosen]*blend[:,None]).sum(0);normal=(tn[chosen]*blend[:,None]).sum(0);normal/=max(float(np.linalg.norm(normal)),1e-12);normals[row]=normal
+        mapped_weights[row]=(tw[chosen]*blend[:,None]).sum(0);mapped_weights[row]/=max(float(np.sum(mapped_weights[row])),1e-12)
         chosen_spatial[row]=float(np.min(dsp[order]));chosen_alignment[row]=float(np.max(align[order]))
-    return output,normals,{'uv_nearest':np.asarray(uv_dist[:,0],dtype=np.float64),'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale}
+    # Same-topology body variants must expose their literal target weight field exactly.  Geometry may
+    # differ, but UV-identical rows are already an authoritative correspondence and must not acquire
+    # interpolation-only skin deltas.
+    if sw.shape==tw.shape and suv.shape==tuv.shape and np.max(np.abs(suv-tuv),initial=0.0)<=1e-10:mapped_weights=tw.copy()
+    return output,normals,{'uv_nearest':np.asarray(uv_dist[:,0],dtype=np.float64),'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale,'_target_weight_correspondence':mapped_weights}
 
 
 def _spatial_rig_correspondence(source_ref,target_ref,k=48):
@@ -45,7 +50,7 @@ def _spatial_rig_correspondence(source_ref,target_ref,k=48):
     kk=min(max(int(k),8),len(shared_ids));tree=cKDTree(tv[shared_ids]);spatial_dist,spatial_local=tree.query(sv,k=kk);spatial_idx=shared_ids[np.asarray(spatial_local,dtype=np.int64)]
     if spatial_dist.ndim==1:spatial_dist=spatial_dist[:,None];spatial_idx=spatial_idx[:,None]
     nearest=np.asarray(spatial_dist[:,0],dtype=np.float64);spatial_scale=float(np.clip(max(0.020,np.percentile(nearest,90)*2.0),0.020,0.060))
-    output=np.zeros_like(sv,dtype=np.float64);normals=np.zeros_like(sv,dtype=np.float64);chosen_alignment=np.zeros(len(sv),dtype=np.float64);chosen_spatial=np.zeros(len(sv),dtype=np.float64)
+    output=np.zeros_like(sv,dtype=np.float64);normals=np.zeros_like(sv,dtype=np.float64);mapped_weights=np.zeros_like(sw,dtype=np.float64);chosen_alignment=np.zeros(len(sv),dtype=np.float64);chosen_spatial=np.zeros(len(sv),dtype=np.float64)
     for first in range(0,len(sv),1024):
         last=min(first+1024,len(sv));candidates=spatial_idx[first:last];dsp=spatial_dist[first:last];source_weights=sw[first:last]
         candidate_weights=tw[candidates];align=np.einsum('bkj,bj->bk',candidate_weights,source_weights,optimize=True);score=(dsp/spatial_scale)+(3.0*(1.0-align))
@@ -54,8 +59,9 @@ def _spatial_rig_correspondence(source_ref,target_ref,k=48):
         take=min(6,score.shape[1]);order=np.argpartition(score,take-1,axis=1)[:,:take];local_score=np.take_along_axis(score,order,axis=1);chosen=np.take_along_axis(candidates,order,axis=1);local_dsp=np.take_along_axis(dsp,order,axis=1);local_align=np.take_along_axis(align,order,axis=1)
         base=np.min(local_score,axis=1,keepdims=True);blend=np.exp(-(local_score-base)*2.0);blend/=np.maximum(np.sum(blend,axis=1,keepdims=True),1e-12)
         output[first:last]=np.sum(tv[chosen]*blend[:,:,None],axis=1);normal=np.sum(tn[chosen]*blend[:,:,None],axis=1);normal/=np.maximum(np.linalg.norm(normal,axis=1,keepdims=True),1e-12);normals[first:last]=normal
+        local_weights=np.sum(tw[chosen]*blend[:,:,None],axis=1);local_weights/=np.maximum(np.sum(local_weights,axis=1,keepdims=True),1e-12);mapped_weights[first:last]=local_weights
         chosen_spatial[first:last]=np.min(local_dsp,axis=1);chosen_alignment[first:last]=np.max(local_align,axis=1)
-    return output,normals,{'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale}
+    return output,normals,{'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale,'_target_weight_correspondence':mapped_weights}
 
 
 def _cross_sex_rig_correspondence(source_ref,target_ref,k=64):
@@ -98,12 +104,13 @@ def _cross_sex_rig_correspondence(source_ref,target_ref,k=64):
     local_distance=np.take_along_axis(distance,order,axis=1);local_alignment=np.take_along_axis(alignment,order,axis=1)
     base=np.min(local_score,axis=1,keepdims=True);blend=np.exp(-(local_score-base)*2.25);blend/=np.maximum(np.sum(blend,axis=1,keepdims=True),1e-12)
     output=np.sum(tv[chosen]*blend[:,:,None],axis=1);normals=np.sum(tn[chosen]*blend[:,:,None],axis=1);normals/=np.maximum(np.linalg.norm(normals,axis=1,keepdims=True),1e-12)
+    mapped_weights=np.sum(tw[chosen]*blend[:,:,None],axis=1);mapped_weights/=np.maximum(np.sum(mapped_weights,axis=1,keepdims=True),1e-12)
     semantic_shift=np.linalg.norm(aligned-sv,axis=1)
     return output,normals,{
         'chosen_spatial':np.min(local_distance,axis=1),'chosen_alignment':np.max(local_alignment,axis=1),'spatial_scale':spatial_scale,
         'mode':'cross_sex_rig_smallclothes','uv_nearest':np.full(len(sv),np.nan,dtype=np.float64),
         'semantic_joint_count':int(np.count_nonzero(valid)),'semantic_shift_p50_mm':float(np.percentile(semantic_shift,50)*1000.0),'semantic_shift_p95_mm':float(np.percentile(semantic_shift,95)*1000.0),'semantic_shift_max_mm':float(np.max(semantic_shift)*1000.0),
-        'hybrid_quality':{},'spatial_quality':{},
+        'hybrid_quality':{},'spatial_quality':{},'_target_weight_correspondence':mapped_weights,
     }
 
 
@@ -129,10 +136,10 @@ def uv_correspondence(source_ref,target_ref,k=32):
     else:
         use_spatial=False
     if use_spatial:
-        output,normals=spatial_Y,spatial_N;chosen_spatial=spatial_diag['chosen_spatial'];chosen_alignment=spatial_diag['chosen_alignment'];spatial_scale=spatial_diag['spatial_scale'];mode='spatial_rig'
+        output,normals=spatial_Y,spatial_N;chosen_spatial=spatial_diag['chosen_spatial'];chosen_alignment=spatial_diag['chosen_alignment'];spatial_scale=spatial_diag['spatial_scale'];mode='spatial_rig';target_weight_correspondence=spatial_diag['_target_weight_correspondence']
     else:
-        output,normals=hybrid_Y,hybrid_N;chosen_spatial=hybrid_diag['chosen_spatial'];chosen_alignment=hybrid_diag['chosen_alignment'];spatial_scale=hybrid_diag['spatial_scale'];mode='uv_rig_spatial'
-    diagnostics={'uv_nearest':hybrid_diag['uv_nearest'],'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale,'mode':mode,'hybrid_quality':hybrid_quality,'spatial_quality':spatial_quality}
+        output,normals=hybrid_Y,hybrid_N;chosen_spatial=hybrid_diag['chosen_spatial'];chosen_alignment=hybrid_diag['chosen_alignment'];spatial_scale=hybrid_diag['spatial_scale'];mode='uv_rig_spatial';target_weight_correspondence=hybrid_diag['_target_weight_correspondence']
+    diagnostics={'uv_nearest':hybrid_diag['uv_nearest'],'chosen_spatial':chosen_spatial,'chosen_alignment':chosen_alignment,'spatial_scale':spatial_scale,'mode':mode,'hybrid_quality':hybrid_quality,'spatial_quality':spatial_quality,'_target_weight_correspondence':target_weight_correspondence}
     return output,normals,diagnostics
 
 
@@ -407,19 +414,21 @@ def collect_slot_pair(source_ref,target_ref):
     if dense_exact:
         if len(source_ref['V'])!=len(target_ref['V']) or not np.array_equal(np.asarray(source_ref['F'],dtype=np.int64),np.asarray(target_ref['F'],dtype=np.int64)):
             raise ValueError('Dense exact-topology source proxy no longer matches the selected target topology')
-        raw_Y=np.asarray(target_ref['V'],dtype=np.float64).copy();diag={'uv_nearest':np.zeros(len(raw_Y),dtype=np.float64),'chosen_spatial':np.zeros(len(raw_Y),dtype=np.float64),'chosen_alignment':np.ones(len(raw_Y),dtype=np.float64),'spatial_scale':0.0,'mode':'dense_exact_topology','hybrid_quality':{},'spatial_quality':{}}
+        raw_Y=np.asarray(target_ref['V'],dtype=np.float64).copy();diag={'uv_nearest':np.zeros(len(raw_Y),dtype=np.float64),'chosen_spatial':np.zeros(len(raw_Y),dtype=np.float64),'chosen_alignment':np.ones(len(raw_Y),dtype=np.float64),'spatial_scale':0.0,'mode':'dense_exact_topology','hybrid_quality':{},'spatial_quality':{},'_target_weight_correspondence':np.asarray(target_ref['W'],dtype=np.float64).copy()}
     else:
         if bool(source_ref.get('_cross_sex_smallclothes_bridge',False)):
             raw_Y,_,diag=_cross_sex_rig_correspondence(source_ref,target_ref)
         else:
             raw_Y,_,diag=uv_correspondence(source_ref,target_ref)
-    X=np.asarray(source_ref['V'],dtype=np.float64);BW=np.asarray(source_ref['W'],dtype=np.float64);good=BW.sum(1)>1e-8
+    X=np.asarray(source_ref['V'],dtype=np.float64);BW=np.asarray(source_ref['W'],dtype=np.float64);target_correspondence_W=np.asarray(diag.get('_target_weight_correspondence'),dtype=np.float64);good=BW.sum(1)>1e-8
     if not np.all(good):raise ValueError(f'{np.count_nonzero(~good)} source body vertices have no weights after rig remap')
+    if target_correspondence_W.shape!=BW.shape:raise ValueError(f'Target correspondence skin weights {target_correspondence_W.shape} do not match source body weight field {BW.shape}')
+    target_correspondence_W=np.maximum(target_correspondence_W,0.0);target_correspondence_W/=np.maximum(target_correspondence_W.sum(axis=1,keepdims=True),1e-12)
     source_support_V,source_support_F,target_support_V,target_support_F,Y,NS,NT,relief_C,support_stats=_support_pair(source_ref,raw_Y)
     uvd=diag['uv_nearest'];chosen_spatial=diag['chosen_spatial'];chosen_alignment=diag['chosen_alignment']
     identity_payload=bool(source_ref.get('payload_id')) and source_ref.get('payload_id')==target_ref.get('payload_id') and str(source_ref.get('race_code') or '')==str(target_ref.get('race_code') or '') and str(source_ref.get('surface_mode') or 'body').casefold()=='body' and str(target_ref.get('surface_mode') or 'body').casefold()=='body'
     return {
-        'X':X,'Y':Y,'BW':BW,'NS':NS,'NT':NT,'names':list(source_ref['joint_names']),'parts':np.asarray([source_ref.get('slot','Body')]*len(X),dtype=object),'identity_payload':identity_payload,
+        'X':X,'Y':Y,'BW':BW,'target_correspondence_W':target_correspondence_W,'NS':NS,'NT':NT,'names':list(source_ref['joint_names']),'parts':np.asarray([source_ref.get('slot','Body')]*len(X),dtype=object),'identity_payload':identity_payload,
         'source_support_V':source_support_V,'source_support_F':source_support_F,'target_support_V':target_support_V,'target_support_F':target_support_F,'target_relief_C':relief_C,
         'source_literal_V':np.asarray(source_ref.get('_literal_source_V',source_ref['V']),dtype=np.float64),'source_literal_F':np.asarray(source_ref.get('_literal_source_F',source_ref['F']),dtype=np.int64),'source_literal_W':np.asarray(source_ref.get('_literal_source_W',source_ref['W']),dtype=np.float64),
         'target_literal_V':np.asarray(target_ref.get('_cross_sex_collision_V',target_ref['V']),dtype=np.float64),'target_literal_F':np.asarray(target_ref.get('_cross_sex_collision_F',target_ref['F']),dtype=np.int64),'target_literal_W':np.asarray(target_ref.get('_cross_sex_collision_W',target_ref['W']),dtype=np.float64),
@@ -463,7 +472,7 @@ def collect_body_pairs(slot_pairs):
     source_support_V,source_support_F=_combine(pairs,'source_support_V','source_support_F')
     target_support_V,target_support_F=_combine(pairs,'target_support_V','target_support_F')
     return {
-        'X':np.vstack([p['X'] for p in pairs]),'Y':np.vstack([p['Y'] for p in pairs]),'BW':np.vstack([p['BW'] for p in pairs]),
+        'X':np.vstack([p['X'] for p in pairs]),'Y':np.vstack([p['Y'] for p in pairs]),'BW':np.vstack([p['BW'] for p in pairs]),'target_correspondence_W':np.vstack([p['target_correspondence_W'] for p in pairs]),
         'NS':np.vstack([p['NS'] for p in pairs]),'NT':np.vstack([p['NT'] for p in pairs]),'names':names,'parts':np.concatenate([p['parts'] for p in pairs]),
         'slot_stats':[p['stats'] for p in pairs],'slot_pairs':pairs,
         'source_surface_V':source_literal_V,'source_surface_F':source_literal_F,'source_surface_W':source_literal_W,

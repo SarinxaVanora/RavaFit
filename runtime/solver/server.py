@@ -500,7 +500,7 @@ def _prepare_cache(payload):
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output,
-        X=cache["X"], Y=cache["Y"], BW=cache["BW"], NS=cache["NS"], NT=cache["NT"],
+        X=cache["X"], Y=cache["Y"], BW=cache["BW"], target_correspondence_W=cache["target_correspondence_W"], NS=cache["NS"], NT=cache["NT"],
         names=np.asarray(cache["names"], dtype=object), parts=cache["parts"],
         source_surface_V=cache["source_surface_V"], source_surface_F=cache["source_surface_F"], source_surface_W=cache["source_surface_W"],
         target_surface_V=cache["target_surface_V"], target_surface_F=cache["target_surface_F"], target_surface_W=cache["target_surface_W"],

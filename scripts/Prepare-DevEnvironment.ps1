@@ -9,8 +9,11 @@ $DevAssets = Join-Path $RepoRoot "DevAssets"
 $BodiesDir = Join-Path $DevAssets "Bodies"
 $RuntimeDir = Join-Path $DevAssets "Runtime"
 $IncomingDir = Join-Path $DevAssets "Incoming"
-$ExpectedRuntimeVersion = "1.1.8"
-$ExpectedProductionRevision = "1.1.1-multi-region-support-source-preserve"
+$ExpectedRuntimeVersion = "1.1.9"
+$productionSource = Get-Content -LiteralPath (Join-Path $RepoRoot 'runtime\solver\production_b14.py') -Raw
+$revisionMatch = [regex]::Match($productionSource, 'PRODUCTION_REVISION\s*=\s*["''](?<revision>[^"'']+)["'']')
+if (-not $revisionMatch.Success) { throw 'Could not read the production solver revision from source.' }
+$ExpectedProductionRevision = $revisionMatch.Groups['revision'].Value
 
 New-Item -ItemType Directory -Force -Path $BodiesDir, $IncomingDir | Out-Null
 
