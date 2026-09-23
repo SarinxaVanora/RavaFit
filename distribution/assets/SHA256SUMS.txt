@@ -1,2 +1,2 @@
-525e3519e2cc83ee5ec2392a58482de93fba6208d7e8c8f30104f10e8066d4b1  distribution/assets/RavaFit.Runtime.win-x64.1.1.9.zip
+96f7264f3e10a9eb6c4bca299be40cbfb61a9ed4067f91c07f3fe036d90bdbf7  distribution/assets/RavaFit.Runtime.win-x64.1.1.9.zip
 5d8e2b301742e85038cd3ec74dabbe094c7005d37a07f05d48491826a4b8b0a0  distribution/assets/Bodies.rbody
