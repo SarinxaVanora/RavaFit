@@ -3,7 +3,7 @@ param(
     [string]$Branch = "master",
     [string]$RuntimeVersion = "1.1.8",
     [string]$BodiesVersion = "1.0.0",
-    [string]$MinimumPluginVersion = "1.1.1",
+    [string]$MinimumPluginVersion = "1.1.5",
     [string]$Runtime = "",
     [string]$Bodies = ""
 )
@@ -15,7 +15,8 @@ if ([string]::IsNullOrWhiteSpace($Bodies)) { $Bodies = Join-Path $RepoRoot "DevA
 $Runtime = [IO.Path]::GetFullPath($Runtime)
 $Bodies = [IO.Path]::GetFullPath($Bodies)
 $AssetDirectory = Join-Path $RepoRoot "distribution\assets"
-$RuntimeZip = Join-Path $AssetDirectory "RavaFit.Runtime.win-x64.zip"
+$RuntimeFileName = "RavaFit.Runtime.win-x64.$RuntimeVersion.zip"
+$RuntimeZip = Join-Path $AssetDirectory $RuntimeFileName
 $BodiesOut = Join-Path $AssetDirectory "Bodies.rbody"
 $ChecksumsOut = Join-Path $AssetDirectory "SHA256SUMS.txt"
 $ManifestOut = Join-Path $RepoRoot "distribution\ravafit-assets.json"
@@ -60,7 +61,7 @@ $manifest = [ordered]@{
     schema = 1
     runtime = [ordered]@{
         version = $RuntimeVersion
-        url = "$mediaBase/RavaFit.Runtime.win-x64.zip"
+        url = "$mediaBase/$RuntimeFileName"
         sha256 = $runtimeHash
         size = $runtimeSize
         productionRevision = $productionRevision
@@ -76,7 +77,7 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestOut -Encoding UTF8
 @(
-    "$runtimeHash  distribution/assets/RavaFit.Runtime.win-x64.zip",
+    "$runtimeHash  distribution/assets/$RuntimeFileName",
     "$bodiesHash  distribution/assets/Bodies.rbody"
 ) | Set-Content -LiteralPath $ChecksumsOut -Encoding ascii
 

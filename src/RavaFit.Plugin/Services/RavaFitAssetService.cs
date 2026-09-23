@@ -150,7 +150,10 @@ internal sealed class RavaFitAssetService : IDisposable
         {
             ThrowIfDisposed();
             SetBusy("Checking GitHub", "Checking runtime and body catalogue versions...", 0d, 0, 0);
-            using var request = new HttpRequestMessage(HttpMethod.Get, RavaFitDistribution.AssetManifestUrl);
+            var manifestUri = $"{RavaFitDistribution.AssetManifestUrl}?ravafit={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+            using var request = new HttpRequestMessage(HttpMethod.Get, manifestUri);
+            request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true, MaxAge = TimeSpan.Zero };
+            request.Headers.Pragma.ParseAdd("no-cache");
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);

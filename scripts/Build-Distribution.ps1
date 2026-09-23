@@ -4,7 +4,7 @@ param(
     [string]$Configuration = "Release",
     [string]$RuntimeVersion = "1.1.8",
     [string]$BodiesVersion = "1.0.0",
-    [string]$MinimumPluginVersion = "1.1.1",
+    [string]$MinimumPluginVersion = "1.1.5",
     [switch]$RunTests
 )
 

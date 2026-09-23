@@ -89,10 +89,7 @@ jobs:
         run: |
           ./scripts/Build-Distribution.ps1 `
             -GitHubRepository "${{ github.repository }}" `
-            -Branch "master" `
-            -RuntimeVersion "1.1.6" `
-            -BodiesVersion "1.0.0" `
-            -MinimumPluginVersion "1.1.1"
+            -Branch "master"
 
       - name: Show generated distribution
         shell: pwsh
@@ -103,8 +100,14 @@ jobs:
           if (-not (Test-Path -LiteralPath "distribution/latest.zip" -PathType Leaf)) {
               throw "distribution/latest.zip was not produced."
           }
-          if (-not (Test-Path -LiteralPath "distribution/assets/RavaFit.Runtime.win-x64.zip" -PathType Leaf)) {
-              throw "Hosted runtime ZIP was not produced."
+          $manifest = Get-Content -LiteralPath "distribution/ravafit-assets.json" -Raw | ConvertFrom-Json
+          $runtimeFileName = [IO.Path]::GetFileName(([Uri]$manifest.runtime.url).AbsolutePath)
+          $runtimePath = Join-Path "distribution/assets" $runtimeFileName
+          if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+              throw "Hosted runtime ZIP was not produced at $runtimePath."
+          }
+          if ($manifest.runtime.version -ne "1.1.8") {
+              throw "Generated runtime manifest version '$($manifest.runtime.version)' does not match this source release (1.1.8)."
           }
           if (-not (Test-Path -LiteralPath "distribution/assets/Bodies.rbody" -PathType Leaf)) {
               throw "Bodies.rbody was not produced/hydrated."
