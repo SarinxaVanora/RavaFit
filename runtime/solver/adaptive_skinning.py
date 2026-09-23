@@ -1,18 +1,23 @@
 """Evidence-driven garment skinning adaptation.
 
-The goal is for a converted garment to deform as though it had been authored for the
-selected target body.  The paired source->target body skin field is the only body
-skinning authority:
+RavaFit's target is not merely a garment that occupies the target bind pose; it should
+move as though it had been authored for that target body.
 
-* equivalent body deformation field -> preserve source garment skinning exactly;
-* genuine paired-body field change -> apply the full corresponding change to only the
-  garment's body-supported weight mass;
+Authority is deliberately local:
+
+* same paired body geometry + same paired body deformation field -> preserve the source
+  garment skinning exactly;
+* changed paired body deformation field -> carry the proven source->target body-weight
+  delta into the garment's body-supported mass;
+* materially changed paired body geometry under genuinely close cloth -> let the local
+  target-body blend progressively become motion authority for that body-supported mass;
 * garment/cloth/secondary influences remain exact structural authority;
-* target body blends may use more body influences than the source vertex when the
-  source GLTF primitive actually has room for them.
+* target body blends may use more body influences only when the source GLTF primitive
+  actually has encoder capacity for them.
 
-This is deliberately not nearest-target weight transfer.  Geometry moving through a
-weight gradient is not proof that its rig should change.
+This is not nearest-target weight transfer.  Geometry change is measured on the paired
+source/target body correspondence, never by sampling whichever target triangle happens
+to be nearest after the garment has already moved.
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import hashlib
 from typing import Any
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 _CAPACITY_CACHE_KEY = "_ravafit_source_influence_capacities_v2"
 
@@ -34,6 +40,14 @@ def _public_delta_report(report: dict[str, Any] | None) -> dict[str, Any]:
         elif isinstance(value, np.generic):
             out[key] = value.item()
     return out
+
+
+def _smoothstep(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if hi <= lo:
+        return (values >= hi).astype(np.float64)
+    t = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def source_skin_capacity_key(positions: np.ndarray, joint_names: list[str] | tuple[str, ...]) -> str:
@@ -67,42 +81,32 @@ def _primitive_influence_capacity(source_js: dict[str, Any], mesh_name: str) -> 
 
 
 def register_source_influence_capacities(cache: dict[str, Any], source: Any) -> dict[str, Any]:
-    """Record the real 4/8 influence capacity of each source GLTF primitive.
-
-    Workers call this before solving.  It lets the adaptive skinning stage use a second
-    JOINTS/WEIGHTS set when the source primitive genuinely owns one, even if every
-    untouched source vertex happened to use four or fewer non-zero influences.
-    """
+    """Record the real 4/8 influence capacity of each source GLTF primitive."""
     registry = dict(cache.get(_CAPACITY_CACHE_KEY) or {})
     rows = []
     source_js = getattr(source, "js", None)
     mesh_names = list(source.mesh_names()) if callable(getattr(source, "mesh_names", None)) else []
     for name in mesh_names:
-        try:
-            data = source.data(name)
-            capacity = _primitive_influence_capacity(source_js, name)
-            if capacity not in (4, 8):
-                rows.append({"mesh": str(name), "capacity": None, "reason": "source primitive capacity unavailable"})
-                continue
-            positions = np.asarray(data.get("V", []), dtype=np.float64)
-            names = list(data.get("joint_names") or [])
-            weights = np.asarray(data.get("W", []), dtype=np.float64)
-            if positions.ndim != 2 or positions.shape[1:] != (3,) or weights.ndim != 2 or len(weights) != len(positions):
-                rows.append({"mesh": str(name), "capacity": None, "reason": "source skin payload unavailable"})
-                continue
-            active = int(np.max(np.count_nonzero(weights > 1e-8, axis=1), initial=0))
-            if active > capacity:
-                raise ValueError(f"{name} has {active} active source influences but its GLTF primitive can encode only {capacity}.")
-            key = source_skin_capacity_key(positions, names)
-            previous = registry.get(key)
-            if previous is not None and int(previous) != capacity:
-                # A hash collision or duplicate authored payload with contradictory
-                # primitive layout must never silently choose the larger capacity.
-                raise ValueError(f"Conflicting source influence capacities for garment skin {name}: {previous} vs {capacity}.")
-            registry[key] = int(capacity)
-            rows.append({"mesh": str(name), "capacity": int(capacity), "max_authored_active": active})
-        except Exception:
-            raise
+        data = source.data(name)
+        capacity = _primitive_influence_capacity(source_js, name)
+        if capacity not in (4, 8):
+            rows.append({"mesh": str(name), "capacity": None, "reason": "source primitive capacity unavailable"})
+            continue
+        positions = np.asarray(data.get("V", []), dtype=np.float64)
+        names = list(data.get("joint_names") or [])
+        weights = np.asarray(data.get("W", []), dtype=np.float64)
+        if positions.ndim != 2 or positions.shape[1:] != (3,) or weights.ndim != 2 or len(weights) != len(positions):
+            rows.append({"mesh": str(name), "capacity": None, "reason": "source skin payload unavailable"})
+            continue
+        active = int(np.max(np.count_nonzero(weights > 1e-8, axis=1), initial=0))
+        if active > capacity:
+            raise ValueError(f"{name} has {active} active source influences but its GLTF primitive can encode only {capacity}.")
+        key = source_skin_capacity_key(positions, names)
+        previous = registry.get(key)
+        if previous is not None and int(previous) != capacity:
+            raise ValueError(f"Conflicting source influence capacities for garment skin {name}: {previous} vs {capacity}.")
+        registry[key] = int(capacity)
+        rows.append({"mesh": str(name), "capacity": int(capacity), "max_authored_active": active})
     cache[_CAPACITY_CACHE_KEY] = registry
     return {"registered": int(len(registry)), "meshes": rows}
 
@@ -165,8 +169,104 @@ def _pack_body_mass_to_budget(ideal_body: np.ndarray, source_body: np.ndarray, b
     return packed, capacity_limited
 
 
+def _paired_body_support_field(points: np.ndarray, garment_weights: np.ndarray, garment_joint_names: list[str], cache: dict[str, Any]) -> dict[str, Any] | None:
+    """Sample paired source/target body geometry and target motion at source garment points.
+
+    This deliberately follows the same source-side evidence shape as production's verified
+    body-delta sampler.  The target is reached only through X->Y correspondence; target-space
+    nearest-neighbour sampling is never used as reweight authority.
+    """
+    p = np.asarray(points, dtype=np.float64)
+    wg = np.asarray(garment_weights, dtype=np.float64)
+    x = np.asarray(cache.get("X", []), dtype=np.float64)
+    y = np.asarray(cache.get("Y", []), dtype=np.float64)
+    bw = np.asarray(cache.get("BW", []), dtype=np.float64)
+    tw = np.asarray(cache.get("target_correspondence_W", []), dtype=np.float64)
+    cache_names = list(cache.get("names") or [])
+    garment_names = list(garment_joint_names)
+    if (p.ndim != 2 or p.shape[1:] != (3,) or x.ndim != 2 or x.shape[1:] != (3,) or
+            y.shape != x.shape or bw.ndim != 2 or tw.shape != bw.shape or len(bw) != len(x) or
+            bw.shape[1] != len(cache_names) or wg.ndim != 2 or len(wg) != len(p) or
+            wg.shape[1] != len(garment_names) or not len(x)):
+        return None
+
+    garment_index = {name: index for index, name in enumerate(garment_names)}
+    common_cache = np.asarray([i for i, name in enumerate(cache_names) if name in garment_index], dtype=np.int64)
+    if not len(common_cache):
+        return None
+
+    signature = np.zeros((len(p), len(cache_names)), dtype=np.float64)
+    for ci in common_cache.tolist():
+        signature[:, ci] = wg[:, garment_index[cache_names[ci]]]
+    body_mass = signature.sum(axis=1)
+    has_body = body_mass > 1e-8
+    signature[has_body] /= body_mass[has_body, None]
+
+    k = min(32, len(x))
+    tree = cKDTree(x)
+    distance, index = tree.query(p, k=k)
+    if distance.ndim == 1:
+        distance = distance[:, None]
+        index = index[:, None]
+    alignment = np.einsum("nk,nqk->nq", signature, bw[index], optimize=True)
+    score = distance + .015 * (1.0 - alignment)
+    side = np.sign(p[:, 0])[:, None]
+    body_side = np.sign(x[index][:, :, 0])
+    score += np.where((np.abs(p[:, 0, None]) > .020) & (side != body_side), .080, 0.0)
+    take = min(12, score.shape[1])
+    order = np.argpartition(score, take - 1, axis=1)[:, :take]
+    selected = np.take_along_axis(index, order, axis=1)
+    selected_score = np.take_along_axis(score, order, axis=1)
+    selected_distance = np.take_along_axis(distance, order, axis=1)
+    relative = selected_score - selected_score.min(axis=1, keepdims=True)
+    blend = np.exp(-relative / .0035)
+    blend /= np.maximum(blend.sum(axis=1, keepdims=True), 1e-12)
+
+    local_source_weights = np.sum(bw[selected] * blend[:, :, None], axis=1)
+    local_target_weights = np.sum(tw[selected] * blend[:, :, None], axis=1)
+    local_source_point = np.sum(x[selected] * blend[:, :, None], axis=1)
+    local_target_point = np.sum(y[selected] * blend[:, :, None], axis=1)
+    support_distance = np.sum(selected_distance * blend, axis=1)
+    shape_change = np.linalg.norm(local_target_point - local_source_point, axis=1)
+    shape_change[~has_body] = 0.0
+    support_distance[~has_body] = np.inf
+    return {
+        "source_weights": local_source_weights,
+        "target_weights": local_target_weights,
+        "source_point": local_source_point,
+        "target_point": local_target_point,
+        "shape_change": shape_change,
+        "support_distance": support_distance,
+        "body_mass": body_mass,
+        "body_supported_cache_columns": common_cache,
+    }
+
+
+def _geometry_motion_authority(field: dict[str, Any] | None, behavior: str, effective_behavior: str) -> np.ndarray:
+    if field is None:
+        return np.zeros(0, dtype=np.float64)
+    shape_change = np.asarray(field["shape_change"], dtype=np.float64)
+    support_distance = np.asarray(field["support_distance"], dtype=np.float64)
+    behaviour = str(behavior or "").casefold()
+    effective = str(effective_behavior or behaviour).casefold()
+    close = {"constructed_close_shell", "body_following_flexible_layer"}
+    if behaviour not in close and effective not in close:
+        return np.zeros(len(shape_change), dtype=np.float64)
+
+    # Below 0.20 mm the paired target is effectively the same body surface for skinning
+    # purposes.  By 2.5 mm of real source->target body movement, close cloth should move
+    # with target-body motion rather than retaining a source-body blend merely because the
+    # two bodies happened to publish identical weight values at corresponding vertices.
+    shape_gate = _smoothstep(shape_change, .00020, .00250)
+    if behaviour == "body_following_flexible_layer" or effective == "body_following_flexible_layer":
+        close_gate = 1.0 - _smoothstep(support_distance, .0050, .0160)
+    else:
+        close_gate = 1.0 - _smoothstep(support_distance, .0040, .0120)
+    return np.clip(shape_gate * close_gate, 0.0, 1.0)
+
+
 def install_adaptive_body_skinning(prod: Any) -> None:
-    """Install correspondence-driven, motion-faithful garment body skinning."""
+    """Install correspondence-driven, target-authored motion adaptation."""
     if getattr(prod, "_ravafit_adaptive_body_skinning_installed", False):
         return
     original = getattr(prod, "_retarget_garment_skinning", None)
@@ -183,35 +283,31 @@ def install_adaptive_body_skinning(prod: Any) -> None:
         source_positions_array = np.asarray(source_positions, dtype=np.float64)
         joint_names = list(source_joint_names)
         capacity, capacity_authority = _source_capacity(preserved, source_positions_array, joint_names, cache)
+        cache_names = list(cache.get("names") or [])
+        garment_index = {name: index for index, name in enumerate(joint_names)}
+
+        paired = _paired_body_support_field(source_positions_array, preserved, joint_names, cache)
+        geometry_authority = _geometry_motion_authority(paired, behavior, effective_behavior)
+        if paired is None:
+            common_cache = np.asarray([i for i, name in enumerate(cache_names) if name in garment_index], dtype=np.int64)
+        else:
+            common_cache = np.asarray(paired["body_supported_cache_columns"], dtype=np.int64)
 
         delta, delta_report = delta_helper(source_positions_array, preserved, joint_names, cache)
         public_delta = _public_delta_report(delta_report)
-        if delta is None or not bool((delta_report or {}).get("verified_body_delta", False)):
-            stage = dict(base_stage)
-            stage.update({
-                "mode": "source_authored_skinning_preserved_same_body_field",
-                "policy": "paired source/target body deformation support is equivalent; preserve authored garment skinning exactly",
-                "retargeted_vertices": 0,
-                "exact_source_weight_preserve": True,
-                "body_weight_delta": public_delta,
-                "adaptive_body_skinning": True,
-                "motion_skinning_revision": 2,
-                "source_influence_capacity": int(capacity),
-                "source_influence_capacity_authority": capacity_authority,
-                "motion_response_residual_l1_mean": 0.0,
-                "motion_response_residual_l1_p95": 0.0,
-                "motion_response_residual_l1_max": 0.0,
-                "capacity_limited_vertices": 0,
-            })
-            return preserved, stage
+        delta_verified = delta is not None and bool((delta_report or {}).get("verified_body_delta", False))
+        if delta is None:
+            delta = np.zeros((len(preserved), len(cache_names)), dtype=np.float64)
+        else:
+            delta = np.asarray(delta, dtype=np.float64)
+            if delta.shape != (len(preserved), len(cache_names)):
+                raise ValueError(f"Adaptive garment skinning delta shape {delta.shape} does not match {(len(preserved), len(cache_names))}.")
 
-        delta = np.asarray(delta, dtype=np.float64)
-        cache_names = list(cache.get("names") or [])
-        if delta.shape != (len(preserved), len(cache_names)):
-            raise ValueError(f"Adaptive garment skinning delta shape {delta.shape} does not match {(len(preserved), len(cache_names))}.")
-
-        body_supported_cache = np.asarray((delta_report or {}).get("body_supported_cache_columns", []), dtype=np.int64)
-        if body_supported_cache.ndim != 1 or not len(body_supported_cache):
+        report_columns = np.asarray((delta_report or {}).get("body_supported_cache_columns", []), dtype=np.int64)
+        body_supported_cache = np.unique(np.concatenate((common_cache, report_columns))) if (len(common_cache) or len(report_columns)) else np.zeros(0, dtype=np.int64)
+        mapped_pairs = [(int(ci), garment_index[cache_names[int(ci)]]) for ci in body_supported_cache.tolist()
+                        if 0 <= int(ci) < len(cache_names) and cache_names[int(ci)] in garment_index]
+        if not mapped_pairs:
             stage = dict(base_stage)
             stage.update({
                 "mode": "source_authored_skinning_preserved_no_local_body_support",
@@ -219,40 +315,43 @@ def install_adaptive_body_skinning(prod: Any) -> None:
                 "exact_source_weight_preserve": True,
                 "body_weight_delta": public_delta,
                 "adaptive_body_skinning": True,
-                "motion_skinning_revision": 2,
+                "motion_skinning_revision": 3,
                 "source_influence_capacity": int(capacity),
                 "source_influence_capacity_authority": capacity_authority,
             })
             return preserved, stage
 
-        garment_index = {name: index for index, name in enumerate(joint_names)}
-        mapped_pairs = [(int(ci), garment_index[cache_names[int(ci)]]) for ci in body_supported_cache.tolist()
-                        if 0 <= int(ci) < len(cache_names) and cache_names[int(ci)] in garment_index]
-        if not mapped_pairs:
-            raise ValueError("Target body requires a skin-weight adaptation but the garment exposes none of the corresponding body joints.")
         mapped_cache = np.asarray([row[0] for row in mapped_pairs], dtype=np.int64)
         body_columns = np.asarray([row[1] for row in mapped_pairs], dtype=np.int64)
-        missing_cache = np.asarray([int(ci) for ci in body_supported_cache.tolist()
+        missing_cache = np.asarray([int(ci) for ci in report_columns.tolist()
                                     if 0 <= int(ci) < len(cache_names) and cache_names[int(ci)] not in garment_index], dtype=np.int64)
 
+        quantisation_floor = float((delta_report or {}).get("quantisation_floor", 0.0035))
         local_l1 = np.asarray((delta_report or {}).get("local_delta_l1", np.abs(delta).sum(axis=1)), dtype=np.float64)
         if local_l1.shape != (len(preserved),):
             local_l1 = np.abs(delta).sum(axis=1)
-        quantisation_floor = float((delta_report or {}).get("quantisation_floor", 0.0035))
         body_mass = preserved[:, body_columns].sum(axis=1)
-        active = (local_l1 > quantisation_floor) & (body_mass > 1e-8)
+        delta_active = delta_verified & (local_l1 > quantisation_floor) & (body_mass > 1e-8)
+        if np.isscalar(delta_active):
+            delta_active = np.full(len(preserved), bool(delta_active), dtype=bool)
+        geometry_active = geometry_authority > 1e-5 if len(geometry_authority) == len(preserved) else np.zeros(len(preserved), dtype=bool)
+        active = (delta_active | geometry_active) & (body_mass > 1e-8)
+
         if not np.any(active):
             stage = dict(base_stage)
+            shape = np.asarray(paired["shape_change"], dtype=np.float64) if paired is not None else np.zeros(len(preserved))
             stage.update({
-                "mode": "source_authored_skinning_preserved_local_body_field_equivalent",
-                "policy": "local paired body weight change is below the encoder/noise floor",
+                "mode": "source_authored_skinning_preserved_same_target_region",
+                "policy": "paired target geometry and deformation support are equivalent locally; preserve authored garment skinning exactly",
                 "retargeted_vertices": 0,
                 "exact_source_weight_preserve": True,
                 "body_weight_delta": public_delta,
                 "adaptive_body_skinning": True,
-                "motion_skinning_revision": 2,
+                "motion_skinning_revision": 3,
                 "source_influence_capacity": int(capacity),
                 "source_influence_capacity_authority": capacity_authority,
+                "paired_shape_change_p95_mm": float(np.percentile(shape, 95) * 1000.0) if len(shape) else 0.0,
+                "geometry_motion_authority_p95": 0.0,
                 "motion_response_residual_l1_mean": 0.0,
                 "motion_response_residual_l1_p95": 0.0,
                 "motion_response_residual_l1_max": 0.0,
@@ -260,12 +359,12 @@ def install_adaptive_body_skinning(prod: Any) -> None:
             })
             return preserved, stage
 
-        if len(missing_cache):
+        if len(missing_cache) and delta_verified:
             missing_positive = np.clip(delta[:, missing_cache], 0.0, None).sum(axis=1) * body_mass
-            missing_active = active & (missing_positive > max(quantisation_floor, 1.0 / 255.0))
+            missing_active = delta_active & (missing_positive > max(quantisation_floor, 1.0 / 255.0))
             if np.any(missing_active):
                 missing_names = [cache_names[int(ci)] for ci in missing_cache.tolist()
-                                 if np.any(active & (np.clip(delta[:, int(ci)], 0.0, None) * body_mass > max(quantisation_floor, 1.0 / 255.0)))]
+                                 if np.any(delta_active & (np.clip(delta[:, int(ci)], 0.0, None) * body_mass > max(quantisation_floor, 1.0 / 255.0)))]
                 shown = ", ".join(missing_names[:12])
                 extra = f" (+{len(missing_names)-12} more)" if len(missing_names) > 12 else ""
                 raise ValueError(
@@ -275,7 +374,26 @@ def install_adaptive_body_skinning(prod: Any) -> None:
 
         source_body = preserved[:, body_columns].copy()
         body_delta = delta[:, mapped_cache]
-        ideal_body = np.maximum(source_body + body_delta * body_mass[:, None], 0.0)
+        delta_ideal = np.maximum(source_body + body_delta * body_mass[:, None], 0.0)
+        delta_total = delta_ideal.sum(axis=1)
+        valid_delta = delta_total > 1e-12
+        delta_ideal[valid_delta] *= (body_mass[valid_delta] / delta_total[valid_delta])[:, None]
+        delta_ideal[~valid_delta] = source_body[~valid_delta]
+
+        ideal_body = delta_ideal.copy()
+        target_direct_valid = np.zeros(len(preserved), dtype=bool)
+        if paired is not None and len(geometry_authority) == len(preserved):
+            target_full = np.asarray(paired["target_weights"], dtype=np.float64)
+            target_mapped = np.maximum(target_full[:, mapped_cache], 0.0)
+            target_total = target_mapped.sum(axis=1)
+            target_direct_valid = target_total > 1e-8
+            target_direct = target_mapped.copy()
+            target_direct[target_direct_valid] *= (body_mass[target_direct_valid] / target_total[target_direct_valid])[:, None]
+            alpha = np.where(target_direct_valid, geometry_authority, 0.0)
+            ideal_body = delta_ideal * (1.0 - alpha[:, None]) + target_direct * alpha[:, None]
+        else:
+            alpha = np.zeros(len(preserved), dtype=np.float64)
+
         ideal_total = ideal_body.sum(axis=1)
         valid_ideal = active & (ideal_total > 1e-12)
         ideal_body[valid_ideal] *= (body_mass[valid_ideal] / ideal_total[valid_ideal])[:, None]
@@ -314,7 +432,7 @@ def install_adaptive_body_skinning(prod: Any) -> None:
                 "exact_source_weight_preserve": True,
                 "body_weight_delta": public_delta,
                 "adaptive_body_skinning": True,
-                "motion_skinning_revision": 2,
+                "motion_skinning_revision": 3,
                 "source_influence_capacity": int(capacity),
                 "source_influence_capacity_authority": capacity_authority,
                 "motion_response_residual_l1_mean": float(np.mean(motion_residual)),
@@ -328,15 +446,17 @@ def install_adaptive_body_skinning(prod: Any) -> None:
         for column in body_columns.tolist():
             if not np.any(preserved[:, column] > 1e-8) and np.any(candidate[:, column] > 1e-8):
                 newly_used_body += 1
+        shape = np.asarray(paired["shape_change"], dtype=np.float64) if paired is not None else np.zeros(len(preserved))
+        support_distance = np.asarray(paired["support_distance"], dtype=np.float64) if paired is not None else np.full(len(preserved), np.inf)
         stage = dict(base_stage)
         stage.update({
-            "mode": "motion_compatible_body_correspondence_skinning",
-            "policy": "preserve source rig exactly where body deformation support is equivalent; otherwise apply the full paired body-weight delta while preserving authored garment-specific influences and the real source GLTF encoder capacity",
+            "mode": "target_authored_motion_body_skinning",
+            "policy": "preserve source rig only where both paired target shape and deformation field are equivalent; for materially changed close-body geometry, adapt only body-supported mass toward paired target-body motion while preserving garment/cloth/secondary influences exactly",
             "vertices": int(len(candidate)),
             "retargeted_vertices": int(np.count_nonzero(changed)),
             "exact_source_weight_preserve": False,
             "adaptive_body_skinning": True,
-            "motion_skinning_revision": 2,
+            "motion_skinning_revision": 3,
             "preserved_non_body_weights_exact": True,
             "body_supported_joint_count": int(len(body_columns)),
             "newly_activated_body_joint_columns": int(newly_used_body),
@@ -350,7 +470,12 @@ def install_adaptive_body_skinning(prod: Any) -> None:
             "motion_response_residual_l1_mean": float(np.mean(motion_residual)),
             "motion_response_residual_l1_p95": float(np.percentile(motion_residual, 95)) if len(motion_residual) else 0.0,
             "motion_response_residual_l1_max": float(np.max(motion_residual, initial=0.0)),
-            "full_delta_vertices": int(np.count_nonzero(active)),
+            "full_delta_vertices": int(np.count_nonzero(delta_active)),
+            "geometry_driven_vertices": int(np.count_nonzero(geometry_active)),
+            "paired_shape_change_p95_mm": float(np.percentile(shape, 95) * 1000.0) if len(shape) else 0.0,
+            "source_support_distance_p95_mm": float(np.percentile(support_distance[np.isfinite(support_distance)], 95) * 1000.0) if np.any(np.isfinite(support_distance)) else None,
+            "geometry_motion_authority_mean": float(np.mean(alpha)) if len(alpha) else 0.0,
+            "geometry_motion_authority_p95": float(np.percentile(alpha, 95)) if len(alpha) else 0.0,
             "body_weight_delta": public_delta,
         })
         return candidate, stage
