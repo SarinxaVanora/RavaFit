@@ -9,6 +9,24 @@ class _Prod:
     pass
 
 
+class _Source:
+    def __init__(self, name, data, capacity):
+        self._name = name
+        self._data = data
+        attrs = {"JOINTS_0": 0, "WEIGHTS_0": 1}
+        if capacity == 8:
+            attrs.update({"JOINTS_1": 2, "WEIGHTS_1": 3})
+        self.js = {"meshes": [{"name": name, "primitives": [{"attributes": attrs}]}]}
+
+    def mesh_names(self):
+        return [self._name]
+
+    def data(self, name):
+        if name != self._name:
+            raise KeyError(name)
+        return self._data
+
+
 def _base_prod(delta, report):
     prod = _Prod()
 
@@ -27,9 +45,12 @@ def _base_prod(delta, report):
     return prod
 
 
-def _invoke(prod, weights, names, cache):
+def _invoke(prod, weights, names, cache, points=None):
     count = len(weights)
-    points = np.zeros((count, 3), dtype=np.float64)
+    if points is None:
+        points = np.zeros((count, 3), dtype=np.float64)
+    else:
+        points = np.asarray(points, dtype=np.float64)
     labels = np.zeros(count, dtype=np.int64)
     return prod._retarget_garment_skinning(
         points, points, np.asarray(weights, dtype=np.float64), list(names), cache,
@@ -76,9 +97,6 @@ def test_changed_body_field_applies_full_delta_to_existing_body_mass():
     }
     prod = _base_prod(delta, report)
     solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_cloth"], {"names": ["j_body_a", "j_body_b"]})
-
-    # The garment has 0.9 body-supported mass. Applying the complete paired-body
-    # delta therefore moves 0.18 from body_a to body_b. This must not be alpha-blended.
     np.testing.assert_allclose(solved, [[0.37, 0.53, 0.10]], atol=1e-12)
     assert solved[0, 2] == source[0, 2]
     assert stage["full_delta_vertices"] == 1
@@ -98,9 +116,6 @@ def test_target_body_may_add_body_influences_without_evicting_cloth():
     }
     prod = _base_prod(delta, report)
     solved, stage = _invoke(prod, source, ["j_body_a", "j_body_b", "j_body_c", "j_cloth"], {"names": ["j_body_a", "j_body_b", "j_body_c"]})
-
-    # A one-bone source body blend is not sacred. If the target body's paired field
-    # genuinely needs three body bones and the vertex has room, use all three.
     np.testing.assert_allclose(solved, [[0.54, 0.18, 0.18, 0.10]], atol=1e-12)
     assert np.count_nonzero(solved[0, :3] > 1e-8) == 3
     assert solved[0, 3] == source[0, 3]
@@ -125,36 +140,68 @@ def test_body_blend_is_capacity_limited_without_sacrificing_non_body_influence()
         ["j_body_a", "j_body_b", "j_body_c", "j_body_d", "j_cloth"],
         {"names": ["j_body_a", "j_body_b", "j_body_c", "j_body_d"]},
     )
-
-    # With a conservative four-influence source primitive and one authored cloth
-    # influence, only three body slots remain. The cloth weight stays exact and the
-    # body weights still sum to the original 0.9 body mass.
     assert solved[0, 4] == 0.10
     assert np.count_nonzero(solved[0, :4] > 1e-8) == 3
     assert abs(float(solved[0, :4].sum()) - 0.90) < 1e-12
     assert abs(float(solved.sum()) - 1.0) < 1e-12
     assert stage["capacity_limited_vertices"] == 1
     assert stage["motion_response_residual_l1_max"] > 0.0
+    assert stage["source_influence_capacity"] == 4
+    assert stage["source_influence_capacity_authority"] == "conservative_authored_usage_fallback"
 
 
-def test_existing_eight_influence_source_proves_eight_slot_capacity():
-    # Seven body influences plus one garment-only influence = eight authored slots.
-    source = np.asarray([[0.20, 0.15, 0.10, 0.10, 0.10, 0.10, 0.15, 0.0, 0.10]])
-    delta = np.asarray([[-0.05, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+def test_registered_eight_slot_primitive_can_use_free_second_set_for_target_motion():
+    # The authored vertex currently uses only three body influences + one cloth influence,
+    # but the source primitive genuinely owns JOINTS_1/WEIGHTS_1. The target may therefore
+    # use additional body influences without sacrificing the cloth weight.
+    source_weights = np.asarray([[0.50, 0.25, 0.15, 0.0, 0.0, 0.0, 0.10]])
+    names = ["j_body_a", "j_body_b", "j_body_c", "j_body_d", "j_body_e", "j_body_f", "j_cloth"]
+    points = np.asarray([[0.01, 0.02, 0.03]])
+    cache = {"names": names[:6]}
+    source = _Source("mesh 1", {"V": points, "W": source_weights, "joint_names": names}, 8)
+    registered = adaptive_skinning.register_source_influence_capacities(cache, source)
+    assert registered["meshes"][0]["capacity"] == 8
+
+    delta = np.asarray([[-0.30, 0.0, 0.0, 0.10, 0.10, 0.10]])
     report = {
         "enabled": True,
         "verified_body_delta": True,
-        "body_supported_cache_columns": np.arange(8, dtype=np.int64),
-        "local_delta_l1": np.asarray([0.10]),
+        "body_supported_cache_columns": np.arange(6, dtype=np.int64),
+        "local_delta_l1": np.asarray([0.60]),
         "quantisation_floor": 0.0035,
     }
     prod = _base_prod(delta, report)
-    names = [f"j_body_{i}" for i in range(8)] + ["j_cloth"]
-    solved, stage = _invoke(prod, source, names, {"names": names[:8]})
-    assert stage["source_influence_capacity_hint"] == 8
-    assert solved[0, -1] == source[0, -1]
-    assert stage["max_final_active_influences"] <= 8
+    solved, stage = _invoke(prod, source_weights, names, cache, points=points)
+
+    assert stage["source_influence_capacity"] == 8
+    assert stage["source_influence_capacity_authority"] == "source_gltf_primitive"
+    assert solved[0, -1] == 0.10
+    assert np.count_nonzero(solved[0, :-1] > 1e-8) == 6
     assert stage["capacity_limited_vertices"] == 0
+    assert stage["motion_response_residual_l1_max"] < 1e-12
+
+
+def test_registered_four_slot_primitive_stays_four_even_if_target_wants_more():
+    source_weights = np.asarray([[0.60, 0.20, 0.10, 0.0, 0.10]])
+    names = ["j_body_a", "j_body_b", "j_body_c", "j_body_d", "j_cloth"]
+    points = np.asarray([[0.02, 0.03, 0.04]])
+    cache = {"names": names[:4]}
+    adaptive_skinning.register_source_influence_capacities(cache, _Source("mesh 2", {"V": points, "W": source_weights, "joint_names": names}, 4))
+    delta = np.asarray([[-0.30, 0.0, 0.0, 0.30]])
+    report = {
+        "enabled": True,
+        "verified_body_delta": True,
+        "body_supported_cache_columns": np.arange(4, dtype=np.int64),
+        "local_delta_l1": np.asarray([0.60]),
+        "quantisation_floor": 0.0035,
+    }
+    prod = _base_prod(delta, report)
+    solved, stage = _invoke(prod, source_weights, names, cache, points=points)
+    assert stage["source_influence_capacity"] == 4
+    assert stage["source_influence_capacity_authority"] == "source_gltf_primitive"
+    assert solved[0, -1] == 0.10
+    assert np.count_nonzero(solved[0] > 1e-8) <= 4
+    assert stage["capacity_limited_vertices"] == 1
 
 
 def test_required_missing_target_joint_fails_instead_of_guessing():
