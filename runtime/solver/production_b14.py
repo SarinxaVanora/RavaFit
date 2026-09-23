@@ -36,7 +36,7 @@ for p in (RBODY_TOOLS, B14_SCRIPTS):
         sys.path.insert(0, str(p))
 
 from rbody_v3_loader import get_cached_rbody, close_cached_rbodies
-from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy, apply_embedded_source_authority
+from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy
 
 # Frozen B14 is read-only.
 from ffxiv_lobofit import (
@@ -70,10 +70,11 @@ from universal_garment_refit import coherent_universal_refit, fit_body_macro_tra
 from unilateral_pair_separation import UnilateralPairSeparationConfig, preserve_source_unilateral_pair_separation
 from surface_relative_detail_layout import SurfaceRelativeDetailConfig, preserve_surface_relative_detail_layout
 from source_relative_structural_carriers import StructuralCarrierConfig, preserve_source_relative_structural_carriers
-from cloth_clearance_envelope import clearance_envelope
+from cloth_clearance_envelope import clearance_envelope, accept_envelope_step
+from body_visibility import covered_body_faces
 
 # B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.
-PRODUCTION_REVISION = "1.1.9-target-authority-source-skin-hard-authority-cloth-envelope"
+PRODUCTION_REVISION = "1.1.9-complete-rbody-fit-authority"
 
 
 def _best_effort_trim_process_memory() -> dict[str, object]:
@@ -676,17 +677,12 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             src_meta=src_lib.payload_meta(source_payload);src_assignments=src_lib.mesh_material_assignments(source_payload)
             for assignment in src_assignments.values():assignment["normalised_material"]=_normalise_material(assignment["material"])
             src_mats={assignment["normalised_material"] for assignment in src_assignments.values()}
-            embedded_source_report={"enabled":False,"reason":"source export contains no usable embedded body surface"}
-            embedded_source_mats:set[str]=set()
-            if source_glb is not None and actual_outfit_body_materials:
-                cache_slot=str(row["slot"])
-                try:
-                    if cache_slot not in embedded_cache:
-                        embedded_cache[cache_slot]=_embedded_body_reference(source_glb,cache_slot,names)
-                    embedded_ref,embedded_source_mats=embedded_cache[cache_slot]
-                    src_ref,embedded_source_report=apply_embedded_source_authority(src_ref,embedded_ref)
-                except Exception as embedded_error:
-                    embedded_source_report={"enabled":False,"reason":f"embedded source authority unavailable: {embedded_error}"}
+            # The explicitly selected RBODY owns complete source anatomy. An
+            # outfit's embedded body can be cut away, compressed or incomplete;
+            # use it only for detach/visibility evidence after the garment fit.
+            embedded_source_report={"enabled":False,"mode":"rbody_source_authority",
+                                    "reason":"selected RBODY supplies complete source anatomy; embedded outfit body is output visibility evidence only"}
+            embedded_source_mats=set(actual_outfit_body_materials)
 
         if bool(row.get("cross_sex_smallclothes_bridge")) and str(row.get("slot") or "").casefold()=="legs":
             src_ref["_cross_sex_smallclothes_bridge"]=True
@@ -703,9 +699,8 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             # e0000 is fitting support; outfit materials determine which body fragments are replaced.
             source_materials.update(actual_outfit_body_materials)
             source_materials_by_slot.setdefault(row["slot"],set()).update(actual_outfit_body_materials)
-        elif source_mode=="rbody" and embedded_source_report.get("enabled") and embedded_source_mats:
-            # Literal outfit body materials are the reliable detach/transplant identity.  RBODY still
-            # supplies body semantics and missing-region completion for the fit pair itself.
+        elif source_mode=="rbody" and embedded_source_mats:
+            # Keep embedded-body identification independent of fit authority.
             source_materials.update(embedded_source_mats);source_materials_by_slot.setdefault(row["slot"],set()).update(embedded_source_mats)
         else:
             source_materials.update(src_mats);source_materials_by_slot.setdefault(row["slot"],set()).update(src_mats)
@@ -713,7 +708,7 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
         target_mesh_materials_by_slot[row["slot"]]=tgt_assignments
         payload_details.append({
             "slot":row["slot"],"source_mode":source_mode,"source_payload":source_payload,"target_payload":tgt_ref["payload_id"],"source_race_code":source_race,"target_race_code":target_race,"source_support_surface":str(row.get("source_support_surface") or "body"),"target_support_surface":target_support_surface,"cross_sex_smallclothes_bridge":bool(row.get("cross_sex_smallclothes_bridge")),
-            "source_materials":sorted(actual_outfit_body_materials if source_mode=="vanilla" else (embedded_source_mats if source_mode=="rbody" and embedded_source_report.get("enabled") and embedded_source_mats else src_mats)),"source_support_materials":sorted(src_mats),"target_materials":sorted(tgt_mats),"source_surface_materials":sorted(source_surface_mats),"target_surface_materials":sorted(target_surface_mats),
+            "source_materials":sorted(actual_outfit_body_materials if source_mode=="vanilla" else (embedded_source_mats if source_mode=="rbody" and embedded_source_mats else src_mats)),"source_support_materials":sorted(src_mats),"target_materials":sorted(tgt_mats),"source_surface_materials":sorted(source_surface_mats),"target_surface_materials":sorted(target_surface_mats),
             "embedded_source_authority":embedded_source_report if source_mode=="rbody" else {"enabled":source_mode=="embedded","mode":source_mode},
             "target_mesh_material_assignments":[tgt_assignments[index] for index in sorted(tgt_assignments)],
         })
@@ -3943,10 +3938,7 @@ def _finalize_modded_structural_solution(source: Any, cache: dict[str,Any], posi
             attachment_reports.append({"mesh":name,"component":int(row["component"]),"support":attachment["support"],"vertices":int(len(ids)),"source_p10_gap_mm":source_p10*1000.0,"before_p10_gap_mm":None if before_gap is None else before_gap*1000.0,"after_p10_gap_mm":None if after_gap is None else after_gap*1000.0,"scale":float(scale)})
 
     target_support_tri=np.asarray(cache.get("_ravafit_target_support_triangles"),dtype=np.float64) if cache.get("_ravafit_target_support_triangles") is not None else _triangles_from_surface(cache["target_support_V"],cache["target_support_F"])
-    target_literal_tri=cache.get("_ravafit_target_collision_triangles")
-    if target_literal_tri is None:
-        suppression=cache.get("_ravafit_source_body_suppression") or {};target_literal_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
-    target_literal_tri=np.asarray(target_literal_tri,dtype=np.float64)
+    target_literal_tri=_target_fit_collision_triangles(cache)
     clearance_reports=[];changed=set()
     for name in sorted(candidate):
         S=source_meshes[name]["V"];F=source_meshes[name]["F"];C=candidate[name].copy()
@@ -4034,10 +4026,7 @@ def _coupled_component_clearance(source_vertices: np.ndarray, vertices: np.ndarr
     S=np.asarray(source_vertices,dtype=np.float64);V=np.asarray(vertices,dtype=np.float64).copy();F=np.asarray(faces,dtype=np.int64)
     if len(S)==0 or len(F)==0:return V,{"adjusted":False,"rounds":0}
     envV=np.asarray(env["V"],dtype=np.float64);envF=np.asarray(env["F"],dtype=np.int64);base_support=np.asarray(cache["target_support_V"],dtype=np.float64)[np.asarray(cache["target_support_F"],dtype=np.int64)]
-    literal=cache.get("_ravafit_target_collision_triangles")
-    if literal is None:
-        suppression=cache.get("_ravafit_source_body_suppression") or {};literal=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
-    literal=np.asarray(literal,dtype=np.float64)
+    literal=_target_fit_collision_triangles(cache)
     edges=np.unique(np.sort(np.vstack((F[:,[0,1]],F[:,[1,2]],F[:,[2,0]])),axis=1),axis=0);ea,eb=edges[:,0],edges[:,1];deg=np.bincount(np.concatenate((ea,eb)),minlength=len(V)).astype(np.float64);feature=_structural_component_features(S,F);rigid=(len(S)<=650 and feature["max_extent"]<=.055) or (len(S)<=220 and feature["max_extent"]<=.090 and feature["thin_ratio"]<=.18) or (len(S)<=180 and feature["max_extent"]<=.170 and feature["boundary_fraction"]>=.50 and feature["middle_ratio"]<=.35)
     if precomputed is None:
         vf=_coupled_support_frame(S,cache,envV);ff=_coupled_support_frame(S[F].mean(axis=1),cache,envV)
@@ -4144,10 +4133,7 @@ def _coupled_target_clearance_guard(positions: dict[str,np.ndarray], contexts: d
     relief or fight the already-established source-relative garment shape.
     """
     out={k:np.asarray(v,dtype=np.float64).copy() for k,v in positions.items()};changed=set();rows=[];env=_build_auxiliary_envelope_support(cache);envV=np.asarray(env["V"],dtype=np.float64)
-    literal=cache.get("_ravafit_target_collision_triangles")
-    if literal is None:
-        suppression=cache.get("_ravafit_source_body_suppression") or {};literal=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
-    literal=np.asarray(literal,dtype=np.float64)
+    literal=_target_fit_collision_triangles(cache)
     for name in sorted(out):
         context=contexts[name];S=np.asarray(context["data"]["V"],dtype=np.float64);F=np.asarray(context["data"]["F"],dtype=np.int64);current=out[name];components=_masked_vertex_components(F,np.ones(len(S),dtype=bool));component_reports=[]
         pre_key=(id(cache),len(S),len(F),int(np.asarray(F,dtype=np.int64).sum(dtype=np.int64)))
@@ -5542,6 +5528,28 @@ def _preserve_final_source_attachment_continuity(source: Any, positions: dict[st
 
 
 
+def _target_fit_collision_triangles(cache: dict[str,Any]) -> np.ndarray:
+    """Use complete target anatomy for fitting, independently of render cut-outs.
+
+    Source-authored body removal is an output visibility decision. Its open edges
+    are not a signed collision solid: using them can classify cloth outside a
+    breast as deeply inside its cut rim. The strict contract retains the original
+    indexed anatomical material separately from hair/accessory package meshes.
+    Those optional open surfaces must not deform the clothing either.
+    """
+    cached = cache.get("_ravafit_target_collision_triangles")
+    if cached is not None:
+        return np.asarray(cached, dtype=np.float64)
+    vertices = cache.get("_ravafit_strict_target_surface_V")
+    faces = cache.get("_ravafit_strict_target_surface_F")
+    if vertices is None or faces is None:
+        vertices, faces = cache["target_surface_V"], cache["target_surface_F"]
+    triangles = _triangles_from_surface(vertices, faces)
+    triangles, _ = _sanitise_strict_b14_surface_triangles(triangles, "complete target anatomy")
+    cache["_ravafit_target_collision_triangles"] = triangles
+    return triangles
+
+
 def _strict_source_literal_body_triangles(cache: dict[str,Any], fallback: np.ndarray) -> np.ndarray:
     """Use the body geometry that actually existed in the source outfit as final contact authority.
 
@@ -5691,28 +5699,16 @@ def _clear_target_body_surfaces(source: Any, positions: dict[str,np.ndarray], ta
             V=trial
         envelope, envelope_report = clearance_envelope(original, F, V-original,
                                                         maximum_move_m=float(maximum_vertex_move_m))
-        envelope_step = original + envelope - V
-        for _ in range(8):
-            trial = V + envelope_step
-            trial_area = np.cross(trial[F[:,1]]-trial[F[:,0]], trial[F[:,2]]-trial[F[:,0]])
-            trial_norm = np.linalg.norm(trial_area, axis=1)
-            alignment = np.einsum("ij,ij->i", base_area, trial_area)
-            unsafe = valid_area & ((alignment <= .05*base_norm*trial_norm) | (trial_norm <= .12*base_norm))
-            if not np.any(unsafe):
-                V = trial
-                break
-            envelope_step[np.unique(F[unsafe])] *= .5
-        else:
-            envelope_report["rejected"] = "could not preserve triangle orientation"
-        # Exact residual pinning: after the smooth envelope has done the visible work, remove any tiny
-        # triangle-interior intersections that remain.  Query only the residual face set on subsequent
-        # iterations so this hard no-clipping invariant is cheap compared with the broad envelope pass.
+        V, envelope_report["topology"] = accept_envelope_step(V, F, original+envelope)
+        # Audit a denser grid after the envelope. Subsequent local moves must
+        # include adjacent faces in the recheck because they share moved corners.
+        audit_bary=np.asarray([(i/8.,j/8.,(8-i-j)/8.) for i in range(9) for j in range(9-i)]+[(1./3.,1./3.,1./3.)],dtype=np.float64)
         micro_iterations=0
-        audit_grid=np.einsum("bk,fkj->fbj",bary,V[F]);_,_,audit_signed,_,_,audit_rejections=_nearest_literal_surface_consistent_with_support(audit_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(audit_rejections);audit_signed=np.asarray(audit_signed,dtype=np.float64).reshape(len(F),len(bary))
+        audit_grid=np.einsum("bk,fkj->fbj",audit_bary,V[F]);_,_,audit_signed,_,_,audit_rejections=_nearest_literal_surface_consistent_with_support(audit_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(audit_rejections);audit_signed=np.asarray(audit_signed,dtype=np.float64).reshape(len(F),len(audit_bary))
         micro_faces=np.flatnonzero(np.any(audit_signed<float(margin_m),axis=1))
         for micro_index in range(12):
             if len(micro_faces)==0:break
-            local_grid=np.einsum("bk,fkj->fbj",bary,V[F[micro_faces]]);_,local_literal_normals,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(bary));local_literal_normals=np.asarray(local_literal_normals,dtype=np.float64).reshape(len(micro_faces),len(bary),3)
+            local_grid=np.einsum("bk,fkj->fbj",audit_bary,V[F[micro_faces]]);_,local_literal_normals,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(audit_bary));local_literal_normals=np.asarray(local_literal_normals,dtype=np.float64).reshape(len(micro_faces),len(audit_bary),3)
             deficit=np.maximum(0.0,float(margin_m)-local_signed);bad=np.flatnonzero(np.max(deficit,axis=1)>1e-8)
             if len(bad)==0:break
             micro_iterations=micro_index+1;rows=micro_faces[bad];chosen=np.argmax(deficit[bad],axis=1);points=local_grid[bad,chosen];literal_n=local_literal_normals[bad,chosen]
@@ -5723,16 +5719,16 @@ def _clear_target_body_surfaces(source: Any, positions: dict[str,np.ndarray], ta
             # A small deterministic overshoot avoids asymptotically hovering a few microns inside due
             # shared-vertex averaging while remaining far below visible garment-shape scale.
             need=np.minimum(deficit[bad,chosen]*1.20+.000015,.00075)
-            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[rows];corner_weights=.45+.55*bary[chosen];contrib=push_normals[:,None,:]*need[:,None,None]*corner_weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),corner_weights.reshape(-1));direct=weight>0;field=np.zeros_like(V);field[direct]=acc[direct]/weight[direct,None]
+            acc=np.zeros_like(V);weight=np.zeros(len(V),dtype=np.float64);vertex_ids=F[rows];corner_weights=.45+.55*audit_bary[chosen];contrib=push_normals[:,None,:]*need[:,None,None]*corner_weights[:,:,None];np.add.at(acc,vertex_ids.reshape(-1),contrib.reshape(-1,3));np.add.at(weight,vertex_ids.reshape(-1),corner_weights.reshape(-1));direct=weight>0;field=np.zeros_like(V);field[direct]=acc[direct]/weight[direct,None]
             trial=V+field;cumulative=trial-original;mag=np.linalg.norm(cumulative,axis=1);over=mag>float(maximum_vertex_move_m)
             if np.any(over):cumulative[over]*=(float(maximum_vertex_move_m)/np.maximum(mag[over],1e-12))[:,None]
             trial=original+cumulative
+            trial,_=accept_envelope_step(V,F,trial)
             if float(np.max(np.linalg.norm(trial-V,axis=1),initial=0.0))<1e-10:break
             V=trial;affected.update(int(x) for x in rows.tolist())
-            # Re-test only the residual set; an outward pin cannot create a new body intersection away
-            # from the moved neighbourhood, and the global exact audit below remains authoritative.
-            local_grid=np.einsum("bk,fkj->fbj",bary,V[F[micro_faces]]);_,_,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(bary));micro_faces=micro_faces[np.any(local_signed<float(margin_m),axis=1)]
-        final_grid=np.einsum("bk,fkj->fbj",bary,V[F]).reshape(-1,3);_,_,final_signed,_,_,final_rejections=_nearest_literal_surface_consistent_with_support(final_grid,target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(final_rejections);final_signed=np.asarray(final_signed,dtype=np.float64).reshape(len(F),len(bary));remaining=np.any(final_signed<-.00002,axis=1);unresolved=int(np.count_nonzero(remaining));unresolved_total+=unresolved
+            micro_faces=np.union1d(micro_faces,np.flatnonzero(np.any(direct[F],axis=1)))
+            local_grid=np.einsum("bk,fkj->fbj",audit_bary,V[F[micro_faces]]);_,_,local_signed,_,_,local_rejections=_nearest_literal_surface_consistent_with_support(local_grid.reshape(-1,3),target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(local_rejections);local_signed=np.asarray(local_signed,dtype=np.float64).reshape(len(micro_faces),len(audit_bary));micro_faces=micro_faces[np.any(local_signed<float(margin_m)-1e-8,axis=1)]
+        final_grid=np.einsum("bk,fkj->fbj",audit_bary,V[F]).reshape(-1,3);_,_,final_signed,_,_,final_rejections=_nearest_literal_surface_consistent_with_support(final_grid,target_tri,support_tri if have_support else None,exact_base=True);opposite_rejections+=int(final_rejections);final_signed=np.asarray(final_signed,dtype=np.float64).reshape(len(F),len(audit_bary));remaining=np.any(final_signed<-.00002,axis=1);unresolved=int(np.count_nonzero(remaining));unresolved_total+=unresolved
         after=float(np.min(final_signed)) if final_signed.size else None;moved=np.linalg.norm(V-original,axis=1);move_max=float(np.max(moved,initial=0.0))
         if move_max>1e-12:out[name]=V;changed.append(name)
         total_faces+=len(affected);maximum_move=max(maximum_move,move_max)
@@ -5901,6 +5897,10 @@ def _preserve_source_shared_seam_skinning(source: Any, positions: dict[str,np.nd
     different authored seam weights retain that difference.  This changes skinning only, never geometry.
     """
     if not skinning:return skinning,{"enabled":False,"reason":"no skinning payload"}
+    if all(np.array_equal(np.asarray(row["weights"]), np.asarray(source.data(name)["W"]))
+           and list(row["joint_names"]) == list(source.data(name)["joint_names"])
+           for name,row in skinning.items()):
+        return skinning,{"enabled":False,"reason":"source skinning already exact; preserve authored seam weights without arithmetic","changed_vertices":0}
     pairs,discovery=_source_proven_cross_mesh_seam_pairs(source,positions,tolerance_m=tolerance_m,minimum_pair_witnesses=minimum_pair_witnesses)
     if not pairs:return skinning,{"enabled":False,"reason":"no repeated source-proven cross-mesh seam","discovery":discovery}
     out={name:{**row,"weights":np.asarray(row["weights"],dtype=np.float64).copy(),"joint_names":list(row["joint_names"])} for name,row in skinning.items()}
@@ -5959,11 +5959,7 @@ def _solve_strict_b14_layers(source: Any, cache: dict[str,Any], body_mesh_names:
     if target_tri is None:target_tri=_triangles_from_surface(cache.get("_ravafit_strict_target_surface_V",cache["target_support_V"]),cache.get("_ravafit_strict_target_surface_F",cache["target_support_F"]))
     source_tri,strict_source_surface_sanitisation=_sanitise_strict_b14_surface_triangles(source_tri,"source")
     target_tri,strict_target_surface_sanitisation=_sanitise_strict_b14_surface_triangles(target_tri,"target")
-    target_collision_tri=cache.get("_ravafit_target_collision_triangles")
-    if target_collision_tri is None:
-        suppression=cache.get("_ravafit_source_body_suppression") or {}
-        target_collision_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
-        cache["_ravafit_target_collision_triangles"]=target_collision_tri
+    target_collision_tri=_target_fit_collision_triangles(cache)
     layers,_=_infer_garment_layers(source,body_mesh_names,mesh_filter,source_tri)
     if not layers:raise ValueError("No garment layers were inferred after removing the source body.")
     layers,relations=_infer_layer_order_graph(source,layers,source_tri)
@@ -6240,11 +6236,7 @@ def _solve_garment_meshes(source: GLB, cache: dict[str, Any], body_mesh_names: s
     if strict_b14_contract:
         source_tri,_=_sanitise_strict_b14_surface_triangles(source_tri,"source")
         target_tri,_=_sanitise_strict_b14_surface_triangles(target_tri,"target")
-    target_collision_tri=cache.get("_ravafit_target_collision_triangles")
-    if target_collision_tri is None:
-        suppression=cache.get("_ravafit_source_body_suppression") or {}
-        target_collision_tri=np.asarray(suppression.get("_collision_triangles"),dtype=np.float64) if suppression.get("_collision_triangles") is not None else _triangles_from_surface(cache["target_surface_V"],cache["target_surface_F"])
-        cache["_ravafit_target_collision_triangles"]=target_collision_tri
+    target_collision_tri=_target_fit_collision_triangles(cache)
 
     positions: dict[str, np.ndarray] = {}
     skinning: dict[str, dict[str, Any]] = {}
@@ -6576,6 +6568,24 @@ def _write_retargeted_skinning(ed: GLBEditor, primitive: dict[str, Any], dense_w
     if not pairs:raise ValueError(f"{mesh_name} has no writable JOINTS/WEIGHTS attributes for target-body skin retargeting.")
     capacity=4*len(pairs);weights=np.asarray(dense_weights,dtype=np.float64)
     if weights.ndim!=2:raise ValueError(f"{mesh_name} retargeted weights are not a dense 2D matrix.")
+    # Geometry-only fits must not re-sort, re-normalise or re-quantise the
+    # authored joint/weight accessors on export. Compare in the same normalised
+    # dense representation used by the solver, then leave the original bytes.
+    authored=np.zeros_like(weights)
+    for joint_accessor,weight_accessor in pairs:
+        joints=np.asarray(ed.accessor(joint_accessor),dtype=np.int64)
+        values=np.asarray(ed.accessor(weight_accessor),dtype=np.float64)
+        if len(joints)!=len(weights) or joints.shape!=values.shape:
+            raise ValueError(f"{mesh_name} skin accessor count does not match solved weights.")
+        if np.any(joints<0) or np.any(joints>=weights.shape[1]):
+            raise ValueError(f"{mesh_name} source joint index exceeds its skin.")
+        for corner in range(joints.shape[1]):
+            authored[np.arange(len(weights)),joints[:,corner]]+=values[:,corner]
+    total=authored.sum(axis=1);valid=total>1e-12
+    authored[valid]/=total[valid,None]
+    if np.array_equal(authored,weights):
+        return {"mode":"source_authored_accessors_preserved","attributes_preserved":True,
+                "influence_capacity":capacity,"max_active_influences":int(np.max(np.count_nonzero(weights>1e-8,axis=1),initial=0))}
     order=np.argsort(-weights,axis=1,kind="stable")[:,:capacity];packed=np.take_along_axis(weights,order,axis=1)
     total=packed.sum(axis=1,keepdims=True);good=total[:,0]>1e-12
     if not np.all(good):raise ValueError(f"{mesh_name} has {int(np.count_nonzero(~good))} vertices with no encodable skin weights.")
@@ -7234,6 +7244,40 @@ def _source_body_suppression_plan(source: GLB, cache: dict[str, Any], source_by_
     return {"enabled":True,"policy":"selected target stays complete unless the embedded source body explicitly removes a coherent garment-covered region","slots":slot_reports,"native_suppression":native_suppression,"_collision_triangles":collision_tri,"_source_collision_triangles":source_collision_tri}
 
 
+def _refine_source_body_suppression_after_fit(source, positions, cache, plan):
+    """Keep authored cutaways only where the final garment still covers the body."""
+    proposed=plan.get("native_suppression",[])
+    if not proposed:return plan
+    garment=[]
+    for name,vertices in positions.items():
+        faces=np.asarray(source.data(name)["F"],dtype=np.int64)
+        if len(faces):garment.append(np.asarray(vertices,dtype=np.float64)[faces])
+    cloth=np.vstack(garment) if garment else np.zeros((0,3,3))
+    cloth,_=_sanitise_strict_b14_surface_triangles(cloth,"fitted garment visibility")
+    pairs={str(pair["slot"]):pair for pair in cache.get("slot_pairs",[])}
+    result=dict(plan);accepted=[];counts={};total_before=0;total_after=0
+    for row in proposed:
+        slot=str(row["slot"]);pair=pairs.get(slot)
+        ids=np.asarray(row["triangles"],dtype=np.int64);total_before+=len(ids)
+        if pair is None:continue
+        record=next((r for r in pair.get("target_mesh_records",[]) if int(r["mesh_index"])==int(row["native_mesh"])),None)
+        if record is None:continue
+        if np.any(ids<0) or np.any(ids>=int(record["face_count"])):
+            raise ValueError(f"Invalid target-body cutaway indices for {slot} mesh {row['native_mesh']}.")
+        faces=np.asarray(pair["target_literal_F"],dtype=np.int64)[ids+int(record["face_offset"])]
+        triangles=np.asarray(pair["target_literal_V"],dtype=np.float64)[faces]
+        retained=ids[covered_body_faces(triangles,cloth)].astype(int).tolist();total_after+=len(retained)
+        counts.setdefault(slot,[]).append({"native_mesh":int(row["native_mesh"]),"suppressed_triangles":len(retained)})
+        if retained:accepted.append({**row,"triangles":retained})
+    result["native_suppression"]=accepted
+    result["slots"]=[{**row,"suppressed_target_triangles":sum(r["suppressed_triangles"] for r in counts.get(str(row["slot"]),[])),
+                      "native_meshes":counts.get(str(row["slot"]),[])} for row in plan.get("slots",[])]
+    result["fitted_coverage"]={"enabled":True,"proposed_triangles":total_before,"suppressed_triangles":total_after,
+                               "retained_at_openings":total_before-total_after,
+                               "policy":"source cutaway evidence plus final outward cloth coverage at every corner and centre; never changes fit geometry"}
+    return result
+
+
 def _public_source_body_suppression(plan: dict[str, Any] | None) -> dict[str, Any]:
     if not plan:return {"enabled":False}
     return {key:value for key,value in plan.items() if not str(key).startswith("_")}
@@ -7694,6 +7738,15 @@ def _source_preserved_garment_solution(source: Any, body_mesh_names: set[str], m
     return positions,skinning,records,stats
 
 
+def _validate_final_fit_clearance(solve_stats):
+    report=solve_stats.get("final_target_body_clearance") or {}
+    unresolved=int(report.get("unresolved_penetrating_face_count",0))
+    if unresolved:
+        depth=report.get("minimum_contact_sample_after_mm")
+        detail=f" (deepest sampled contact {float(depth):.3f} mm)" if depth is not None else ""
+        raise ValueError(f"Garment fit still intersects the selected target body on {unresolved} triangles{detail}. No fitted output was published.")
+
+
 def convert(spec: dict[str, Any]) -> dict[str, Any]:
     source_glb = Path(spec["source_glb"]).resolve()
     output_glb = Path(spec["output_glb"]).resolve()
@@ -7834,6 +7887,9 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
     if reference_retry is not None:
         solve_stats["reference_retry"] = reference_retry
 
+    _validate_final_fit_clearance(solve_stats)
+    suppression_plan=_refine_source_body_suppression_after_fit(source,positions,cache,suppression_plan)
+    cache["_ravafit_source_body_suppression"]=suppression_plan
     fitted_without_body = output_glb.with_name(output_glb.stem + ".garment-only.glb")
     detach = _patch_positions_and_detach_body(source_glb, fitted_without_body, positions, skinning, body_mesh_names)
     if transplant_target_body:

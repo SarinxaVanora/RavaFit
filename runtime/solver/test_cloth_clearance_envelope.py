@@ -1,7 +1,7 @@
 import numpy as np
 
 import production_b14 as p
-from cloth_clearance_envelope import clearance_envelope
+from cloth_clearance_envelope import clearance_envelope, accept_envelope_step
 
 
 def _cup(n=25):
@@ -78,3 +78,16 @@ def test_contact_spread_uses_physical_size_instead_of_mesh_ring_count():
         sample = np.argmin(np.linalg.norm(vertices[:, :2]-[.024, 0.], axis=1))
         heights.append(np.linalg.norm(result[sample]))
     np.testing.assert_allclose(heights[0], heights[1], rtol=.02)
+
+
+def test_unsafe_local_triangle_does_not_cancel_other_envelope_repairs():
+    vertices=np.asarray([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.],
+                         [2.,0.,0.],[3.,0.,0.],[2.,1.,0.]])
+    faces=np.asarray([[0,1,2],[3,4,5]])
+    proposed=vertices.copy();proposed[1,0]=-2.;proposed[3:,2]=.003
+
+    result,report=accept_envelope_step(vertices,faces,proposed)
+
+    assert np.cross(result[1]-result[0],result[2]-result[0])[2]>0.
+    np.testing.assert_array_equal(result[3:],proposed[3:])
+    assert report['limited_vertices']==3

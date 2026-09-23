@@ -6,6 +6,35 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
 
+def accept_envelope_step(vertices, faces, proposed):
+    """Limit unsafe local moves without discarding valid neighbouring repairs."""
+    V=np.asarray(vertices,dtype=np.float64)
+    F=np.asarray(faces,dtype=np.int64)
+    step=np.asarray(proposed,dtype=np.float64)-V
+    before=np.cross(V[F[:,1]]-V[F[:,0]],V[F[:,2]]-V[F[:,0]])
+    lengths=np.linalg.norm(before,axis=1)
+    valid=lengths>1e-12
+    limited=set()
+    def unsafe(candidate):
+        area=np.cross(candidate[F[:,1]]-candidate[F[:,0]],candidate[F[:,2]]-candidate[F[:,0]])
+        norm=np.linalg.norm(area,axis=1)
+        dot=np.einsum('ij,ij->i',before,area)
+        return valid & ((dot<=.05*lengths*norm) | (norm<=.12*lengths))
+    for _ in range(12):
+        bad=unsafe(V+step)
+        if not np.any(bad):
+            return V+step,{"limited_vertices":len(limited),"accepted_fraction":1.}
+        ids=np.unique(F[bad]);limited.update(ids.tolist());step[ids]*=.5
+    # A shared vertex can affect a neighbouring triangle. Keep the same safe
+    # reference and back off the remaining step if local limits did not suffice.
+    for power in range(1,13):
+        fraction=2.**(-power)
+        candidate=V+step*fraction
+        if not np.any(unsafe(candidate)):
+            return candidate,{"limited_vertices":len(limited),"accepted_fraction":fraction}
+    return V.copy(),{"limited_vertices":len(limited),"accepted_fraction":0.}
+
+
 def clearance_envelope(vertices, faces, displacement, *, radius_m=.060, maximum_move_m=.008):
     """Build a local, outward displacement envelope on connected garment topology.
 

@@ -3,9 +3,9 @@
     "runtime":  {
                     "version":  "1.1.9",
                     "url":  "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.1.1.9.zip",
-                    "sha256":  "ab6b7388a96aa8fa150f114170c94d2b25943a072e4046e240d00ea5f48f168a",
-                    "size":  188068354,
-                    "productionRevision":  "1.1.9-target-authority-source-skin-hard-authority-cloth-envelope",
+                    "sha256":  "8d3e97efcfdd19be6249db8a8e9c23e1c92e5c54c069827f50e953a43e541ecb",
+                    "size":  210868810,
+                    "productionRevision":  "1.1.9-complete-rbody-fit-authority",
                     "minimumPluginVersion":  "1.1.5"
                 },
     "bodies":  {
