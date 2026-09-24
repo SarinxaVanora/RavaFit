@@ -106,8 +106,8 @@ jobs:
           if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
               throw "Hosted runtime ZIP was not produced at $runtimePath."
           }
-          if ($manifest.runtime.version -ne "1.1.10") {
-              throw "Generated runtime manifest version '$($manifest.runtime.version)' does not match this source release (1.1.10)."
+          if ($manifest.runtime.version -ne "1.1.9") {
+              throw "Generated runtime manifest version '$($manifest.runtime.version)' does not match this source release (1.1.9)."
           }
           if (-not (Test-Path -LiteralPath "distribution/assets/Bodies.rbody" -PathType Leaf)) {
               throw "Bodies.rbody was not produced/hydrated."
