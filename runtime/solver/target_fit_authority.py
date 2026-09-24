@@ -16,16 +16,29 @@ from typing import Any
 import numpy as np
 
 
-def _close_authority(source_distance: np.ndarray) -> np.ndarray:
-    """Full authority for skin-close cloth, fading out before stand-off structure."""
+def _close_authority(source_distance: np.ndarray, behavior: str) -> np.ndarray:
+    """Per-vertex target-frame authority derived from authored support, not mesh medians.
+
+    Flexible body-following cloth should track only genuinely close support. Constructed
+    close shells are different: cups, padded panels and other authored-volume structures
+    can stand well away from the source skin while still being completely body-supported.
+    Their standoff is construction, not evidence that target fitting should be skipped.
+    """
     distance = np.asarray(source_distance, dtype=np.float64)
-    t = np.clip((distance - .006) / .012, 0.0, 1.0)
+    behaviour = str(behavior or "").casefold()
+    if behaviour == "constructed_close_shell":
+        # Keep full macro target authority through normal constructed-shell standoff, then
+        # fade only for geometry that is genuinely remote from the body support surface.
+        lo, hi = .018, .040
+    else:
+        lo, hi = .006, .018
+    t = np.clip((distance - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
     smooth = t * t * (3.0 - 2.0 * t)
     return 1.0 - smooth
 
 
 def _smooth_tangent_field(values: np.ndarray, faces: np.ndarray, iterations: int = 5) -> np.ndarray:
-    """Low-pass only the macro tangential retarget displacement, never garment geometry."""
+    """Low-pass a displacement field over garment topology, never garment geometry itself."""
     values = np.asarray(values, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
     if not len(values) or not len(faces) or iterations <= 0:
@@ -51,12 +64,13 @@ def _smooth_tangent_field(values: np.ndarray, faces: np.ndarray, iterations: int
 def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarray], contexts: dict[str, dict[str, Any]], cache: dict[str, Any], margin: float) -> tuple[dict[str, np.ndarray], set[str], dict[str, Any]]:
     """Align close cloth to the full paired target support frame.
 
-    The previous guard corrected only support-normal distance. That could leave a cup at
-    approximately the source body's width/position even after fitting to a differently
-    shaped breast. Here the exact source->target support correspondence supplies a complete
-    per-vertex target frame. Normal displacement is authoritative; tangential displacement
-    is low-pass filtered so macro width/position follows the target without erasing authored
-    cup curvature, folds, seams or other local garment construction.
+    Constructed close shells follow the complete target macro frame even when their authored
+    surface stands away from the source body; that standoff is retained as garment construction.
+
+    Flexible body-following cloth is treated differently. Its target-frame displacement is
+    low-pass filtered over the garment panel before application so local anatomical relief cannot
+    pinch the cloth into grooves or folds. This preserves broad target changes (waist, hips, legs,
+    butt, abdomen) while bridging high-frequency anatomy such as genital relief.
     """
     support_frame = getattr(prod, "_coupled_support_frame", None)
     topology_guard = getattr(prod, "_coupled_topology_safe_alpha", None)
@@ -77,9 +91,8 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         features = context.get("features") or {}
         median_clearance_mm = float(features.get("source_clearance_median_mm", 999.0))
         close = {"constructed_close_shell", "body_following_flexible_layer"}
+        base_behaviour = behaviour if behaviour in close else effective
         if behaviour not in close and effective not in close:
-            continue
-        if median_clearance_mm > 8.0:
             continue
 
         data = context.get("data") or {}
@@ -101,20 +114,32 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
 
         finite = np.isfinite(source_distance) & np.all(np.isfinite(contact), axis=1) & np.all(np.isfinite(normal), axis=1)
-        authority = _close_authority(source_distance)
+        authority = _close_authority(source_distance, base_behaviour)
         authority[~finite] = 0.0
-        desired_distance = np.clip(source_distance, clearance_floor, .030)
+        # Preserve the exact authored body standoff where possible. The upper clamp exists only
+        # to reject pathological correspondence; it is deliberately much larger than a cup's
+        # normal authored volume.
+        desired_distance = np.clip(source_distance, clearance_floor, .045)
         ideal = contact + normal * desired_distance[:, None]
         error = ideal - current
 
-        # Keep source-authored normal spacing. Tangential movement is the target's macro
-        # width/position change, so low-pass that displacement field rather than flattening
-        # the garment itself.
-        normal_scalar = np.einsum("ij,ij->i", error, normal)
-        normal_move = normal_scalar[:, None] * normal
-        tangent_move = error - normal_move
-        tangent_move = _smooth_tangent_field(tangent_move, faces, iterations=5)
-        move = normal_move + tangent_move
+        if base_behaviour == "body_following_flexible_layer":
+            # Flexible cloth must follow the target's *macro* displacement field, not individual
+            # target-body relief. Smooth the complete target-frame move over garment topology.
+            # Because only the displacement is filtered, source-authored garment shape and seams
+            # are not themselves smoothed or shrink-wrapped.
+            move = _smooth_tangent_field(error, faces, iterations=12)
+            relief_rejected = error - move
+        else:
+            # Constructed shells retain their authored local form. Normal displacement carries
+            # macro target volume/position; tangential displacement is low-pass filtered so the
+            # shell follows the target frame without flattening cup/panel curvature.
+            normal_scalar = np.einsum("ij,ij->i", error, normal)
+            normal_move = normal_scalar[:, None] * normal
+            tangent_move = error - normal_move
+            tangent_move = _smooth_tangent_field(tangent_move, faces, iterations=5)
+            move = normal_move + tangent_move
+            relief_rejected = np.zeros_like(move)
 
         magnitude = np.linalg.norm(move, axis=1)
         beyond = magnitude > tolerance
@@ -123,14 +148,16 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         move *= (scale * authority)[:, None]
 
         move_length = np.linalg.norm(move, axis=1)
-        too_large = move_length > .020
-        move[too_large] *= (.020 / np.maximum(move_length[too_large], 1e-12))[:, None]
+        too_large = move_length > .025
+        move[too_large] *= (.025 / np.maximum(move_length[too_large], 1e-12))[:, None]
         active = np.linalg.norm(move, axis=1) > 1e-7
         if not np.any(active):
             current_projection = np.einsum("ij,ij->i", current - contact, normal)
             reports.append({
                 "mesh": name,
                 "active_vertices": 0,
+                "behavior": base_behaviour,
+                "source_clearance_mesh_p50_mm": median_clearance_mm,
                 "source_clearance_p50_mm": float(np.median(source_distance[finite]) * 1000.0) if np.any(finite) else None,
                 "target_clearance_p50_mm": float(np.median(current_projection[finite]) * 1000.0) if np.any(finite) else None,
             })
@@ -156,16 +183,20 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         final_projection = np.einsum("ij,ij->i", safe - contact, normal)
         current_projection = np.einsum("ij,ij->i", current - contact, normal)
         target_error = np.linalg.norm(safe - ideal, axis=1)
+        rejected = np.linalg.norm(relief_rejected, axis=1)
         reports.append({
             "mesh": name,
+            "behavior": base_behaviour,
             "active_vertices": int(np.count_nonzero(active)),
             "moved_vertices": int(np.count_nonzero(moved > 1e-7)),
+            "source_clearance_mesh_p50_mm": median_clearance_mm,
             "source_clearance_p50_mm": float(np.median(source_distance[finite]) * 1000.0) if np.any(finite) else None,
             "before_target_clearance_p50_mm": float(np.median(current_projection[active]) * 1000.0),
             "after_target_clearance_p50_mm": float(np.median(final_projection[active]) * 1000.0),
             "target_frame_error_p95_mm": float(np.percentile(target_error[active], 95) * 1000.0),
             "move_p95_mm": float(np.percentile(moved[active], 95) * 1000.0),
             "move_max_mm": float(np.max(moved[active]) * 1000.0),
+            "rejected_local_relief_p95_mm": float(np.percentile(rejected[active], 95) * 1000.0),
             "tolerance_mm": float(tolerance * 1000.0),
             "clearance_floor_mm": float(clearance_floor * 1000.0),
             "topology_alpha": float(alpha),
@@ -177,7 +208,7 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         "enabled": True,
         "adjusted_mesh_count": int(len(changed)),
         "meshes": reports,
-        "policy": "close cloth follows the complete paired target macro frame plus source-authored support spacing; tangential correction is low-pass displacement only, literal body detail remains collision-only, and the existing final seam stage remains untouched",
+        "policy": "constructed close shells follow the complete paired target macro frame regardless of normal authored standoff; flexible body-following cloth follows a topology-smoothed target displacement field that bridges local anatomical relief; literal body detail remains collision-only and final seam authority is untouched",
     }
 
 
@@ -191,10 +222,10 @@ def install_close_shell_macro_authority(prod: Any) -> None:
         def relief_guard(source_vertices, faces, mapped, blend, blend_ids, cache, behavior, features):
             behaviour = str(behavior or "").casefold()
             clearance_mm = float((features or {}).get("source_clearance_median_mm", 999.0))
-            if behaviour == "constructed_close_shell" and clearance_mm <= 4.50:
+            if behaviour == "constructed_close_shell":
                 return np.asarray(mapped, dtype=np.float64), {
                     "enabled": False,
-                    "reason": "close constructed cloth uses smooth target macro support; literal target detail remains collision authority",
+                    "reason": "constructed close cloth uses paired smooth target macro support at any normal authored cup/panel standoff; literal target detail remains collision authority",
                     "source_clearance_median_mm": clearance_mm,
                 }
             return relief_original(source_vertices, faces, mapped, blend, blend_ids, cache, behavior, features)

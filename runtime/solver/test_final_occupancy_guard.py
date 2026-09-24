@@ -29,6 +29,23 @@ def _plane_occupancy(points, triangles, k=48, exact_band=.002):
     return nearest, normals, signed, np.abs(signed), np.zeros(len(points), dtype=np.int64)
 
 
+def test_target_surfaces_prefers_garment_support_proxy_over_raw_body_support():
+    prod = _Prod()
+    prod._target_fit_collision_triangles = lambda cache: np.zeros((1, 3, 3), dtype=float)
+    prod._triangles_from_surface = lambda v, f: np.asarray(v, float)[np.asarray(f, int)]
+    prod._garment_support_proxy = lambda cache: {
+        "V": np.asarray([[7., 0., 0.], [8., 0., 0.], [7., 1., 0.]]),
+        "F": np.asarray([[0, 1, 2]], dtype=np.int64),
+    }
+    cache = {
+        "target_support_V": np.asarray([[1., 0., 0.], [2., 0., 0.], [1., 1., 0.]]),
+        "target_support_F": np.asarray([[0, 1, 2]], dtype=np.int64),
+    }
+    collision, support = guard._target_surfaces(prod, cache)
+    assert collision.shape == (1, 3, 3)
+    assert float(support[0, 0, 0]) == 7.0
+
+
 def test_dense_face_sampling_catches_interior_witness_vertices_and_centroid_miss():
     prod = _Prod()
 
@@ -53,7 +70,7 @@ def test_dense_repair_bridges_literal_ridge_without_imprinting_it_into_cloth():
     source._data["mesh"]["V"] = np.asarray([[0., 0., .00020], [1., 0., .00020], [0., 1., .00020]])
     base = {"mesh": source.data("mesh")["V"].copy()}
     collision = np.zeros((1, 3, 3), dtype=float)
-    support = np.full((1, 3, 3), 9.0, dtype=float)  # marker used only by this mock
+    support = np.full((1, 3, 3), 9.0, dtype=float)
 
     def occupancy(points, triangles, k=48, exact_band=.002):
         points = np.asarray(points, float)
@@ -61,10 +78,8 @@ def test_dense_repair_bridges_literal_ridge_without_imprinting_it_into_cloth():
         nearest = points.copy()
         nearest[:, 2] = 0.0
         if float(np.asarray(triangles)[0, 0, 0]) > 5.0:
-            # Smooth macro support: a flat clothing-support plane.
             signed = points[:, 2].copy()
         else:
-            # Literal anatomy has a narrow 1.5 mm ridge under the face interior.
             ridge = ((points[:, 0] > .15) & (points[:, 0] < .80) &
                      (points[:, 1] > .10) & (points[:, 1] < .70) &
                      ((points[:, 0] + points[:, 1]) < .90))
@@ -78,12 +93,40 @@ def test_dense_repair_bridges_literal_ridge_without_imprinting_it_into_cloth():
         prod, source, base, collision, support, margin=.00016, maximum_vertex_step=.003,
     )
     z = solved["mesh"][:, 2]
-    # A literal-surface projection would make a local ridge/cameltoe. The support bridge moves
-    # the connected cloth face as one macro patch, preserving its authored flat local shape.
     assert float(np.ptp(z)) < 1e-12
     assert float(np.min(z)) > .00020
     assert report["literal_surface_used_for_detection_only"] is True
-    assert report["repair_direction"] == "smooth_target_support_normal"
+    assert report["repair_direction"] == "coherent_garment_support_proxy_normal"
+
+
+def test_dense_repair_coheres_divergent_local_support_normals_instead_of_pinching_panel():
+    prod = _Prod()
+    source = _Source()
+    source._data["mesh"]["V"] = np.asarray([[0., 0., .00020], [1., 0., .00020], [0., 1., .00020]])
+    base = {"mesh": source.data("mesh")["V"].copy()}
+    collision = np.zeros((1, 3, 3), dtype=float)
+    support = np.full((1, 3, 3), 9.0, dtype=float)
+
+    def occupancy(points, triangles, k=48, exact_band=.002):
+        points = np.asarray(points, float)
+        nearest = points.copy()
+        if float(np.asarray(triangles)[0, 0, 0]) > 5.0:
+            normals = np.asarray([[0.45, 0., .893], [-0.45, 0., .893], [0., 0., 1.]])[:len(points)]
+            if len(normals) < len(points):
+                normals = np.tile([[0., 0., 1.]], (len(points), 1))
+            signed = np.full(len(points), .001)
+        else:
+            normals = np.tile([[0., 0., 1.]], (len(points), 1))
+            signed = np.full(len(points), -.001)
+        return nearest, normals, signed, np.abs(signed), np.zeros(len(points), dtype=np.int64)
+
+    prod._nearest_literal_occupancy = occupancy
+    solved, _ = guard._dense_face_repair_pass(
+        prod, source, base, collision, support, margin=.00016, maximum_vertex_step=.003,
+    )
+    displacement = solved["mesh"] - base["mesh"]
+    assert float(np.ptp(displacement[:, 0])) < .0015
+    assert float(np.min(displacement[:, 2])) > 0.0
 
 
 def test_dense_finalizer_repairs_residual_body_poke_instead_of_rejecting():

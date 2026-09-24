@@ -12,17 +12,32 @@ _DENSE_BARY = np.asarray(
 def _target_surfaces(prod: Any, cache: dict[str, Any]) -> tuple[np.ndarray, np.ndarray] | None:
     collision_fn = getattr(prod, "_target_fit_collision_triangles", None)
     triangles_fn = getattr(prod, "_triangles_from_surface", None)
+    garment_support_fn = getattr(prod, "_garment_support_proxy", None)
     if not callable(collision_fn) or not callable(triangles_fn):
         return None
     collision = np.asarray(collision_fn(cache), dtype=np.float64)
-    support = cache.get("_ravafit_target_support_triangles")
+
+    # Final repair must use the same garment-support proxy as the close-fit solver. The raw
+    # target support surface is still body geometry and can retain local grooves/folds. Feeding
+    # its normals back into the final corrective pass can re-introduce exactly the anatomical
+    # embossing the earlier fit deliberately bridged (for example a crotch cleft in panties).
+    support = None
+    if callable(garment_support_fn):
+        try:
+            proxy = garment_support_fn(cache)
+            v = np.asarray((proxy or {}).get("V", []), dtype=np.float64)
+            f = np.asarray((proxy or {}).get("F", []), dtype=np.int64)
+            if v.ndim == 2 and v.shape[1:] == (3,) and f.ndim == 2 and f.shape[1:] == (3,) and len(v) and len(f):
+                support = triangles_fn(v, f)
+        except Exception:
+            support = None
     if support is None:
         v = np.asarray(cache.get("target_support_V", []), dtype=np.float64)
         f = np.asarray(cache.get("target_support_F", []), dtype=np.int64)
         if v.ndim != 2 or v.shape[1:] != (3,) or f.ndim != 2 or f.shape[1:] != (3,):
             return None
         support = triangles_fn(v, f)
-        cache["_ravafit_target_support_triangles"] = support
+
     support = np.asarray(support, dtype=np.float64)
     if collision.ndim != 3 or collision.shape[1:] != (3, 3) or not len(collision):
         return None
@@ -67,7 +82,7 @@ def _dense_penetration_report(prod: Any, source: Any, positions: dict[str, np.nd
         "penetrating_samples": int(total),
         "minimum_signed_mm": worst * 1000 if worst is not None else None,
         "meshes": rows,
-        "policy": "literal target anatomy is occupancy authority only; residual garment repair bridges local relief using the smooth target support field",
+        "policy": "literal target anatomy is occupancy authority only; residual garment repair bridges local relief using the garment-support proxy",
     }
 
 
@@ -119,11 +134,9 @@ def _dense_face_repair_pass(prod: Any, source: Any, positions: dict[str, np.ndar
                             target_support: np.ndarray, margin: float, maximum_vertex_step: float) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Bridge dense face-interior body penetration without embossing literal anatomy.
 
-    The literal selected body answers only whether garment surface is occupied. It never supplies
-    the correction shape. Penetrating faces are grouped into connected patches and translated along
-    the smooth target-support normal field by the deepest required clearance in that patch. This is
-    intentionally different from projecting each witness onto the literal body: doing that imprints
-    nipples, genital folds, grooves and other local anatomy into close clothing.
+    Literal target anatomy answers only whether garment surface is occupied. Correction direction
+    comes from the garment-support proxy, and normals are coherently blended across each connected
+    penetrating garment patch so a local body groove cannot pull neighbouring cloth into a crease.
     """
     occupancy = getattr(prod, "_nearest_literal_occupancy", None)
     if not callable(occupancy):
@@ -168,8 +181,6 @@ def _dense_face_repair_pass(prod: Any, source: Any, positions: dict[str, np.ndar
             component_vertices = np.unique(faces[component].reshape(-1))
             points = vertices[component_vertices]
 
-            # The support proxy is the garment-shaping authority. Its local normal follows target
-            # macro anatomy while bridging high-frequency literal details that fabric should not trace.
             _, support_normals, _, _, _ = occupancy(points, target_support, k=48, exact_band=.006)
             support_normals = _normalise_rows(np.asarray(support_normals, dtype=np.float64))
             _, literal_normals, _, _, _ = occupancy(points, target_collision, k=48, exact_band=.006)
@@ -177,8 +188,17 @@ def _dense_face_repair_pass(prod: Any, source: Any, positions: dict[str, np.ndar
             flip = np.einsum("ij,ij->i", support_normals, literal_normals) < 0.0
             support_normals[flip] *= -1.0
 
-            # If a support normal is numerically unusable, fall back to the fitted garment patch
-            # normal, oriented outward by the literal body. This still avoids literal micro-relief.
+            # Coherently bridge the penetrating panel. A local anatomical cleft may change the
+            # raw support normal sharply over only a handful of vertices; following that field
+            # independently recreates the cleft in the garment. Blend toward the connected patch
+            # direction while retaining enough local curvature to follow broad body silhouette.
+            patch_normal = np.mean(support_normals, axis=0)
+            patch_length = float(np.linalg.norm(patch_normal))
+            if patch_length > 1e-12:
+                patch_normal /= patch_length
+                coherent = .30 * support_normals + .70 * patch_normal[None, :]
+                support_normals = _normalise_rows(coherent)
+
             bad_normal = np.linalg.norm(support_normals, axis=1) < .5
             if np.any(bad_normal):
                 tris = vertices[faces[component]]
@@ -213,9 +233,9 @@ def _dense_face_repair_pass(prod: Any, source: Any, positions: dict[str, np.ndar
         "connected_relief_patches": int(patch_count),
         "worst_signed_before_mm": worst_before * 1000 if worst_before is not None else None,
         "maximum_vertex_step_mm": float(maximum_vertex_step * 1000),
-        "repair_direction": "smooth_target_support_normal",
+        "repair_direction": "coherent_garment_support_proxy_normal",
         "literal_surface_used_for_detection_only": True,
-        "policy": "bridge target micro-relief as connected cloth patches; never project garment vertices onto literal anatomical relief",
+        "policy": "bridge target micro-relief as coherent connected cloth patches; never project garment vertices or per-vertex correction normals onto literal anatomical relief",
     }
 
 
@@ -315,7 +335,8 @@ def install_dense_final_target_occupancy(prod: Any) -> None:
             "initial_validation": initial_validation,
             "repair": repair_report,
             "validation": repair_report.get("validation", initial_validation),
-            "policy": "repair literal target occupancy using smooth garment-support shape; literal anatomy detects penetration but never imprints its local relief into cloth",
+            "support_authority": "garment_support_proxy_when_available",
+            "policy": "repair literal target occupancy using coherent garment-support shape; literal anatomy detects penetration but never supplies garment shape or local correction normals",
         }
         return candidate, skinning_out, records_out, merged
 
