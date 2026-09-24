@@ -9,7 +9,7 @@ class _Prod:
     pass
 
 
-def _install_fake_coupled_prod(source_distance=.001, contact_shift=(0., 0., 0.)):
+def _install_fake_coupled_prod(source_distance=.001, contact_shift=(0., 0., 0.), per_vertex_contact_shift=None):
     prod = _Prod()
     contact_shift = np.asarray(contact_shift, dtype=np.float64)
 
@@ -19,6 +19,11 @@ def _install_fake_coupled_prod(source_distance=.001, contact_shift=(0., 0., 0.))
     def support_frame(source, cache):
         count = len(source)
         contact = np.asarray(source, dtype=np.float64) + np.asarray([0., 0., 1.]) + contact_shift
+        if per_vertex_contact_shift is not None:
+            local = np.asarray(per_vertex_contact_shift, dtype=np.float64)
+            if local.shape != contact.shape:
+                raise ValueError("per_vertex_contact_shift shape mismatch")
+            contact = contact + local
         normal = np.tile(np.asarray([[0., 0., 1.]]), (count, 1))
         distance = np.full(count, source_distance)
         return contact, normal, distance, np.zeros(count, dtype=np.int64)
@@ -57,7 +62,7 @@ def test_close_constructed_relief_still_uses_macro_support_only():
     result, report = prod._apply_target_relief_correction(
         mapped, np.zeros((0, 3), dtype=np.int64), mapped,
         np.ones((1, 1)), np.zeros((1, 1), dtype=np.int64), {},
-        "constructed_close_shell", {"source_clearance_median_mm": 3.0},
+        "constructed_close_shell", {"source_clearance_median_mm": 12.0},
     )
     np.testing.assert_array_equal(result, mapped)
     assert report["enabled"] is False
@@ -115,8 +120,6 @@ def test_close_shell_follows_target_frame_tangentially_without_destroying_local_
         solved[0] - solved[2],
     ])
     assert "cup" in changed
-    # Ten millimetres of paired target-frame translation should be followed to within
-    # the deliberate 0.15 mm numerical tolerance.
     shift = np.mean(solved - current, axis=0)
     assert 0.00980 < float(shift[0]) < 0.01001
     assert abs(float(shift[1])) < 1e-10
@@ -156,18 +159,46 @@ def test_literal_floor_prevents_copying_an_unsafe_tiny_source_gap():
     assert report["source_authored_close_fit"]["meshes"][0]["clearance_floor_mm"] == .7
 
 
-def test_body_following_layer_uses_same_full_target_frame_rule():
-    prod = _install_fake_coupled_prod(source_distance=.002)
-    context = _context("body_following_flexible_layer", 2.0)
-    current = np.asarray(context["data"]["V"]).copy()
-    current[:, 2] = 1.007
+def test_body_following_layer_uses_macro_target_frame_without_local_pinching():
+    local_relief = np.asarray([
+        [0., 0., 0.],
+        [0., 0., .006],
+        [0., 0., 0.],
+    ])
+    prod = _install_fake_coupled_prod(source_distance=.001, per_vertex_contact_shift=local_relief)
+    context = _context("body_following_flexible_layer", 1.0)
+    source = np.asarray(context["data"]["V"]).copy()
+    current = source + np.asarray([0., 0., 1.001])
 
-    result, changed, _ = prod._coupled_target_clearance_guard(
-        {"stocking": current}, {"stocking": context}, {}, margin=.00065, enforce_support=False,
+    result, changed, report = prod._coupled_target_clearance_guard(
+        {"panty": current}, {"panty": context}, {}, margin=.00065, enforce_support=False,
     )
 
-    assert "stocking" in changed
-    assert float(np.max(result["stocking"][:, 2])) < 1.0023
+    assert "panty" in changed
+    displacement = result["panty"][:, 2] - current[:, 2]
+    # A six-millimetre point-like target relief must be bridged as a panel movement,
+    # not copied into one garment vertex as an anatomical crease.
+    assert float(np.ptp(displacement)) < .00035
+    assert float(np.max(displacement)) < .0025
+    fit = report["source_authored_close_fit"]["meshes"][0]
+    assert fit["rejected_local_relief_p95_mm"] > 2.0
+
+
+def test_constructed_shell_with_large_authored_standoff_still_follows_target_macro_frame():
+    prod = _install_fake_coupled_prod(source_distance=.012, contact_shift=(.010, 0., 0.))
+    context = _context("constructed_close_shell", 12.0)
+    source = np.asarray(context["data"]["V"]).copy()
+    current = source + np.asarray([0., 0., 1.012])
+
+    result, changed, report = prod._coupled_target_clearance_guard(
+        {"cup": current}, {"cup": context}, {}, margin=.00065, enforce_support=True,
+    )
+
+    assert "cup" in changed
+    shift = np.mean(result["cup"] - current, axis=0)
+    assert float(shift[0]) > .0097
+    fit = report["source_authored_close_fit"]["meshes"][0]
+    assert fit["source_clearance_mesh_p50_mm"] == 12.0
 
 
 def test_stand_off_structure_is_never_shrink_wrapped_by_late_guard():
@@ -183,17 +214,3 @@ def test_stand_off_structure_is_never_shrink_wrapped_by_late_guard():
     np.testing.assert_array_equal(result["bow"], current)
     assert "bow" not in changed
     assert report["source_authored_close_fit"]["adjusted_mesh_count"] == 0
-
-
-def test_close_component_above_clearance_classification_threshold_is_left_alone():
-    prod = _install_fake_coupled_prod(source_distance=.001, contact_shift=(.010, 0., 0.))
-    context = _context("constructed_close_shell", 12.0)
-    current = np.asarray(context["data"]["V"]).copy()
-    current[:, 2] = 1.020
-
-    result, changed, _ = prod._coupled_target_clearance_guard(
-        {"structured": current}, {"structured": context}, {}, margin=.00065, enforce_support=True,
-    )
-
-    np.testing.assert_array_equal(result["structured"], current)
-    assert "structured" not in changed
