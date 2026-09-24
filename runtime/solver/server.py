@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# SolverHost is launched with Python -I in production. Isolated mode deliberately
+# does not prepend the script directory to sys.path, so establish our own trusted
+# local module root before importing sibling runtime modules.
+SOLVER_TOOLS = Path(__file__).resolve().parent
+_solver_tools = str(SOLVER_TOOLS)
+if _solver_tools not in sys.path:
+    sys.path.insert(0, _solver_tools)
 
 import server_core as _server
 from core_fit_entrypoint import install_core_fit_entrypoint
