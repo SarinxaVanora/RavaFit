@@ -6,6 +6,7 @@ import numpy as np
 HERE=Path(__file__).resolve().parent
 if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
 import production_b14 as prod
+import core_fit_authority
 import target_fit_authority as target_fit
 import body_skin_delta_guard
 import adaptive_skinning
@@ -41,7 +42,9 @@ def main()->int:
             value=(payload.get('stats') or {}).get('local_affine_quality_rms_mm')
             if local_rms is None and value is not None:local_rms=float(value)
             worker_reports.append({'mesh':name,'worker_sec':payload.get('elapsed_sec'),'pid':payload.get('pid')})
-        source=SerializedMultiGarmentSource(common['source_js'],meshes);cache=common['cache']
+        source=SerializedMultiGarmentSource(common['source_js'],meshes);cache=dict(common['cache'])
+        core_report=core_fit_authority.prepare_cache(prod,cache)
+        core_fit_authority.install_runtime_authority(prod)
         target_fit.install_close_shell_macro_authority(prod)
         body_skin_delta_guard.install_complete_body_delta_visibility(prod)
         capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
@@ -54,6 +57,7 @@ def main()->int:
             _A,quality,_tree=prod.precompute_body_local_affines(cache['X'],cache['Y'],cache['BW']);local_rms=float(np.sqrt(np.mean(np.asarray(quality,float)**2))*1000.0)
         positions,skinning,records,stats=prod._finalize_garment_solution(source,cache,positions,skinning,records,float(local_rms),_assembly_in_process=True)
         stats['source_influence_capacity_registry']=capacity_report
+        stats['core_fit_authority']=core_report
         stats['garment_mesh_workers']={'enabled':True,'mode':'one-clean-multimesh-worker+fresh-finalizer','mesh_count':len(rows),'workers':worker_reports,'finalizer_pid':__import__('os').getpid(),'pipeline_wall_sec':time.perf_counter()-started}
         output_path.parent.mkdir(parents=True,exist_ok=True)
         with output_path.open('wb') as f:pickle.dump({'positions':positions,'skinning':skinning,'records':records,'stats':stats},f,protocol=pickle.HIGHEST_PROTOCOL)
