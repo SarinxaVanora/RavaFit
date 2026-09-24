@@ -36,3 +36,7 @@ jobs:
       - name: Run motion-skinning, target-fit, core-fit entrypoint and final-occupancy regressions
         working-directory: runtime/solver
         run: python -m pytest -q test_adaptive_skinning.py test_local_support_preserve.py test_target_fit_authority.py test_core_fit_authority.py test_core_fit_entrypoint.py test_final_occupancy_guard.py
+
+      - name: Verify isolated SolverHost bootstrap
+        working-directory: runtime/solver
+        run: python -I server.py </dev/null
