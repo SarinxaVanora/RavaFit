@@ -7,6 +7,7 @@ HERE=Path(__file__).resolve().parent
 if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
 import production_b14 as prod
 import target_fit_authority as target_fit
+import body_skin_delta_guard
 import adaptive_skinning
 
 
@@ -24,12 +25,19 @@ class SerializedGarmentSource:
         return self._data
 
 
+def _install_authorities(cache:dict,source)->dict:
+    # Delta visibility must wrap production before adaptive_skinning captures its helper.
+    target_fit.install_close_shell_macro_authority(prod)
+    body_skin_delta_guard.install_complete_body_delta_visibility(prod)
+    adaptive_skinning.install_adaptive_body_skinning(prod)
+    return adaptive_skinning.register_source_influence_capacities(cache,source)
+
+
 def _solve_one(common:dict, mesh:dict, output_path:Path, report_path:Path, shared_cache:dict|None=None, reset_runtime:bool=True)->dict:
     started=time.perf_counter();mesh_name=str(mesh['name'])
     source=SerializedGarmentSource(common['source_js'],mesh_name,mesh['data'])
     cache=shared_cache if shared_cache is not None else dict(common['cache'])
-    capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
-    target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
+    capacity_report=_install_authorities(cache,source)
     if reset_runtime:
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
@@ -58,8 +66,7 @@ def _batch_main()->int:
             name=str(mesh['name']);ordered.append(name);meshes[name]=mesh['data']
         source=SerializedMultiGarmentSource(common['source_js'],meshes)
         cache=dict(common['cache'])
-        capacity_report=adaptive_skinning.register_source_influence_capacities(cache,source)
-        target_fit.install_close_shell_macro_authority(prod);adaptive_skinning.install_adaptive_body_skinning(prod)
+        capacity_report=_install_authorities(cache,source)
         for key in ('_ravafit_local_affines','_ravafit_source_support_triangles','_ravafit_target_support_triangles','_ravafit_target_collision_triangles'):
             cache.pop(key,None)
         prod._reset_b14_runtime_caches();prod._set_surface_query_cache_enabled(True)

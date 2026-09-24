@@ -15,20 +15,19 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from cloth_clearance_envelope import clearance_envelope, accept_envelope_step
+except Exception:  # pragma: no cover - production runtime always carries this module.
+    clearance_envelope = None
+    accept_envelope_step = None
+
 
 def _close_authority(source_distance: np.ndarray, behavior: str) -> np.ndarray:
-    """Per-vertex target-frame authority derived from authored support, not mesh medians.
-
-    Flexible body-following cloth should track only genuinely close support. Constructed
-    close shells are different: cups, padded panels and other authored-volume structures
-    can stand well away from the source skin while still being completely body-supported.
-    Their standoff is construction, not evidence that target fitting should be skipped.
-    """
+    """Per-vertex target-frame authority derived from authored support, not mesh medians."""
     distance = np.asarray(source_distance, dtype=np.float64)
     behaviour = str(behavior or "").casefold()
     if behaviour == "constructed_close_shell":
-        # Keep full macro target authority through normal constructed-shell standoff, then
-        # fade only for geometry that is genuinely remote from the body support surface.
+        # Structured cups/panels remain target-supported through normal authored volume.
         lo, hi = .018, .040
     else:
         lo, hi = .006, .018
@@ -61,16 +60,36 @@ def _smooth_tangent_field(values: np.ndarray, faces: np.ndarray, iterations: int
     return current
 
 
+def _vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    normals = np.zeros_like(vertices)
+    if not len(faces):
+        return normals
+    area = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]], vertices[faces[:, 2]] - vertices[faces[:, 0]])
+    for corner in range(3):
+        np.add.at(normals, faces[:, corner], area)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    return normals
+
+
+def _close_behaviour(context: dict[str, Any]) -> str | None:
+    behaviour = str(context.get("behavior") or "").casefold()
+    effective = str(context.get("effective_behavior") or behaviour).casefold()
+    close = {"constructed_close_shell", "body_following_flexible_layer"}
+    if behaviour in close:
+        return behaviour
+    if effective in close:
+        return effective
+    return None
+
+
 def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarray], contexts: dict[str, dict[str, Any]], cache: dict[str, Any], margin: float) -> tuple[dict[str, np.ndarray], set[str], dict[str, Any]]:
-    """Align close cloth to the full paired target support frame.
+    """Align close cloth to the paired *smooth* target support frame.
 
-    Constructed close shells follow the complete target macro frame even when their authored
-    surface stands away from the source body; that standoff is retained as garment construction.
-
-    Flexible body-following cloth is treated differently. Its target-frame displacement is
-    low-pass filtered over the garment panel before application so local anatomical relief cannot
-    pinch the cloth into grooves or folds. This preserves broad target changes (waist, hips, legs,
-    butt, abdomen) while bridging high-frequency anatomy such as genital relief.
+    Flexible cloth receives only a low-frequency displacement field, so source-authored
+    bridging over local anatomical relief survives a body change. Constructed shells keep
+    their local form while following the target macro frame.
     """
     support_frame = getattr(prod, "_coupled_support_frame", None)
     topology_guard = getattr(prod, "_coupled_topology_safe_alpha", None)
@@ -86,15 +105,12 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
     for name, context in contexts.items():
         if name not in out:
             continue
-        behaviour = str(context.get("behavior") or "").casefold()
-        effective = str(context.get("effective_behavior") or behaviour).casefold()
-        features = context.get("features") or {}
-        median_clearance_mm = float(features.get("source_clearance_median_mm", 999.0))
-        close = {"constructed_close_shell", "body_following_flexible_layer"}
-        base_behaviour = behaviour if behaviour in close else effective
-        if behaviour not in close and effective not in close:
+        base_behaviour = _close_behaviour(context)
+        if base_behaviour is None:
             continue
 
+        features = context.get("features") or {}
+        median_clearance_mm = float(features.get("source_clearance_median_mm", 999.0))
         data = context.get("data") or {}
         source = np.asarray(data.get("V", []), dtype=np.float64)
         faces = np.asarray(data.get("F", []), dtype=np.int64)
@@ -116,28 +132,21 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         finite = np.isfinite(source_distance) & np.all(np.isfinite(contact), axis=1) & np.all(np.isfinite(normal), axis=1)
         authority = _close_authority(source_distance, base_behaviour)
         authority[~finite] = 0.0
-        # Preserve the exact authored body standoff where possible. The upper clamp exists only
-        # to reject pathological correspondence; it is deliberately much larger than a cup's
-        # normal authored volume.
         desired_distance = np.clip(source_distance, clearance_floor, .045)
         ideal = contact + normal * desired_distance[:, None]
         error = ideal - current
 
         if base_behaviour == "body_following_flexible_layer":
-            # Flexible cloth must follow the target's *macro* displacement field, not individual
-            # target-body relief. Smooth the complete target-frame move over garment topology.
-            # Because only the displacement is filtered, source-authored garment shape and seams
-            # are not themselves smoothed or shrink-wrapped.
+            # This is the key anti-embossing rule: move the panel with the target's
+            # broad support field, never with individual anatomical peaks/grooves.
             move = _smooth_tangent_field(error, faces, iterations=12)
             relief_rejected = error - move
         else:
-            # Constructed shells retain their authored local form. Normal displacement carries
-            # macro target volume/position; tangential displacement is low-pass filtered so the
-            # shell follows the target frame without flattening cup/panel curvature.
+            # Structured close shells keep source curvature/volume. Macro normal movement
+            # follows the target; tangential movement is filtered to avoid flattening cups.
             normal_scalar = np.einsum("ij,ij->i", error, normal)
             normal_move = normal_scalar[:, None] * normal
-            tangent_move = error - normal_move
-            tangent_move = _smooth_tangent_field(tangent_move, faces, iterations=5)
+            tangent_move = _smooth_tangent_field(error - normal_move, faces, iterations=5)
             move = normal_move + tangent_move
             relief_rejected = np.zeros_like(move)
 
@@ -208,12 +217,115 @@ def _fit_close_garment_to_target_frame(prod: Any, positions: dict[str, np.ndarra
         "enabled": True,
         "adjusted_mesh_count": int(len(changed)),
         "meshes": reports,
-        "policy": "constructed close shells follow the complete paired target macro frame regardless of normal authored standoff; flexible body-following cloth follows a topology-smoothed target displacement field that bridges local anatomical relief; literal body detail remains collision-only and final seam authority is untouched",
+        "policy": "paired smooth target support owns macro fit; source garment owns local authored shape; literal anatomy is never a garment-shaping target",
+    }
+
+
+def _shape_preserving_literal_clearance(prod: Any, before: dict[str, np.ndarray], literal: dict[str, np.ndarray], contexts: dict[str, dict[str, Any]], cache: dict[str, Any]) -> tuple[dict[str, np.ndarray], set[str], dict[str, Any]]:
+    """Convert literal-body collision repairs into outward cloth envelopes.
+
+    The production collision solver may legitimately detect that a vertex must move, but its
+    raw per-vertex displacement is not allowed to become a new anatomical surface sample. For
+    close garments we retain only the outward requirement, spread it across connected cloth,
+    and explicitly reject inward/tangential micro-relief. This is what prevents a target-body
+    cleft, nipple or fold from being embossed into otherwise smooth source-authored cloth.
+    """
+    out = {name: np.asarray(value, dtype=np.float64).copy() for name, value in literal.items()}
+    changed: set[str] = set()
+    reports: list[dict[str, Any]] = []
+    support_frame = getattr(prod, "_coupled_support_frame", None)
+
+    if not callable(clearance_envelope) or not callable(accept_envelope_step):
+        return out, changed, {"enabled": False, "reason": "cloth clearance envelope unavailable"}
+
+    for name, context in contexts.items():
+        if name not in before or name not in out:
+            continue
+        behaviour = _close_behaviour(context)
+        if behaviour is None:
+            continue
+        base = np.asarray(before[name], dtype=np.float64)
+        raw = np.asarray(out[name], dtype=np.float64)
+        if base.shape != raw.shape or base.ndim != 2 or base.shape[1:] != (3,):
+            continue
+        data = context.get("data") or {}
+        source = np.asarray(data.get("V", []), dtype=np.float64)
+        faces = np.asarray(data.get("F", []), dtype=np.int64)
+        if source.shape != base.shape or faces.ndim != 2 or faces.shape[1:] != (3,) or not len(faces):
+            continue
+
+        delta = raw - base
+        raw_length = np.linalg.norm(delta, axis=1)
+        if not np.any(raw_length > 1e-9):
+            continue
+
+        normals = _vertex_normals(base, faces)
+        if callable(support_frame):
+            try:
+                frame = support_frame(source, cache)
+                if frame is not None:
+                    support_normal = np.asarray(frame[1], dtype=np.float64)
+                    support_normal /= np.maximum(np.linalg.norm(support_normal, axis=1, keepdims=True), 1e-12)
+                    if support_normal.shape == normals.shape:
+                        flip = np.einsum("ij,ij->i", normals, support_normal) < 0.0
+                        normals[flip] *= -1.0
+            except Exception:
+                pass
+
+        projection = np.einsum("ij,ij->i", delta, normals)
+        outward = np.maximum(projection, 0.0)
+        outward_delta = normals * outward[:, None]
+        rejected = delta - outward_delta
+
+        radius = .060 if behaviour == "body_following_flexible_layer" else .045
+        maximum = .012 if behaviour == "body_following_flexible_layer" else .010
+        envelope_delta, envelope_report = clearance_envelope(base, faces, outward_delta, radius_m=radius, maximum_move_m=maximum)
+
+        # Never reduce a collision solver's proven outward requirement at a contact seed.
+        envelope_projection = np.einsum("ij,ij->i", envelope_delta, normals)
+        deficit = np.maximum(outward - envelope_projection, 0.0)
+        envelope_delta = envelope_delta + normals * deficit[:, None]
+
+        proposed, topology_report = accept_envelope_step(base, faces, base + envelope_delta)
+        moved = np.linalg.norm(proposed - base, axis=1)
+        out[name] = proposed
+        if np.any(moved > 1e-9):
+            changed.add(name)
+        reports.append({
+            "mesh": name,
+            "behavior": behaviour,
+            "raw_collision_vertices": int(np.count_nonzero(raw_length > 1e-9)),
+            "raw_move_p95_mm": float(np.percentile(raw_length, 95) * 1000.0),
+            "outward_seed_vertices": int(np.count_nonzero(outward > 1e-9)),
+            "rejected_non_outward_p95_mm": float(np.percentile(np.linalg.norm(rejected, axis=1), 95) * 1000.0),
+            "enveloped_move_p95_mm": float(np.percentile(moved, 95) * 1000.0),
+            "envelope": envelope_report,
+            "topology": topology_report,
+        })
+
+    # Every coupled clearance call is followed by a seam/attachment projection. This turns
+    # authored joins into a continuing invariant instead of repairing them and then allowing
+    # the next collision pass to split them again.
+    seam_report: dict[str, Any] = {"enabled": False, "reason": "authored weld seam projector unavailable"}
+    preserve_welds = getattr(prod, "_preserve_authored_weld_splits", None)
+    if callable(preserve_welds):
+        try:
+            projected, seam_changed, seam_report = preserve_welds(out, contexts)
+            out = {name: np.asarray(value, dtype=np.float64) for name, value in projected.items()}
+            changed.update(str(name) for name in seam_changed)
+        except Exception as ex:
+            seam_report = {"enabled": False, "reason": f"authored weld seam projection failed: {type(ex).__name__}: {ex}"}
+
+    return out, changed, {
+        "enabled": True,
+        "meshes": reports,
+        "seams": seam_report,
+        "policy": "literal body supplies occupancy only; close-garment collision is outward-only and spread over connected cloth before authored seams are re-projected",
     }
 
 
 def install_close_shell_macro_authority(prod: Any) -> None:
-    """Install close-garment relief and full target-frame authority."""
+    """Install source-shape authority for close garments."""
     if getattr(prod, "_ravafit_close_shell_macro_authority_installed", False):
         return
 
@@ -225,7 +337,7 @@ def install_close_shell_macro_authority(prod: Any) -> None:
             if behaviour == "constructed_close_shell":
                 return np.asarray(mapped, dtype=np.float64), {
                     "enabled": False,
-                    "reason": "constructed close cloth uses paired smooth target macro support at any normal authored cup/panel standoff; literal target detail remains collision authority",
+                    "reason": "constructed close cloth keeps source local form and uses paired smooth macro support; literal target detail remains occupancy-only",
                     "source_clearance_median_mm": clearance_mm,
                 }
             return relief_original(source_vertices, faces, mapped, blend, blend_ids, cache, behavior, features)
@@ -235,11 +347,13 @@ def install_close_shell_macro_authority(prod: Any) -> None:
     if callable(clearance_original):
         def clearance_guard(positions, contexts, cache, margin=.00065, enforce_support=True):
             fitted, fitted_meshes, fitted_report = _fit_close_garment_to_target_frame(prod, positions, contexts, cache, float(margin))
-            result, changed, report = clearance_original(fitted, contexts, cache, margin=margin, enforce_support=enforce_support)
-            changed = set(changed) | set(fitted_meshes)
+            literal, changed, report = clearance_original(fitted, contexts, cache, margin=margin, enforce_support=enforce_support)
+            shaped, shaped_meshes, shaped_report = _shape_preserving_literal_clearance(prod, fitted, literal, contexts, cache)
+            changed = set(changed) | set(fitted_meshes) | set(shaped_meshes)
             merged = dict(report or {})
             merged["source_authored_close_fit"] = fitted_report
-            return result, changed, merged
+            merged["shape_preserving_literal_clearance"] = shaped_report
+            return shaped, changed, merged
         prod._coupled_target_clearance_guard = clearance_guard
 
     prod._ravafit_close_shell_macro_authority_installed = True
