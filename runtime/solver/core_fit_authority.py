@@ -60,6 +60,21 @@ def _macro_from_combined_cache(cache: dict[str, Any]) -> tuple[np.ndarray, np.nd
     return macro, normals, {"enabled": True, "mode": "slot_pairs", "slots": reports}
 
 
+def _macro_support_surface(cache: dict[str, Any]) -> dict[str, Any]:
+    source = np.asarray(cache.get("source_support_V", []), dtype=np.float64)
+    target = np.asarray(cache.get("target_support_V", []), dtype=np.float64)
+    source_faces = np.asarray(cache.get("source_support_F", []), dtype=np.int64)
+    target_faces = np.asarray(cache.get("target_support_F", []), dtype=np.int64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1:] != (3,) or len(source) < 3:
+        return {"enabled": False, "reason": "paired support surfaces do not share a vertex domain"}
+    if source_faces.shape != target_faces.shape or source_faces.ndim != 2 or source_faces.shape[1:] != (3,) or not len(source_faces) or not np.array_equal(source_faces, target_faces):
+        return {"enabled": False, "reason": "paired support surfaces do not share topology"}
+    macro, _, report = macro_body_correspondence(source, target, source_faces, radius_m=.032)
+    cache["_ravafit_literal_target_support_V"] = target.copy()
+    cache["target_support_V"] = macro
+    return {"enabled": True, **report}
+
+
 def _recalibrate_target_weight_correspondence(prod: Any, cache: dict[str, Any], literal_correspondence: np.ndarray) -> dict[str, Any]:
     sampler = getattr(prod, "_target_skin_weights_at_points", None)
     BW = np.asarray(cache.get("BW", []), dtype=np.float64)
@@ -93,12 +108,12 @@ def _recalibrate_target_weight_correspondence(prod: Any, cache: dict[str, Any], 
 
 def prepare_cache(prod: Any, cache: dict[str, Any]) -> dict[str, Any]:
     """Install the actual fitting hierarchy into an already-built production body cache."""
-    if cache.get("_ravafit_core_fit_cache_revision") == 1:
+    if cache.get("_ravafit_core_fit_cache_revision") == 2:
         return dict(cache.get("_ravafit_core_fit_report") or {})
 
     X = np.asarray(cache.get("X", []), dtype=np.float64)
     literal = np.asarray(cache.get("Y", []), dtype=np.float64).copy()
-    report: dict[str, Any] = {"enabled": False, "revision": 1}
+    report: dict[str, Any] = {"enabled": False, "revision": 2}
     macro_result = _macro_from_combined_cache(cache)
     if macro_result is None:
         report["reason"] = "body cache has no source-topology correspondence suitable for macro filtering"
@@ -113,11 +128,16 @@ def prepare_cache(prod: Any, cache: dict[str, Any]) -> dict[str, Any]:
                 cache["target_relief_C"] = np.zeros_like(correction)
             report.update({"enabled": True, "macro_body": macro_report})
 
+    report["macro_support_surface"] = _macro_support_surface(cache)
     skin_report = _recalibrate_target_weight_correspondence(prod, cache, literal) if literal.shape == X.shape else {"enabled": False, "reason": "literal paired body positions unavailable"}
     report["target_skin_field"] = skin_report
-    cache["_ravafit_core_fit_cache_revision"] = 1
+    cache["_ravafit_core_fit_cache_revision"] = 2
     cache["_ravafit_core_fit_report"] = report
-    for key in ("_ravafit_local_affines", "_ravafit_source_support_triangles", "_ravafit_target_support_triangles", "_ravafit_target_collision_triangles"):
+    for key in (
+        "_ravafit_local_affines", "_ravafit_source_support_triangles", "_ravafit_target_support_triangles",
+        "_ravafit_target_collision_triangles", "_ravafit_garment_support_proxy",
+        "_ravafit_structural_source_support_triangles", "_ravafit_structural_target_support_triangles",
+    ):
         cache.pop(key, None)
     return report
 
