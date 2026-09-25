@@ -38,6 +38,8 @@ def test_single_mesh_direct_entrypoint_prepares_core_fit_before_solver(monkeypat
     assert result[3]["source_influence_capacity_registry"]["registered"] == 1
 
 
+# Regression for the real Duskwing route: same-race RBODY conversions dispatch through strict B14,
+# so authority applied only to _solve_garment_meshes is a no-op for this case.
 def test_strict_b14_entrypoint_cannot_bypass_core_authority(monkeypatch):
     calls = []
 
