@@ -5,6 +5,7 @@ import numpy as np
 
 import core_fit_authority
 import final_occupancy_guard
+from source_standoff_authority import authored_clearance_floor
 
 _STRICT_MARGIN_M = .00035
 _STANDOFF_FLOOR_M = .00055
