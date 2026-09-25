@@ -100,8 +100,23 @@ def _shell_raw_components(prod: Any, data: dict[str, Any], source_triangles: np.
     return labels[raw_to_weld], {int(k): str(v) for k, v in classes.items()}
 
 
+def _component_local_faces(faces: np.ndarray, ids: np.ndarray, vertex_count: int) -> np.ndarray:
+    ids = np.asarray(ids, dtype=np.int64)
+    faces = np.asarray(faces, dtype=np.int64)
+    lookup = np.full(int(vertex_count), -1, dtype=np.int64)
+    lookup[ids] = np.arange(len(ids), dtype=np.int64)
+    mask = np.all(lookup[faces] >= 0, axis=1)
+    return lookup[faces[mask]]
+
+
 def enforce_source_standoff(prod: Any, source: Any, cache: dict[str, Any], positions: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Restore source-authored cloth/body spacing against strict B14's macro target frame."""
+    """Restore only source-proven body-supported garment spacing against the macro target frame.
+
+    Far straps, collars, skirts and other non-body-supported vertices must never inherit their raw
+    nearest-body distance as a clearance target. Close cloth does retain its authored spacing, and
+    the correction is applied in small topology-safe component-local steps so one difficult vertex
+    cannot veto an otherwise valid garment-wide standoff correction.
+    """
     nearest = getattr(prod, "_b14_nearest_surface", None)
     safe = getattr(prod, "_coupled_topology_safe_alpha", None)
     if not callable(nearest):
@@ -113,25 +128,27 @@ def enforce_source_standoff(prod: Any, source: Any, cache: dict[str, Any], posit
     target_f = np.asarray(cache.get("_ravafit_strict_target_surface_F", []), dtype=np.int64)
     if not len(source_v) or not len(source_f) or not len(target_v) or not len(target_f):
         raise ValueError("Strict B14 standoff authority could not resolve macro source/target support surfaces.")
+
     source_tri = _triangles(prod, source_v, source_f)
     target_tri = _triangles(prod, target_v, target_f)
-
     out = {name: np.asarray(value, dtype=np.float64).copy() for name, value in positions.items()}
     reports: list[dict[str, Any]] = []
     total_moved = 0
     maximum_move = 0.0
-    maximum_shortfall = 0.0
+    maximum_requested = 0.0
+    maximum_remaining = 0.0
 
     for name in sorted(out):
         data = source.data(name)
         source_vertices = np.asarray(data.get("V", []), dtype=np.float64)
         faces = np.asarray(data.get("F", []), dtype=np.int64)
-        before = out[name].copy()
-        if source_vertices.shape != before.shape or not len(faces):
+        before_mesh = out[name].copy()
+        if source_vertices.shape != before_mesh.shape or not len(faces):
             continue
+
         raw_components, classes = _shell_raw_components(prod, data, source_tri)
-        proposal = before.copy()
-        component_reports = []
+        candidate = before_mesh.copy()
+        component_reports: list[dict[str, Any]] = []
 
         for component in sorted(set(int(value) for value in raw_components.tolist())):
             if str(classes.get(component, "shell")).casefold() != "shell":
@@ -146,44 +163,75 @@ def enforce_source_standoff(prod: Any, source: Any, cache: dict[str, Any], posit
             finite = source_distance[np.isfinite(source_distance)]
             if not len(finite):
                 continue
+
             median = float(np.median(finite))
-            if median > .030:
-                component_reports.append({"component": component, "vertices": int(len(ids)), "skipped": "source component is not body-supported", "source_clearance_median_mm": median * 1000.0})
+            # One connected shell can contain close cups plus a collar tens of millimetres away.
+            # Classify support per vertex; only source-proven close body-supported vertices inherit
+            # their authored body spacing.
+            support_limit = float(np.clip(max(.0040, median * 4.0), .0040, .0120))
+            source_valid = np.isfinite(source_distance) & (source_signed >= -1e-5) & (source_distance <= support_limit)
+            supported = int(np.count_nonzero(source_valid))
+            minimum_supported = max(12, int(np.ceil(len(ids) * .02)))
+            if supported < minimum_supported:
+                component_reports.append({
+                    "component": component,
+                    "vertices": int(len(ids)),
+                    "supported_vertices": supported,
+                    "skipped": "too little source-proven close body support",
+                    "source_clearance_median_mm": median * 1000.0,
+                    "support_limit_mm": support_limit * 1000.0,
+                })
                 continue
 
-            robust_cap = float(np.clip(np.percentile(finite, 97) + .0010, .0020, .0300))
+            valid_distance = source_distance[source_valid]
+            robust_cap = float(np.clip(np.percentile(valid_distance, 99) + .00050, .0010, support_limit))
             desired = authored_clearance_floor(source_distance, _STANDOFF_FLOOR_M, robust_cap)
             desired = np.minimum(desired + _STANDOFF_PAD_M, robust_cap)
 
-            _, target_normals, target_signed, _, _ = nearest(before[ids], target_tri, k=32)
+            _, target_normals, target_signed, _, _ = nearest(candidate[ids], target_tri, k=32)
             target_normals = _normalise_rows(target_normals)
             target_signed = np.asarray(target_signed, dtype=np.float64)
-            # Only source vertices that were actually outside/at the source body participate in the
-            # standoff floor. Literal target occupancy still handles any inside/outside ambiguity.
-            source_valid = source_signed >= -1e-5
             deficit = np.where(source_valid, np.maximum(desired - target_signed, 0.0), 0.0)
-            step = np.minimum(deficit, .015)[:, None] * target_normals
-            proposal[ids] += step
+            maximum_requested = max(maximum_requested, float(np.max(deficit, initial=0.0)))
 
+            # Small bounded steps converge reliably and keep the topology guard local to the affected
+            # authored component instead of letting one difficult vertex veto the whole mesh.
+            requested_step = np.minimum(deficit, .00150)[:, None] * target_normals
+            local_before = candidate[ids].copy()
+            local_proposal = local_before + requested_step
+            topology = {"accepted_alpha": 1.0}
+            local_faces = _component_local_faces(faces, ids, len(source_vertices))
+            if callable(safe) and len(local_faces) and np.any(np.linalg.norm(requested_step, axis=1) > 1e-10):
+                local_candidate, alpha, _, _ = safe(source_vertices[ids], local_before, local_proposal, local_faces)
+                local_candidate = np.asarray(local_candidate, dtype=np.float64)
+                topology = {"accepted_alpha": float(alpha)}
+            else:
+                local_candidate = local_proposal
+            candidate[ids] = local_candidate
+
+            _, _, after_signed, _, _ = nearest(candidate[ids], target_tri, k=32)
+            after_signed = np.asarray(after_signed, dtype=np.float64)
+            remaining = np.where(source_valid, np.maximum(desired - after_signed, 0.0), 0.0)
+            maximum_remaining = max(maximum_remaining, float(np.max(remaining, initial=0.0)))
+            moved = np.linalg.norm(local_candidate - local_before, axis=1)
             component_reports.append({
                 "component": component,
                 "vertices": int(len(ids)),
-                "source_clearance_p05_mm": float(np.percentile(source_distance, 5) * 1000.0),
-                "source_clearance_median_mm": median * 1000.0,
-                "desired_clearance_p05_mm": float(np.percentile(desired, 5) * 1000.0),
-                "target_clearance_before_p05_mm": float(np.percentile(target_signed, 5) * 1000.0),
-                "required_move_p95_mm": float(np.percentile(np.linalg.norm(step, axis=1), 95) * 1000.0),
+                "supported_vertices": supported,
+                "support_limit_mm": support_limit * 1000.0,
+                "source_clearance_p05_mm": float(np.percentile(valid_distance, 5) * 1000.0),
+                "source_clearance_median_mm": float(np.median(valid_distance) * 1000.0),
+                "desired_clearance_p05_mm": float(np.percentile(desired[source_valid], 5) * 1000.0),
+                "target_clearance_before_p05_mm": float(np.percentile(target_signed[source_valid], 5) * 1000.0),
+                "requested_shortfall_p95_mm": float(np.percentile(deficit[source_valid], 95) * 1000.0),
+                "remaining_shortfall_p95_mm": float(np.percentile(remaining[source_valid], 95) * 1000.0),
+                "remaining_shortfall_max_mm": float(np.max(remaining, initial=0.0) * 1000.0),
+                "move_p95_mm": float(np.percentile(moved, 95) * 1000.0),
+                "topology": topology,
             })
-            maximum_shortfall = max(maximum_shortfall, float(np.max(deficit, initial=0.0)))
 
-        topology = {"accepted_alpha": 1.0}
-        candidate = proposal
-        if callable(safe) and np.any(np.linalg.norm(proposal - before, axis=1) > 1e-10):
-            candidate, alpha, _, _ = safe(source_vertices, before, proposal, faces)
-            candidate = np.asarray(candidate, dtype=np.float64)
-            topology = {"accepted_alpha": float(alpha)}
         out[name] = candidate
-        movement = np.linalg.norm(candidate - before, axis=1)
+        movement = np.linalg.norm(candidate - before_mesh, axis=1)
         moved = int(np.count_nonzero(movement > 1e-8))
         total_moved += moved
         maximum_move = max(maximum_move, float(np.max(movement, initial=0.0)))
@@ -192,7 +240,6 @@ def enforce_source_standoff(prod: Any, source: Any, cache: dict[str, Any], posit
             "moved_vertices": moved,
             "move_p95_mm": float(np.percentile(movement, 95) * 1000.0) if len(movement) else 0.0,
             "move_max_mm": float(np.max(movement, initial=0.0) * 1000.0),
-            "topology": topology,
             "components": component_reports,
         })
 
@@ -200,9 +247,10 @@ def enforce_source_standoff(prod: Any, source: Any, cache: dict[str, Any], posit
         "enabled": True,
         "moved_vertices": int(total_moved),
         "maximum_move_mm": float(maximum_move * 1000.0),
-        "maximum_requested_shortfall_mm": float(maximum_shortfall * 1000.0),
+        "maximum_requested_shortfall_mm": float(maximum_requested * 1000.0),
+        "maximum_remaining_shortfall_mm": float(maximum_remaining * 1000.0),
         "meshes": reports,
-        "policy": "source-authored body spacing is a minimum macro-frame standoff; target anatomy may only force additional outward clearance",
+        "policy": "only source-proven close body-supported cloth keeps authored macro-frame standoff; far straps/collars/skirt regions are excluded; corrections are small component-local topology-safe steps",
     }
 
 
@@ -257,14 +305,16 @@ def finalize_strict_solution(prod: Any, source: Any, cache: dict[str, Any], posi
             "final_validation": final_validation,
             "max_iteration_move_mm": float(max_delta * 1000.0),
         })
-        if int(final_validation.get("penetrating_samples", 0)) == 0 and max_delta <= .00001:
+        if int(final_validation.get("penetrating_samples", 0)) == 0 and float(standoff.get("maximum_remaining_shortfall_mm", 0.0)) <= .05 and max_delta <= .00001:
             converged = True
             break
 
     # A final dry-run of the standoff projection proves a seam repair has not silently collapsed the
     # authored body gap again.  We refuse to publish rather than choose between a split seam and clip.
     would_be, standoff_check = enforce_source_standoff(prod, source, cache, candidate)
-    standoff_residual = max((float(np.max(np.linalg.norm(would_be[name] - candidate[name], axis=1), initial=0.0)) for name in candidate), default=0.0)
+    projected_residual = max((float(np.max(np.linalg.norm(would_be[name] - candidate[name], axis=1), initial=0.0)) for name in candidate), default=0.0)
+    measured_residual = float(standoff_check.get("maximum_remaining_shortfall_mm", 0.0)) / 1000.0
+    standoff_residual = max(projected_residual, measured_residual)
     final_validation = final_occupancy_guard._dense_penetration_report(prod, source, candidate, target_collision, _STRICT_MARGIN_M)
     if int(final_validation.get("penetrating_samples", 0)):
         raise ValueError("Strict B14 final output still intersects the selected target body; RavaFit refused to publish it.")
