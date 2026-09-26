@@ -154,6 +154,34 @@ def aggregate_mesh_data(glb: Any, name: str) -> dict[str, Any]:
     }
 
 
+def scatter_domain_attribute(glb: Any, name: str, values: np.ndarray, semantic: str) -> dict[str, Any]:
+    """Scatter one aggregate solver attribute back to every authored glTF vertex domain."""
+    _, domains, primitives = mesh_domains(glb, name)
+    aggregate=np.asarray(values)
+    total=sum(domain.count for domain in domains)
+    if len(aggregate) != total:
+        raise ValueError(f'{name} aggregate {semantic} rows {len(aggregate)} != domain rows {total}.')
+    attr_name={
+        'POSITION':'position_accessor','NORMAL':'normal_accessor','TANGENT':'tangent_accessor','TEXCOORD_0':'uv_accessor',
+    }.get(semantic)
+    if attr_name is None:
+        raise ValueError(f'Unsupported scattered semantic {semantic!r}.')
+    written=set();rows=[]
+    for domain in domains:
+        accessor=getattr(domain,attr_name)
+        if accessor is None:
+            raise ValueError(f'{name} domain has no {semantic} accessor.')
+        section=aggregate[domain.start:domain.start+domain.count]
+        if accessor not in written:
+            glb.write_accessor(accessor,section)
+            written.add(accessor)
+            if semantic == 'POSITION':
+                glb.js['accessors'][accessor]['min']=np.asarray(section).min(axis=0).astype(float).tolist()
+                glb.js['accessors'][accessor]['max']=np.asarray(section).max(axis=0).astype(float).tolist()
+        rows.append({'start':int(domain.start),'vertices':int(domain.count),'primitives':[int(v) for v in domain.primitive_indices],'accessor':int(accessor)})
+    return {'primitive_count':len(primitives),'vertex_domain_count':len(domains),'domains':rows}
+
+
 class ProductionGLB(FrozenGLB):
     """Frozen-B14-compatible GLB reader that exposes every primitive of an XIV mesh."""
     def primitive(self,name):
