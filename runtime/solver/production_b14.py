@@ -72,6 +72,10 @@ from surface_relative_detail_layout import SurfaceRelativeDetailConfig, preserve
 from source_relative_structural_carriers import StructuralCarrierConfig, preserve_source_relative_structural_carriers
 from cloth_clearance_envelope import clearance_envelope, accept_envelope_step
 from body_visibility import covered_body_faces
+from multi_primitive_glb import ProductionGLB, mesh_domains, aggregate_mesh_data
+
+# Never let the production path inherit Frozen B14's first-primitive-only GLB view.
+GLB = ProductionGLB
 
 # B14 fits layers. RavaFit only discovers the layers, supplies the correct body correspondence, and preserves their authored relationships afterward.
 PRODUCTION_REVISION = "1.1.9-complete-rbody-fit-authority"
@@ -6645,33 +6649,66 @@ def _patch_positions_and_detach_body(source_path: Path, output_path: Path, posit
     ed = GLBEditor(source_path)
     body_mesh_indices = {mi for mi, mesh in enumerate(ed.js.get("meshes", [])) if mesh.get("name") in body_mesh_names}
     normal_rebuild={}
+    primitive_report={}
 
+    # Production must treat every glTF primitive belonging to one XIV mesh as a
+    # single authored mesh. Frozen B14's legacy GLB helpers expose primitives[0]
+    # only, which silently discarded MeshParts from outfits such as Duskwing.
+    read_view = GLB(source_path)
     for name, newpos in positions.items():
-        _, primitive = ed.mesh_primitive(name)
-        pos_acc = primitive["attributes"]["POSITION"]
-        old = ed.accessor(pos_acc)
-        new = np.asarray(newpos, dtype=np.float32)
-        if old.shape != new.shape:
-            raise ValueError(f"{name} position count mismatch {old.shape} vs {new.shape}")
-        faces = ed.accessor(primitive["indices"]).reshape(-1, 3).astype(np.int64)
-        source_normals=ed.accessor(primitive["attributes"]["NORMAL"]).astype(np.float32) if "NORMAL" in primitive["attributes"] else None
-        if source_normals is not None:
-            normals,normal_stage=_rebuild_normals_preserving_authored_splits(new,faces,old,source_normals);normal_rebuild[name]=normal_stage
+        source_data=aggregate_mesh_data(read_view,name)
+        source_v=np.asarray(source_data["V"],dtype=np.float64)
+        source_n=np.asarray(source_data["N"],dtype=np.float64) if source_data.get("N") is not None else None
+        faces=np.asarray(source_data["F"],dtype=np.int64)
+        new=np.asarray(newpos,dtype=np.float32)
+        if source_v.shape != new.shape:
+            raise ValueError(f"{name} aggregate position count mismatch {source_v.shape} vs {new.shape}")
+        if source_n is not None:
+            normals,normal_stage=_rebuild_normals_preserving_authored_splits(new,faces,source_v,source_n);normal_rebuild[name]=normal_stage
         else:
-            tri = trimesh.Trimesh(vertices=new, faces=faces, process=False);normals=np.asarray(tri.vertex_normals,dtype=np.float32);normal_rebuild[name]={"smoothed_groups":0,"smoothed_vertices":0}
-        ed.write_accessor(pos_acc, new)
-        if "NORMAL" in primitive["attributes"]:
-            ed.write_accessor(primitive["attributes"]["NORMAL"], normals)
-        if "TANGENT" in primitive["attributes"] and "TEXCOORD_0" in primitive["attributes"] and "NORMAL" in primitive["attributes"]:
-            uv = ed.accessor(primitive["attributes"]["TEXCOORD_0"]).astype(np.float32)
-            fallback = ed.accessor(primitive["attributes"]["TANGENT"]).astype(np.float32)
-            ed.write_accessor(primitive["attributes"]["TANGENT"], compute_tangents(new, faces, uv, normals, fallback))
-        ed.js["accessors"][pos_acc]["min"] = new.min(axis=0).astype(float).tolist()
-        ed.js["accessors"][pos_acc]["max"] = new.max(axis=0).astype(float).tolist()
+            tri=trimesh.Trimesh(vertices=new,faces=faces,process=False);normals=np.asarray(tri.vertex_normals,dtype=np.float32);normal_rebuild[name]={"smoothed_groups":0,"smoothed_vertices":0}
+
+        mi,domains,primitives=mesh_domains(ed,name)
+        written_accessors=set();domain_rows=[]
         skin = skinning.get(name)
         if skin is None:
             raise ValueError(f"Solved garment mesh {name} has no retargeted skinning payload.")
-        skin["packing"] = _write_retargeted_skinning(ed, primitive, skin["weights"], name)
+        solved_weights=np.asarray(skin["weights"],dtype=np.float64)
+        if solved_weights.shape[0] != len(new):
+            raise ValueError(f"{name} solved skinning rows {solved_weights.shape[0]} != aggregate vertices {len(new)}")
+        packing_rows=[]
+
+        for domain in domains:
+            sl=slice(domain.start,domain.start+domain.count)
+            domain_new=new[sl]
+            domain_normals=normals[sl]
+            if domain.position_accessor not in written_accessors:
+                ed.write_accessor(domain.position_accessor,domain_new);written_accessors.add(domain.position_accessor)
+                ed.js["accessors"][domain.position_accessor]["min"]=domain_new.min(axis=0).astype(float).tolist()
+                ed.js["accessors"][domain.position_accessor]["max"]=domain_new.max(axis=0).astype(float).tolist()
+            if domain.normal_accessor is not None and domain.normal_accessor not in written_accessors:
+                ed.write_accessor(domain.normal_accessor,domain_normals);written_accessors.add(domain.normal_accessor)
+
+            # Tangents need every face in this vertex domain, not merely primitive[0].
+            domain_faces=[]
+            for pi in domain.primitive_indices:
+                primitive=primitives[pi]
+                idx=np.asarray(ed.accessor(primitive["indices"]),dtype=np.int64).reshape(-1)
+                if len(idx)%3:raise ValueError(f"{name} primitive {pi} index count is not triangular.")
+                domain_faces.append(idx.reshape(-1,3))
+            domain_faces=np.vstack(domain_faces) if domain_faces else np.zeros((0,3),dtype=np.int64)
+            if domain.tangent_accessor is not None and domain.uv_accessor is not None and domain.normal_accessor is not None and domain.tangent_accessor not in written_accessors:
+                uv=ed.accessor(domain.uv_accessor).astype(np.float32);fallback=ed.accessor(domain.tangent_accessor).astype(np.float32)
+                ed.write_accessor(domain.tangent_accessor,compute_tangents(domain_new,domain_faces,uv,domain_normals,fallback));written_accessors.add(domain.tangent_accessor)
+
+            representative=primitives[domain.primitive_indices[0]]
+            packing_rows.append(_write_retargeted_skinning(ed,representative,solved_weights[sl],name))
+            domain_rows.append({"start":int(domain.start),"vertices":int(domain.count),"primitives":[int(v) for v in domain.primitive_indices]})
+
+        # All domains of a logical XIV mesh carry one solver skinning stage. Preserve
+        # the old public shape while recording the actual primitive/domain fan-out.
+        skin["packing"] = packing_rows[0] if len(packing_rows)==1 else {"mode":"multi_primitive_domains","domains":packing_rows}
+        primitive_report[name]={"primitive_count":len(primitives),"vertex_domain_count":len(domains),"domains":domain_rows}
 
     detached_nodes = []
     for ni, node in enumerate(ed.js.get("nodes", [])):
@@ -6683,7 +6720,6 @@ def _patch_positions_and_detach_body(source_path: Path, output_path: Path, posit
     for scene in ed.js.get("scenes", []):
         scene["nodes"] = [ni for ni in scene.get("nodes", []) if ni not in detached_nodes]
 
-    # Regenerated normals/tangents need fresh accessor bounds or SharpGLTF will reject the GLB.
     bounds = _refresh_float_accessor_bounds(ed)
     _validate_float_accessor_bounds(ed)
     ed.save(output_path)
@@ -6692,6 +6728,7 @@ def _patch_positions_and_detach_body(source_path: Path, output_path: Path, posit
         "body_mesh_indices": sorted(body_mesh_indices),
         "detached_nodes": detached_nodes,
         "normal_rebuild": normal_rebuild,
+        "multi_primitive_meshes": primitive_report,
         "retargeted_skinning": {name: {"stage": value.get("stage"), "packing": value.get("packing")} for name, value in skinning.items()},
         "accessor_bounds": {
             "checked": bounds["checked"],
@@ -6701,7 +6738,6 @@ def _patch_positions_and_detach_body(source_path: Path, output_path: Path, posit
             "serialized_sparse_checked": serialized_bounds.get("sparse_checked", 0),
         },
     }
-
 
 def _align4(buf: bytearray):
     while len(buf) % 4:
