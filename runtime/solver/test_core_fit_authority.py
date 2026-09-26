@@ -52,7 +52,6 @@ def test_clearance_floor_handles_bad_samples_without_destroying_authored_gap():
 class _Prod:
     def _target_skin_weights_at_points(self, points, cache, source_weights=None, source_joint_names=None):
         out=np.asarray(source_weights,dtype=float).copy()
-        # A real paired-body change: first half transfers 25% from bone 0 to bone 1.
         half=len(out)//2
         moved=np.minimum(out[:half,0],.25)
         out[:half,0]-=moved;out[:half,1]+=moved
@@ -77,6 +76,8 @@ def test_prepare_cache_changes_the_real_support_frame_and_body_skin_field():
     report=core_fit_authority.prepare_cache(_Prod(),cache)
     assert report['enabled']
     assert report['macro_support_surface']['enabled']
+    assert report['macro_body']['radius_mm'] == 8.0
+    assert report['macro_support_surface']['radius_mm'] == 8.0
     centre=np.argmin(r)
     assert cache['target_support_V'][centre,2] > literal[centre,2]
     assert np.max(np.abs(cache['target_relief_C'])) == 0.0
@@ -85,7 +86,6 @@ def test_prepare_cache_changes_the_real_support_frame_and_body_skin_field():
 
 
 def test_runtime_support_guard_restores_source_authored_gap_on_real_production_signature():
-    # Flat body/support frame with a garment that the base solver has shrink-wrapped too close.
     source,faces=_grid(n=7,spacing=.01)
     labels=np.zeros(len(source),dtype=np.int64)
     source_garment=source.copy();source_garment[:,2]=.0010
