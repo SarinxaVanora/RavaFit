@@ -25,13 +25,19 @@ def _vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return out
 
 
-def macro_body_correspondence(source: np.ndarray, literal_target: np.ndarray, faces: np.ndarray, *, radius_m: float = .022) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+def macro_body_correspondence(source: np.ndarray, literal_target: np.ndarray, faces: np.ndarray, *, radius_m: float = .008) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Low-pass the *body displacement field*, never the body or garment itself.
 
     B14 needs broad source->target anatomical change. Literal target grooves, nipples,
     genital clefts and other small surface relief remain collision geometry and must not
     become fitting targets. Diffusion is performed only across source-body topology so
     nearby but disconnected/opposite surfaces never contaminate one another.
+
+    The diffusion count is deliberately scale-sensitive.  A large hard minimum turns a
+    nominally local filter into repeated whole-surface relaxation on normal XIV body
+    topology and was measured to flatten the Duskwing Neolithe chest.  The 8 mm / 1..12
+    policy is the configuration validated against the real YAB->Neolithe and
+    YAB WC->Kaia Poofy source/target pairs.
     """
     source = np.asarray(source, dtype=np.float64)
     literal_target = np.asarray(literal_target, dtype=np.float64)
@@ -45,7 +51,7 @@ def macro_body_correspondence(source: np.ndarray, literal_target: np.ndarray, fa
     edge_lengths = np.linalg.norm(source[edges[:, 0]] - source[edges[:, 1]], axis=1)
     finite_edges = edge_lengths[np.isfinite(edge_lengths) & (edge_lengths > 1e-7)]
     median_edge = float(np.median(finite_edges)) if len(finite_edges) else .004
-    iterations = int(np.clip(np.ceil((float(radius_m) / max(median_edge, 1e-5)) ** 2), 6, 40))
+    iterations = int(np.clip(np.ceil((float(radius_m) / max(median_edge, 1e-5)) ** 2), 1, 12))
 
     displacement = literal_target - source
     current = displacement.copy()
@@ -68,7 +74,7 @@ def macro_body_correspondence(source: np.ndarray, literal_target: np.ndarray, fa
     literal_len = np.linalg.norm(displacement, axis=1)
     return macro, normals, {
         "enabled": True,
-        "policy": "B14 receives topology-low-pass source-to-target body motion; literal target relief remains collision-only",
+        "policy": "B14 receives scale-sensitive topology-low-pass source-to-target body motion; literal target relief remains collision-only",
         "vertices": int(len(source)),
         "edges": int(len(edges)),
         "radius_mm": float(radius_m * 1000.0),
