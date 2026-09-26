@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+import sys
 import numpy as np
+
+_MODULE_DIR = Path(__file__).resolve().parent
+_RUNTIME_ROOT = _MODULE_DIR.parent if _MODULE_DIR.name.casefold() == 'solver' else _MODULE_DIR
+_B14_SCRIPTS = _RUNTIME_ROOT / 'b14_frozen' / 'scripts'
+if str(_B14_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_B14_SCRIPTS))
 
 from ffxiv_lobofit import GLB as FrozenGLB
 
