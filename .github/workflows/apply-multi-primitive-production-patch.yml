@@ -1,0 +1,38 @@
+name: Apply multi-primitive production patch
+
+on:
+  push:
+    branches:
+      - fix/multi-primitive-xiv-mesh-authority
+    paths:
+      - "scripts/multi_primitive_production.patch"
+      - ".github/workflows/apply-multi-primitive-production-patch.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: fix/multi-primitive-xiv-mesh-authority
+
+      - name: Apply exact production patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check scripts/multi_primitive_production.patch
+          git apply scripts/multi_primitive_production.patch
+          rm scripts/multi_primitive_production.patch
+          rm .github/workflows/apply-multi-primitive-production-patch.yml
+          python -m py_compile runtime/solver/production_b14.py runtime/solver/multi_primitive_glb.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add runtime/solver/production_b14.py runtime/solver/multi_primitive_glb.py runtime/solver/test_multi_primitive_glb.py .github/workflows/solver-unit-tests.yml
+          git add -u scripts/multi_primitive_production.patch .github/workflows/apply-multi-primitive-production-patch.yml
+          git commit -m "Use complete XIV mesh primitives in production solver"
+          git push origin HEAD:fix/multi-primitive-xiv-mesh-authority
