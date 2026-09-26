@@ -29,7 +29,7 @@ def _macro_from_combined_cache(cache: dict[str, Any]) -> tuple[np.ndarray, np.nd
         F = np.asarray(cache.get(key_f, []), dtype=np.int64)
         if V.shape == X.shape and F.ndim == 2 and F.shape[1:] == (3,) and len(F) and int(np.max(F)) < len(X):
             if float(np.max(np.linalg.norm(V - X, axis=1), initial=0.0)) <= 2e-5:
-                macro, normals, report = macro_body_correspondence(X, Y, F, radius_m=.032)
+                macro, normals, report = macro_body_correspondence(X, Y, F)
                 return macro, normals, {"mode": key_f, **report}
 
     pairs = list(cache.get("slot_pairs") or [])
@@ -49,7 +49,7 @@ def _macro_from_combined_cache(cache: dict[str, Any]) -> tuple[np.ndarray, np.nd
             return None
         if float(np.max(np.linalg.norm(PV - PX, axis=1), initial=0.0)) > 2e-5:
             return None
-        macro, normals, report = macro_body_correspondence(PX, PY, PF, radius_m=.032)
+        macro, normals, report = macro_body_correspondence(PX, PY, PF)
         macro_rows.append(macro)
         normal_rows.append(normals)
         reports.append({"slot": str(pair.get("slot") or "Body"), **report})
@@ -69,7 +69,7 @@ def _macro_support_surface(cache: dict[str, Any]) -> dict[str, Any]:
         return {"enabled": False, "reason": "paired support surfaces do not share a vertex domain"}
     if source_faces.shape != target_faces.shape or source_faces.ndim != 2 or source_faces.shape[1:] != (3,) or not len(source_faces) or not np.array_equal(source_faces, target_faces):
         return {"enabled": False, "reason": "paired support surfaces do not share topology"}
-    macro, _, report = macro_body_correspondence(source, target, source_faces, radius_m=.032)
+    macro, _, report = macro_body_correspondence(source, target, source_faces)
     cache["_ravafit_literal_target_support_V"] = target.copy()
     cache["target_support_V"] = macro
     return {"enabled": True, **report}
