@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from multi_primitive_glb import ProductionGLB, scatter_domain_attribute
+from glb_patch_legacy import GLBEditor
 
 
 def _align4(b: bytearray):
@@ -57,8 +58,9 @@ def test_separate_vertex_domains_are_concatenated_and_scattered(tmp_path):
     assert d['F'].shape==(2,3)
     assert tuple(d['F'][1])==(4,6,7)
     new=d['V'].copy();new[:,2]+=0.125
-    report=scatter_domain_attribute(view,'mesh 1',new,'POSITION')
-    view.save(out)
+    editor=GLBEditor(source)
+    report=scatter_domain_attribute(editor,'mesh 1',new,'POSITION')
+    editor.save(out)
     final=ProductionGLB(out).data('mesh 1')
     np.testing.assert_allclose(final['V'],new,atol=1e-7)
     assert report['primitive_count']==2
