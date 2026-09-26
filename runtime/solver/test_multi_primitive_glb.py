@@ -2,8 +2,7 @@ import json,struct
 from pathlib import Path
 import numpy as np
 
-from multi_primitive_glb import ProductionGLB
-import production_b14 as prod
+from multi_primitive_glb import ProductionGLB, scatter_domain_attribute
 
 
 def _align4(b: bytearray):
@@ -58,9 +57,10 @@ def test_separate_vertex_domains_are_concatenated_and_scattered(tmp_path):
     assert d['F'].shape==(2,3)
     assert tuple(d['F'][1])==(4,6,7)
     new=d['V'].copy();new[:,2]+=0.125
-    skin={'mesh 1':{'weights':d['W'].copy(),'joint_names':d['joint_names'],'stage':{}}}
-    report=prod._patch_positions_and_detach_body(source,out,{'mesh 1':new},skin,set())
+    report=scatter_domain_attribute(view,'mesh 1',new,'POSITION')
+    view.save(out)
     final=ProductionGLB(out).data('mesh 1')
     np.testing.assert_allclose(final['V'],new,atol=1e-7)
-    assert report['multi_primitive_meshes']['mesh 1']['primitive_count']==2
-    assert report['multi_primitive_meshes']['mesh 1']['vertex_domain_count']==2
+    assert report['primitive_count']==2
+    assert report['vertex_domain_count']==2
+    assert len(report['domains'])==2
