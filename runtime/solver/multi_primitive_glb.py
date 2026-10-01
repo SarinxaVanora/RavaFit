@@ -254,5 +254,16 @@ class ProductionGLB(FrozenGLB):
             return np.asarray(view).copy() if copy else view
         return super().accessor(i,copy)
 
+    def write_accessor(self,i,values):
+        if isinstance(i,_AggregateAttribute):
+            scatter_domain_attribute(self,i.mesh_name,values,i.semantic)
+            return
+        # Frozen B14's compact one-line helper places the assignment inside the
+        # shape-mismatch branch. Production must perform the correctly-sized
+        # write while preserving the frozen reference implementation verbatim.
+        arr=FrozenGLB.accessor(self,i,False);v=np.asarray(values,dtype=arr.dtype)
+        if arr.shape!=v.shape:raise ValueError((i,arr.shape,v.shape))
+        arr[:]=v
+
     def data(self,name):
         return aggregate_mesh_data(self,name)
