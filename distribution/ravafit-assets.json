@@ -3,8 +3,8 @@
   "runtime": {
     "version": "1.1.9",
     "url": "https://media.githubusercontent.com/media/SarinxaVanora/RavaFit/master/distribution/assets/RavaFit.Runtime.win-x64.1.1.9.zip",
-    "sha256": "8e63944d42d6c98ef87e34541f03d985008e4e66d348e60c516e9975a2aace94",
-    "size": 192303847,
+    "sha256": "d218de3447b7fdb17641860f7a6e9012dceb2ecb14b83e615c33ef99378756cf",
+    "size": 192305095,
     "productionRevision": "1.1.9-complete-rbody-fit-authority",
     "minimumPluginVersion": "1.1.5"
   },
