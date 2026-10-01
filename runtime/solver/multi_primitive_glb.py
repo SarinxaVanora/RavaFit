@@ -29,6 +29,12 @@ class VertexDomain:
     weights_accessors: tuple[int | None, int | None]
 
 
+@dataclass(frozen=True)
+class _AggregateAttribute:
+    mesh_name: str
+    semantic: str
+
+
 def _attrs_key(primitive: dict[str, Any]) -> tuple[int, ...]:
     attrs = primitive.get('attributes', {})
     semantics = ('POSITION','NORMAL','TEXCOORD_0','TANGENT','JOINTS_0','WEIGHTS_0','JOINTS_1','WEIGHTS_1')
@@ -182,13 +188,82 @@ def scatter_domain_attribute(glb: Any, name: str, values: np.ndarray, semantic: 
     return {'primitive_count':len(primitives),'vertex_domain_count':len(domains),'domains':rows}
 
 
+class _AggregateWriteView:
+    """Array-like write-through view used only by legacy attribute-only primitive callers."""
+    def __init__(self, glb: Any, token: _AggregateAttribute):
+        self._glb=glb;self._token=token
+        _,domains,_=mesh_domains(glb,token.mesh_name)
+        attr_name={'POSITION':'position_accessor','NORMAL':'normal_accessor','TANGENT':'tangent_accessor','TEXCOORD_0':'uv_accessor'}.get(token.semantic)
+        if attr_name is None:
+            raise ValueError(f'Unsupported aggregate accessor semantic {token.semantic!r}.')
+        accessors=[]
+        for domain in domains:
+            accessor=getattr(domain,attr_name)
+            if accessor is None:
+                raise ValueError(f'{token.mesh_name} domain has no {token.semantic} accessor.')
+            accessors.append(int(accessor))
+        arrays=[np.asarray(glb.accessor(accessor,False)) for accessor in accessors]
+        if not arrays:
+            raise ValueError(f'{token.mesh_name} has no {token.semantic} accessors.')
+        if any(array.ndim != arrays[0].ndim or array.shape[1:] != arrays[0].shape[1:] for array in arrays[1:]):
+            raise ValueError(f'{token.mesh_name} {token.semantic} vertex domains disagree on accessor shape.')
+        dtypes={array.dtype.str for array in arrays}
+        if len(dtypes) != 1:
+            raise ValueError(f'{token.mesh_name} {token.semantic} vertex domains disagree on accessor dtype.')
+        self.dtype=arrays[0].dtype
+        self.shape=(sum(len(array) for array in arrays),*arrays[0].shape[1:])
+
+    def _read(self) -> np.ndarray:
+        _,domains,_=mesh_domains(self._glb,self._token.mesh_name)
+        attr_name={'POSITION':'position_accessor','NORMAL':'normal_accessor','TANGENT':'tangent_accessor','TEXCOORD_0':'uv_accessor'}[self._token.semantic]
+        return np.concatenate([np.asarray(self._glb.accessor(int(getattr(domain,attr_name)),True)) for domain in domains],axis=0)
+
+    def __array__(self, dtype=None, copy=None):
+        value=self._read()
+        if dtype is not None:value=value.astype(dtype,copy=False)
+        return value.copy() if copy else value
+
+    def __getitem__(self,key):
+        return self._read()[key]
+
+    def __setitem__(self,key,value):
+        aggregate=self._read()
+        aggregate[key]=value
+        scatter_domain_attribute(self._glb,self._token.mesh_name,aggregate,self._token.semantic)
+
+
 class ProductionGLB(FrozenGLB):
     """Frozen-B14-compatible GLB reader that exposes every primitive of an XIV mesh."""
     def primitive(self,name):
-        mi,_,primitives=mesh_domains(self,name)
-        if len(primitives)!=1:
-            raise ValueError(f'{name} has {len(primitives)} primitives; use data() so no authored MeshPart is discarded.')
-        return mi,primitives[0]
+        mi,domains,primitives=mesh_domains(self,name)
+        if len(primitives)==1:
+            return mi,primitives[0]
+        # A few production routines inherited Frozen B14's attribute-write idiom:
+        # primitive()->accessor(False)->arr[:]=... . Give those callers an
+        # aggregate write-through view rather than ever handing them primitive 0.
+        # Deliberately omit indices: topology consumers must use data().
+        attrs={'POSITION':_AggregateAttribute(name,'POSITION')}
+        if all(domain.normal_accessor is not None for domain in domains):attrs['NORMAL']=_AggregateAttribute(name,'NORMAL')
+        if all(domain.uv_accessor is not None for domain in domains):attrs['TEXCOORD_0']=_AggregateAttribute(name,'TEXCOORD_0')
+        if all(domain.tangent_accessor is not None for domain in domains):attrs['TANGENT']=_AggregateAttribute(name,'TANGENT')
+        return mi,{'attributes':attrs,'_ravafit_aggregate':True,'_ravafit_primitive_count':len(primitives)}
+
+    def accessor(self,i,copy=True):
+        if isinstance(i,_AggregateAttribute):
+            view=_AggregateWriteView(self,i)
+            return np.asarray(view).copy() if copy else view
+        return super().accessor(i,copy)
+
+    def write_accessor(self,i,values):
+        if isinstance(i,_AggregateAttribute):
+            scatter_domain_attribute(self,i.mesh_name,values,i.semantic)
+            return
+        # Frozen B14's compact one-line helper places the assignment inside the
+        # shape-mismatch branch. Production must perform the correctly-sized
+        # write while preserving the frozen reference implementation verbatim.
+        arr=FrozenGLB.accessor(self,i,False);v=np.asarray(values,dtype=arr.dtype)
+        if arr.shape!=v.shape:raise ValueError((i,arr.shape,v.shape))
+        arr[:]=v
 
     def data(self,name):
         return aggregate_mesh_data(self,name)
