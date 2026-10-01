@@ -66,3 +66,26 @@ def test_separate_vertex_domains_are_concatenated_and_scattered(tmp_path):
     assert report['primitive_count']==2
     assert report['vertex_domain_count']==2
     assert len(report['domains'])==2
+
+
+def test_legacy_attribute_write_through_updates_every_vertex_domain(tmp_path):
+    source=tmp_path/'retarget_source.glb';out=tmp_path/'retarget_out.glb';_make_glb(source,separate_domains=True)
+    view=ProductionGLB(source);before=view.data('mesh 1')
+    mesh_index,primitive=view.primitive('mesh 1')
+    assert mesh_index==0
+    assert primitive['_ravafit_aggregate'] is True
+    assert primitive['_ravafit_primitive_count']==2
+    assert 'indices' not in primitive
+
+    new_positions=before['V'].copy();new_positions[:,2]+=0.25
+    positions=view.accessor(primitive['attributes']['POSITION'],False)
+    positions[:]=new_positions.astype(positions.dtype,copy=False)
+
+    new_normals=np.tile(np.asarray([[0,1,0]],np.float32),(len(new_positions),1))
+    normals=view.accessor(primitive['attributes']['NORMAL'],False)
+    normals[:]=new_normals.astype(normals.dtype,copy=False)
+    view.save(out)
+
+    final=ProductionGLB(out).data('mesh 1')
+    np.testing.assert_allclose(final['V'],new_positions,atol=1e-7)
+    np.testing.assert_allclose(final['N'],new_normals,atol=1e-7)
