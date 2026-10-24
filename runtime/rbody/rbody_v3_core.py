@@ -4,6 +4,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 import numpy as np
+from body_rig_audit import audit_body_rig_projection
 
 # FFXIV MDL vertex declarations used by body models.
 USAGE = {0:'POSITION',1:'BONE_WEIGHT',2:'BONE_INDEX',3:'NORMAL',4:'TEXCOORD',5:'FLOW',6:'BINORMAL',7:'COLOR'}
@@ -618,6 +619,7 @@ def body_surface_view(ref: dict[str,Any], rig_joint_names: list[str]|None=None, 
     P=np.concatenate(pos) if pos else np.zeros((0,3),np.float32);N=np.concatenate(nor) if nor else np.zeros((0,3),np.float32);UV=np.concatenate(uv) if uv else np.zeros((0,2),np.float32);J=np.concatenate(js) if js else np.zeros((0,8),np.uint16);Wc=np.concatenate(ws) if ws else np.zeros((0,8),np.float32);I=np.concatenate(idx) if idx else np.zeros((0,),np.uint32)
     names=list(ref['joint_names'])
     if rig_joint_names is None: rig_joint_names=names
+    rig_projection_audit=audit_body_rig_projection(J,Wc,names,rig_joint_names)
     ridx={n:i for i,n in enumerate(rig_joint_names)}
     dense=np.zeros((len(P),len(rig_joint_names)),np.float64);rows=np.arange(len(P));
     for k in range(J.shape[1] if J.ndim==2 else 0):
@@ -627,4 +629,4 @@ def body_surface_view(ref: dict[str,Any], rig_joint_names: list[str]|None=None, 
         mapped=np.array([ridx.get(names[int(x)],-1) for x in srcj],dtype=np.int64);ok2=mapped>=0
         np.add.at(dense,(srcrows[ok2],mapped[ok2]),srcw[ok2])
     sw=dense.sum(1);good=sw>1e-12;dense[good]/=sw[good,None]
-    return {'V':P.astype(np.float64),'F':I.reshape(-1,3).astype(np.int64),'UV':UV.astype(np.float64),'N':N.astype(np.float64),'W':dense,'joint_names':list(rig_joint_names),'mesh_records':records,'surface_mode':mode}
+    return {'V':P.astype(np.float64),'F':I.reshape(-1,3).astype(np.int64),'UV':UV.astype(np.float64),'N':N.astype(np.float64),'W':dense,'joint_names':list(rig_joint_names),'mesh_records':records,'surface_mode':mode,'rig_projection_audit':rig_projection_audit}
