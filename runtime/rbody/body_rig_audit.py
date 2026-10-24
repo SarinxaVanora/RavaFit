@@ -72,3 +72,44 @@ def audit_body_rig_projection(joints, weights, body_joint_names, outfit_joint_na
         "weighted_body_joints": per_joint,
         "changes_applied": False,
     }
+
+
+def compare_body_rig_audits(source, target):
+    """Compare source and target bone-weight distributions without normalising away absent joints.
+
+    The bodies need not share topology or vertex counts. Mass fractions indicate
+    how heavily each body uses a joint *overall*, not a vertex correspondence or
+    proof of a local skinning change.
+    """
+    if source is None or target is None:
+        return None
+    source_rows = {row["name"]: row for row in source["weighted_body_joints"]}
+    target_rows = {row["name"]: row for row in target["weighted_body_joints"]}
+    source_mass = float(source["total_original_weight_mass"])
+    target_mass = float(target["total_original_weight_mass"])
+    bones = []
+    for name in sorted(set(source_rows) | set(target_rows)):
+        s = source_rows.get(name)
+        t = target_rows.get(name)
+        sv = float(s["weight_mass"]) / source_mass if s and source_mass > 1e-12 else 0.0
+        tv = float(t["weight_mass"]) / target_mass if t and target_mass > 1e-12 else 0.0
+        bones.append({
+            "name": name,
+            "source_mass_fraction": sv,
+            "target_mass_fraction": tv,
+            "target_minus_source_mass_fraction": tv - sv,
+            "weighted_in_source": s is not None,
+            "weighted_in_target": t is not None,
+            "missing_from_outfit_rig": not (s or t)["retained_in_outfit_rig"],
+        })
+    bones.sort(key=lambda row: (-abs(row["target_minus_source_mass_fraction"]), row["name"]))
+    return {
+        "mode": "body_joint_distribution_comparison_not_vertex_correspondence",
+        "source_weighted_bone_count": len(source_rows),
+        "target_weighted_bone_count": len(target_rows),
+        "newly_weighted_target_bones": [x["name"] for x in bones if not x["weighted_in_source"]],
+        "source_only_weighted_bones": [x["name"] for x in bones if not x["weighted_in_target"]],
+        "bones_missing_from_outfit_rig": [x["name"] for x in bones if x["missing_from_outfit_rig"]],
+        "bones": bones,
+        "changes_applied": False,
+    }
