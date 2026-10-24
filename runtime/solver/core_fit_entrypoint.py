@@ -7,7 +7,6 @@ import adaptive_skinning
 import body_skin_delta_guard
 import core_fit_authority
 import strict_fit_authority
-import target_guided_bone_retirement
 
 
 def _install_motion_authority(production: Any, cache: dict, source: Any) -> dict:
@@ -15,7 +14,6 @@ def _install_motion_authority(production: Any, cache: dict, source: Any) -> dict
     body_skin_delta_guard.install_complete_body_delta_visibility(production)
     capacity = adaptive_skinning.register_source_influence_capacities(cache, source)
     adaptive_skinning.install_adaptive_body_skinning(production)
-    target_guided_bone_retirement.install_target_guided_bone_retirement(production)
     return capacity
 
 
