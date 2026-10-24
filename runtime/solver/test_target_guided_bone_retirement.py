@@ -107,25 +107,27 @@ def test_target_body_does_not_mark_existing_named_source_bones_for_removal():
     np.testing.assert_array_equal(solved, source)
     assert report["enabled"] is False
 
-
-def test_wrapped_adaptive_result_gets_retired_and_reports_new_stage():
-    class Prod:
-        pass
-    prod = Prod()
+def test_post_seam_final_repair_removes_reintroduced_unavailable_bone():
     names = ["j_phys", "j_chest", "j_spine", "j_cloth"]
-    def original(*args):
-        return np.asarray(args[2], dtype=np.float64).copy(), {"retargeted_vertices": 0, "exact_source_weight_preserve": True}
-    prod._retarget_garment_skinning = original
-    prod._target_skin_weights_at_points = _sampler([0, 0.75, 0.25, 0])
-    install_target_guided_bone_retirement(prod)
-    points = np.asarray([[0, 0, 0]], dtype=np.float64)
-    source = np.asarray([[0.6, 0.3, 0, 0.1]], dtype=np.float64)
-    result, stage = prod._retarget_garment_skinning(
-        points, points, source, names, _cache(), "flexible", "flexible", [], {}, [],
-    )
-    np.testing.assert_allclose(result, [[0, 0.75, 0.15, 0.1]], atol=1e-12)
-    assert stage["retargeted_vertices"] == 1
-    assert stage["exact_source_weight_preserve"] is False
-    assert stage["target_guided_unavailable_body_bones"]["enabled"]
-    install_target_guided_bone_retirement(prod)
-    assert prod._ravafit_target_guided_body_bone_retirement_installed
+    cache = _cache()
+    source = [[0.6, 0.3, 0.0, 0.1]]
+    repaired, _ = _run(source, names, cache, _sampler([0, 0.75, 0.25, 0]))
+    # Existing seam-authority code may alter skinning before final output.
+    # The final pass must remove a reintroduced unsupported bone *again*.
+    post_seam = repaired.copy()
+    post_seam[0, 0] = 0.2
+    post_seam[0, 1] -= 0.2
+    final, report = _run(post_seam, names, cache, _sampler([0, 0.75, 0.25, 0]))
+    assert final[0, 0] == 0
+    assert final[0, 3] == source[0][3]
+    assert final.sum() == pytest.approx(1.0)
+    assert report["enabled"] is True
+
+
+def test_retirement_is_idempotent_after_final_pass():
+    names = ["j_phys", "j_chest", "j_spine", "j_cloth"]
+    cache = _cache()
+    final, _ = _run([[0.6, 0.3, 0.0, 0.1]], names, cache, _sampler([0, 0.7, 0.3, 0]))
+    again, report = _run(final, names, cache, _sampler([0, 0.7, 0.3, 0]))
+    np.testing.assert_array_equal(again, final)
+    assert report["enabled"] is False
