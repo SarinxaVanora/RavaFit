@@ -56,6 +56,7 @@ def audit_body_rig_projection(joints, weights, body_joint_names, outfit_joint_na
     return {
         "mode": "pre_normalisation_body_rig_projection_audit",
         "original_body_joint_count": len(names),
+        "original_body_joint_names": names,
         "outfit_rig_joint_count": len(outfit_names),
         "weighted_body_joint_count": len(per_joint),
         "missing_weighted_joint_count": len(missing),
