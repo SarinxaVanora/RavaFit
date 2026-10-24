@@ -37,6 +37,7 @@ for p in (RBODY_TOOLS, B14_SCRIPTS):
 
 from rbody_v3_loader import get_cached_rbody, close_cached_rbodies
 from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy
+from body_rig_audit import compare_body_rig_audits
 
 # Frozen B14 is read-only.
 from ffxiv_lobofit import (
@@ -715,6 +716,9 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             "source_materials":sorted(actual_outfit_body_materials if source_mode=="vanilla" else (embedded_source_mats if source_mode=="rbody" and embedded_source_mats else src_mats)),"source_support_materials":sorted(src_mats),"target_materials":sorted(tgt_mats),"source_surface_materials":sorted(source_surface_mats),"target_surface_materials":sorted(target_surface_mats),
             "embedded_source_authority":embedded_source_report if source_mode=="rbody" else {"enabled":source_mode=="embedded","mode":source_mode},
             "target_mesh_material_assignments":[tgt_assignments[index] for index in sorted(tgt_assignments)],
+            "source_rig_projection_audit":src_ref.get("rig_projection_audit"),
+            "target_rig_projection_audit":tgt_ref.get("rig_projection_audit"),
+            "source_target_body_joint_comparison":compare_body_rig_audits(src_ref.get("rig_projection_audit"),tgt_ref.get("rig_projection_audit")),
         })
     body_cache=collect_body_pairs(pairs)
     if not vanilla_mode and retarget_context is None:
