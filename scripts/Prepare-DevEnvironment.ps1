@@ -80,6 +80,7 @@ function Sync-RavaFitRuntimeCode([string]$Target) {
         'rbody_v3_loader.py',
         'rbody_b14_adapter.py',
         'prepare_b14_rbody_cache.py',
+        'body_rig_audit.py',
         'rbody_v3_core.py'
     )) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot "runtime\rbody\$name") -Destination (Join-Path $rbodyTarget $name) -Force

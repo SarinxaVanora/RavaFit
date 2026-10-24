@@ -160,6 +160,7 @@ function Copy-RavaFitRuntimeCode([string]$Target) {
         'rbody_v3_loader.py',
         'rbody_b14_adapter.py',
         'prepare_b14_rbody_cache.py',
+        'body_rig_audit.py',
         'rbody_v3_core.py'
     )) {
         $source = Join-Path $RepoRoot "runtime\rbody\$name"
