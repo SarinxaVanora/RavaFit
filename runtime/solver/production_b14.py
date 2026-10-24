@@ -721,6 +721,23 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             "source_target_body_joint_comparison":compare_body_rig_audits(src_ref.get("rig_projection_audit"),tgt_ref.get("rig_projection_audit")),
         })
     body_cache=collect_body_pairs(pairs)
+    # Bone retirement must be justified by the *original* source and target MDLs.
+    # A body does not own garment-only rigging: never remove a cloth/attachment
+    # bone merely because it isn't referenced by the selected target body.
+    source_body_used=set()
+    target_body_known=set()
+    target_body_used=set()
+    for source_ref,target_ref in pairs:
+        source_audit=source_ref.get("rig_projection_audit") or {}
+        target_audit=target_ref.get("rig_projection_audit") or {}
+        if not source_audit or not target_audit:
+            continue
+        source_body_used.update(row["name"] for row in source_audit.get("weighted_body_joints",[]))
+        target_body_known.update(target_audit.get("original_body_joint_names",[]))
+        target_body_used.update(row["name"] for row in target_audit.get("weighted_body_joints",[]))
+    # A joint present in *any* selected target body region is not unavailable.
+    body_cache["_ravafit_source_body_joints_absent_from_target"]=sorted(source_body_used-target_body_known)
+    body_cache["_ravafit_target_body_weighted_joints"]=sorted(target_body_used)
     if not vanilla_mode and retarget_context is None:
         body_cache=_apply_strict_historical_uv_contract(pairs,body_cache)
     else:
