@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - "runtime/solver/**"
+      - "runtime/rbody/**"
       - ".github/workflows/solver-unit-tests.yml"
   push:
     branches:
       - master
     paths:
       - "runtime/solver/**"
+      - "runtime/rbody/**"
       - ".github/workflows/solver-unit-tests.yml"
 
 permissions:
@@ -35,7 +37,7 @@ jobs:
 
       - name: Run motion-skinning, target-fit, core-fit, strict-B14, multi-primitive and final-occupancy regressions
         working-directory: runtime/solver
-        run: python -m pytest -q test_adaptive_skinning.py test_local_support_preserve.py test_target_fit_authority.py test_core_fit_authority.py test_core_fit_entrypoint.py test_strict_fit_authority.py test_multi_primitive_glb.py test_final_occupancy_guard.py
+        run: python -m pytest -q test_adaptive_skinning.py test_local_support_preserve.py test_target_fit_authority.py test_core_fit_authority.py test_core_fit_entrypoint.py test_strict_fit_authority.py test_multi_primitive_glb.py test_final_occupancy_guard.py test_rbody_rig_audit.py
 
       - name: Verify isolated SolverHost bootstrap
         working-directory: runtime/solver
