@@ -37,6 +37,7 @@ for p in (RBODY_TOOLS, B14_SCRIPTS):
 
 from rbody_v3_loader import get_cached_rbody, close_cached_rbodies
 from rbody_b14_adapter import collect_body_pairs, build_dense_source_proxy
+import target_guided_bone_retirement
 from body_rig_audit import compare_body_rig_audits
 
 # Frozen B14 is read-only.
@@ -721,6 +722,23 @@ def _load_pairs(spec: dict[str, Any], names: list[str], source_glb: GLB | None =
             "source_target_body_joint_comparison":compare_body_rig_audits(src_ref.get("rig_projection_audit"),tgt_ref.get("rig_projection_audit")),
         })
     body_cache=collect_body_pairs(pairs)
+    # Bone retirement must be justified by the *original* source and target MDLs.
+    # A body does not own garment-only rigging: never remove a cloth/attachment
+    # bone merely because it isn't referenced by the selected target body.
+    source_body_used=set()
+    target_body_known=set()
+    target_body_used=set()
+    for source_ref,target_ref in pairs:
+        source_audit=source_ref.get("rig_projection_audit") or {}
+        target_audit=target_ref.get("rig_projection_audit") or {}
+        if not source_audit or not target_audit:
+            continue
+        source_body_used.update(row["name"] for row in source_audit.get("weighted_body_joints",[]))
+        target_body_known.update(target_audit.get("original_body_joint_names",[]))
+        target_body_used.update(row["name"] for row in target_audit.get("weighted_body_joints",[]))
+    # A joint present in *any* selected target body region is not unavailable.
+    body_cache["_ravafit_source_body_joints_absent_from_target"]=sorted(source_body_used-target_body_known)
+    body_cache["_ravafit_target_body_weighted_joints"]=sorted(target_body_used)
     if not vanilla_mode and retarget_context is None:
         body_cache=_apply_strict_historical_uv_contract(pairs,body_cache)
     else:
@@ -7928,6 +7946,33 @@ def convert(spec: dict[str, Any]) -> dict[str, Any]:
         solve_stats["reference_retry"] = reference_retry
 
     _validate_final_fit_clearance(solve_stats)
+    # Enforce missing-body-bone zero weights on the final output, after every
+    # adaptive skinning / cross-mesh seam / indexed-collapse / preserve shortcut.
+    # No later geometry or skinning solver is permitted to reintroduce them.
+    if cache.get("_ravafit_source_body_joints_absent_from_target"):
+        retired_meshes={}
+        for mesh_name,final_v in positions.items():
+            row=skinning.get(mesh_name)
+            if row is None:raise ValueError(f"Missing final skinning payload for {mesh_name}.")
+            original_data=source.data(mesh_name)
+            final_weights,remap=target_guided_bone_retirement.remap_unavailable_body_bones(
+                final_v,original_data["V"],row["weights"],row["joint_names"],cache,_target_skin_weights_at_points)
+            if not remap.get("enabled"):continue
+            revised=dict(row);revised["weights"]=final_weights
+            revised_stage=dict(revised.get("stage") or {})
+            revised_stage["target_guided_unavailable_body_bones"]=remap
+            revised_stage["exact_source_weight_preserve"]=False
+            revised_stage["retargeted_vertices"]=max(int(revised_stage.get("retargeted_vertices",0)),int(remap["affected_vertices"]))
+            revised["stage"]=revised_stage
+            skinning[mesh_name]=revised
+            if isinstance(mesh_records.get(mesh_name),dict):
+                mesh_records[mesh_name]["skinning"]=revised_stage
+            retired_meshes[mesh_name]=remap
+        solve_stats["target_guided_unavailable_body_bones"]={
+            "enabled":bool(retired_meshes),"meshes":retired_meshes,
+            "source_body_joints_absent_from_target":list(cache["_ravafit_source_body_joints_absent_from_target"]),
+            "geometry_modified":False,
+        }
     suppression_plan=_refine_source_body_suppression_after_fit(source,positions,cache,suppression_plan)
     cache["_ravafit_source_body_suppression"]=suppression_plan
     fitted_without_body = output_glb.with_name(output_glb.stem + ".garment-only.glb")
