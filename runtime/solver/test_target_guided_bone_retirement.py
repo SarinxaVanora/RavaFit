@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from target_guided_bone_retirement import remap_unavailable_body_bones, install_target_guided_bone_retirement
+from target_guided_bone_retirement import remap_unavailable_body_bones
 
 
 def _cache(missing=("j_phys",), target=("j_chest", "j_spine"), names=("j_phys", "j_chest", "j_spine", "j_cloth")):
