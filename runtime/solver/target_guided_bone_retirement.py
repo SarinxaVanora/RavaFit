@@ -8,7 +8,6 @@ sampled at the garment's final fitted positions; the source body never does.
 """
 from __future__ import annotations
 
-from typing import Any
 import numpy as np
 
 from adaptive_skinning import _source_capacity
@@ -111,33 +110,3 @@ def remap_unavailable_body_bones(final_positions, source_positions, weights, joi
         "nonmissing_source_weights_preserved_except_target_guided_addition": True,
         "geometry_modified": False,
     }
-
-
-def install_target_guided_bone_retirement(prod: Any) -> None:
-    if getattr(prod, "_ravafit_target_guided_body_bone_retirement_installed", False):
-        return
-    original = getattr(prod, "_retarget_garment_skinning", None)
-    if not callable(original):
-        raise AttributeError("Production has no skinning finalizer to wrap.")
-    sampler = getattr(prod, "_target_skin_weights_at_points", None)
-
-    def retarget(raw_positions, source_positions, source_weights, source_joint_names, cache,
-                 behavior, effective_behavior, labels, classes, raw_to_weld):
-        solved, stage = original(raw_positions, source_positions, source_weights, source_joint_names,
-                                 cache, behavior, effective_behavior, labels, classes, raw_to_weld)
-        if not cache.get(_CACHE_MISSING):
-            return solved, stage
-        if not callable(sampler):
-            raise ValueError("RavaFit cannot sample the selected target body's actual skin weights.")
-        corrected, report = remap_unavailable_body_bones(
-            raw_positions, source_positions, solved, source_joint_names, cache, sampler,
-        )
-        stage = dict(stage)
-        stage["target_guided_unavailable_body_bones"] = report
-        if report.get("enabled"):
-            stage["exact_source_weight_preserve"] = False
-            stage["retargeted_vertices"] = max(int(stage.get("retargeted_vertices", 0)), int(report["affected_vertices"]))
-        return corrected, stage
-
-    prod._retarget_garment_skinning = retarget
-    prod._ravafit_target_guided_body_bone_retirement_installed = True
