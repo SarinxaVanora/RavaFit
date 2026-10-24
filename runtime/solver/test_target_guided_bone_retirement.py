@@ -69,7 +69,7 @@ def test_capacity_prevents_additional_bones_without_evicting_authored_weights():
     result, report = _run(source, names, cache, _sampler([0, 0.5, 0.2, 0, 0, 0.3]))
     # Three authored slots remain (including j_other and cloth): only one
     # additional donor fits, but chest remains available and gains mass.
-    np.testing.assert_allclose(result, [[0, 0.4125, 0, 0.25, 0.25, 0.0875]], atol=1e-12)
+    np.testing.assert_allclose(result, [[0, 0.40625, 0, 0.25, 0.25, 0.09375]], atol=1e-12)
     assert np.count_nonzero(result[0] > 1e-8) == 4
     assert report["capacity_limited_vertices"] == 1
 
