@@ -9,7 +9,7 @@ RBODY = Path(__file__).resolve().parents[1] / "rbody"
 if str(RBODY) not in sys.path:
     sys.path.insert(0, str(RBODY))
 
-from body_rig_audit import audit_body_rig_projection
+from body_rig_audit import audit_body_rig_projection, compare_body_rig_audits
 from rbody_v3_core import body_surface_view
 
 
@@ -80,3 +80,20 @@ def test_unweighted_missing_bone_does_not_trigger_false_alarm():
     assert result["weighted_body_joint_count"] == 2
     assert result["total_missing_weight_mass"] == 0
     assert result["missing_weighted_joints"] == []
+
+
+def test_source_target_joint_distribution_is_explicit_even_when_bone_is_missing():
+    body = _example_body()
+    source = body_surface_view(body, rig_joint_names=["j_spine"], surface_mode="body")
+    # Target uses the same original body, but changes its relative jiggle weighting.
+    target_body = _example_body()
+    target_body["weights"][0, :2] = [0.9, 0.1]
+    target = body_surface_view(target_body, rig_joint_names=["j_spine"], surface_mode="body")
+    comparison = compare_body_rig_audits(source["rig_projection_audit"], target["rig_projection_audit"])
+    assert comparison["changes_applied"] is False
+    assert comparison["bones_missing_from_outfit_rig"] == ["j_physics"]
+    physics = next(row for row in comparison["bones"] if row["name"] == "j_physics")
+    assert physics["target_minus_source_mass_fraction"] > 0
+    assert physics["missing_from_outfit_rig"] is True
+    assert comparison["newly_weighted_target_bones"] == []
+    assert compare_body_rig_audits(None, target["rig_projection_audit"]) is None
